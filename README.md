@@ -137,7 +137,7 @@ Two files live in **`NetInfo/`**, next to `ConnectUnit.exe`:
 
 | File | Contents |
 |------|----------|
-| `config.toml` | Identity, role, crypto, peers, invites, parasitic state, and all pacing/APD/DRR/FEC/failover tuning knobs (flat root keys) |
+| `config.toml` | Identity, role, crypto, peers, invites, parasitic state, and all pacing/APD/DRR/FEC/failover tuning knobs (sectioned by feature: `[session]`, `[drr]`, `[fec]`, `[congestion]`, …) |
 | `peer_cache.json` | Learned peer endpoints, maintained by the engine |
 
 Edit `config.toml`, then run `config reload` to apply performance fields live. Identity/session fields (network id, role, VIP, keys) require a daemon restart.
@@ -158,4 +158,4 @@ Integration coverage: `tests/loopback.rs`, `tests/relay_send.rs`. Wire or failov
 
 ## License
 
-CC0 1.0 Universal — public domain.
+MIT License
