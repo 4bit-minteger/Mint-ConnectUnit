@@ -16,7 +16,6 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 4. [Roles: owner vs peer](#roles-owner-vs-peer)
 5. [CLI commands](#cli-commands)
 6. [Configuration](#configuration)
-7. [Testing](#testing)
 
 ---
 
@@ -146,16 +145,6 @@ Full field list, factory defaults, and what each knob trades off: **[`SPEC.md` Â
 
 ---
 
-## Testing
-
-```powershell
-cargo test
-```
-
-Integration coverage: `tests/loopback.rs`, `tests/relay_send.rs`. Wire or failover changes must update **`SPEC.md`** and tests.
-
----
-
 ## License
 
-MIT License
+[LICENSE-MIT](LICENSE-MIT)
