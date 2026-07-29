@@ -284,7 +284,7 @@ Functions **`should_relay`** / **`can_return_to_direct`** implement policy (read
 
 ### Failover defaults
 
-Defaults live in `src/routing.rs` (`failover` module) and are mirrored as **flat root keys** in `config.toml` (e.g. `d2r_quality_min`). Apply with **`config reload`**. Omitting keys keeps defaults. A `[advanced]` table is rejected.
+Defaults live in `src/routing.rs` (`failover` module) and are mirrored under the **`[failover]`** table in `config.toml` (e.g. `d2r_quality_min`). Apply with **`config reload`**. Omitting keys keeps defaults.
 
 | Constant / field | Value | Meaning | If ↑ | If ↓ |
 |----------|------:|---------|------|------|
@@ -415,7 +415,7 @@ Full congestion / FEC field table: [Operational defaults](#operational-defaults-
 ## Reliable control transport
 
 - Compact reliable send / ack (`0x04` / `0x05`) with ordered retry and RTO EWMA.
-- Pending cap, RTO min/max, retry count (default `retries_left = 1`) — tunable via flat config keys.
+- Pending cap, RTO min/max, retry count (default `retries_left = 1`) — tunable via `[reliable]` config keys.
 - Some retransmits bypass pacing via **`RetransmitDirectSender`** (rate limited by CLI `rtrx-s`).
 
 ---
@@ -509,7 +509,7 @@ First-run **`AppState::FirstRun`** menu runs before **`CommandLoop`**.
 
 | File | Role |
 |------|------|
-| `NetInfo/config.toml` (next to `ConnectUnit.exe`) | Full `NetworkConfig`: identity/session, peers, invites, parasitic state, buffers, MTU/metric, pacing/APD/DRR/FEC runtime knobs, decentralized join, and engine tuning keys (all flat at root; no `[advanced]` table) |
+| `NetInfo/config.toml` (next to `ConnectUnit.exe`) | Full `NetworkConfig`: identity/session, peers, invites, parasitic state, buffers, MTU/metric, pacing/APD/DRR/FEC runtime knobs, decentralized join, and engine tuning keys (sectioned TOML tables: `[session]`, `[pacing]`, `[apd]`, `[drr]`, `[fec]`, `[congestion]`, `[failover]`, …) |
 | `NetInfo/peer_cache.json` (next to `ConnectUnit.exe`) | Learned endpoints (maintained by engine; not normal hand-edit) |
 
 ### Identity / session fields (not applied by `config reload`)
@@ -561,9 +561,9 @@ Factory defaults below match `NetworkConfig::default` / `pacing_defaults` / `Adv
 | `adapter_mtu` | **1340** | Wintun interface MTU (payload limit per frame on TAP) | Larger packets per datagram; more fragmentation risk on Internet path if PMTUD lags | Smaller frames; safer on lossy paths; more overhead |
 | PMTUD floor | **1220** | Minimum path MTU used when discovery incomplete | — | — |
 
-### Advanced tuning (`advanced` in config.toml)
+### Advanced tuning (sectioned tables in config.toml)
 
-Failover thresholds, engine timers, reliable RTO/retry bounds, FEC shard size + flush + adaptive thresholds + max total shards, PMTUD probe ladder, congestion telemetry / FEC loss classifier, routing EWMA / quality scoring, engine per-tick / STUN / MSYN limits, and canonical hole-punch stage knobs are exposed as **flat root keys** in `config.toml` (see [Performance parameters](#performance-parameters) for the full schema, clamps, and semantics). Defaults match the engine constants; omitting keys preserves today's behavior. Apply live with **`config reload`** (performance merge includes these fields); **`config reset`** also clears them. A `[advanced]` / `[advanced.*]` section is rejected. In-flight hole-punch workflows keep the snapshot from spawn; the next punch uses reloaded values.
+Failover thresholds, engine timers, reliable RTO/retry bounds, FEC shard size + flush + adaptive thresholds + max total shards, PMTUD probe ladder, congestion telemetry / FEC loss classifier, routing EWMA / quality scoring, engine per-tick / STUN / MSYN limits, and canonical hole-punch stage knobs live in dedicated TOML tables (`[failover]`, `[timers]`, `[reliable]`, `[fec]`, `[congestion]`, `[pmtud]`, `[routing_ewma]`, `[engine_limits]`, `[hole_punch]`, `[buffers]`) — see [Performance parameters](#performance-parameters) for the full schema, clamps, and semantics. Defaults match the engine constants; omitting keys preserves today's behavior. Apply live with **`config reload`** (performance merge includes these fields); **`config reset`** also clears them. In-flight hole-punch workflows keep the snapshot from spawn; the next punch uses reloaded values.
 
 ### UDP and Wintun (`buffer`)
 
@@ -724,56 +724,75 @@ CLI shows `[PUNCH] "Stage": 1|2|3` during interactive joins; reconnect fastpath 
 
 ## Performance parameters
 
-Most constants below are now **user-tunable at runtime** as flat keys in `config.toml` (CLI: **`config show`** / edit file + **`config reload`**). Omitting any field uses the factory default. Values are clamped before apply. **Not tunable**: crypto / anti-replay window (security-critical, locked).
+Most constants below are now **user-tunable at runtime** in sectioned `config.toml` tables (CLI: **`config show`** / edit file + **`config reload`**). Omitting any field uses the factory default. Values are clamped before apply. **Not tunable**: crypto / anti-replay window (security-critical, locked).
 
-On-disk TOML is fully flat (no `[advanced]` table). Equivalent JSON shape for reference:
+On-disk TOML is sectioned by feature. Example shape (key names unchanged inside each table):
 
-```json
-{
-  "d2r_quality_min": 35, "d2r_loss_max": 0.12, "r2d_quality_min": 50, "r2d_success_min": 3, "hold_down_secs": 2,
-  "keepalive_secs": 5, "msyn_secs": 15, "pmtud_batch_secs": 60, "ping_watchdog_ms": 100,
-  "stale_tick_secs": 30, "stale_mark_secs": 35, "stale_evict_secs": 90,
-  "rto_min_ms": 50, "rto_max_ms": 400, "max_pending": 256, "retries_left": 1,
-  "shard_payload_size": 1279, "flush_ms": 4, "flush_aggressive_ms": 2,
-  "adaptive_off_below": 0.015, "adaptive_on_above": 0.05, "fec_max_total_shards": 64,
-  "congestion_enabled": true, "gain": 0.1, "hol_escape_ms": 15,
-  "initial_rate_bps": 8000000, "additive_increase_bps": 64000, "min_decrease_factor": 0.8,
-  "rate_smoothing_alpha": 0.7, "min_rate_bps": 1500000, "max_rate_bps": 20000000,
-  "loss_multiplicative_decrease": 0.7, "burst_cap_bytes": 32000,
-  "rtt_base_tracking": true, "loss_classifier_enabled": true,
-  "target_queue_delay_ms": 15, "congestion_loss_threshold": 0.7,
-  "base_rtt_window_secs": 4, "base_rtt_stale_windows": 2, "probe_interval_ms": 30,
-  "fec_recovery_recency_ms": 3000,
-  "probe_sizes": [1500,1460,1400,1350,1300,1250,1200,1100,1000,576], "stable_downgrade_batches": 3,
-  "rtt_ewma_old": 0.8, "rtt_ewma_new": 0.2, "jitter_ewma_old": 0.8, "jitter_ewma_new": 0.2,
-  "loss_ewma_decay": 0.95, "loss_ewma_success_delta": 0.005, "loss_ewma_fail_bump": 0.05,
-  "bw_ewma_old": 0.85, "bw_ewma_new": 0.15, "quality_initial": 50,
-  "quality_loss_scale": 60, "quality_loss_penalty_cap": 40,
-  "quality_jitter_div": 3.0, "quality_jitter_penalty_cap": 30, "rtt_score_clamp_ms": 500,
-  "max_direct_retry_per_tick": 32, "max_pending_heal_probes": 96, "max_pending_stun_queries": 8,
-  "max_cc_probes_per_tick": 32, "max_secondary_retry_per_tick": 16,
-  "stun_cache_ttl_secs": 30, "msyn_body_max": 524288, "heal_cooldown_ms": 1000,
-  "punch_stage1_packets": 3, "punch_stage1_gap_ms": 50, "punch_stage1_observe_ms": 500,
-  "punch_stage2_observe_secs": 1, "punch_stage2_pps": 128, "punch_stage3_pps": 64,
-  "punch_stage3_max_secs": 10, "punch_stage3_batch_gap_ms": 500,
-  "punch_max_expanded_targets": 512, "punch_wide_min_width": 32, "punch_wide_max_width": 256,
-  "punch_random_port_min": 1024, "punch_random_port_max": 65535
-}
+```toml
+[session]
+server_name = "..."
+network_id = "..."
+role = "owner"
+virtual_ip = "10.0.0.1"
+# crypto_key, node_id, listen_port, invites, membership, …
+
+[[peers]]
+node_id = "..."
+name = "..."
+virtual_ip = "10.0.0.2"
+real_ip = "..."
+
+[parasitic]
+[adapter]
+[pacing]
+[apd]
+[drr]
+
+[fec]
+fec_enabled = true
+shard_payload_size = 1279
+flush_ms = 4
+fec_max_total_shards = 64
+
+[decentralized]
+
+[failover]
+d2r_quality_min = 35
+d2r_loss_max = 0.12
+r2d_quality_min = 50
+r2d_success_min = 3
+hold_down_secs = 2
+
+[timers]
+keepalive_secs = 5
+msyn_secs = 15
+stale_tick_secs = 30
+stale_mark_secs = 35
+stale_evict_secs = 90
+
+[reliable]
+[congestion]
+[pmtud]
+[routing_ewma]
+[engine_limits]
+[hole_punch]
+[buffers]
 ```
 
+Full key sets for each advanced table use the current field names (`d2r_*`, `keepalive_secs`, `shard_payload_size`, `congestion_enabled`, `probe_sizes`, `rtt_ewma_*`, `max_direct_retry_per_tick`, `punch_stage*`, …).
 Clamps (enforced before apply): `stale_tick < stale_mark < stale_evict`; `rto_min ≤ rto_max`; `shard_payload_size` ∈ `512..=1279` (v3 wire max — larger needs a protocol bump); `probe_sizes` unique, strictly decreasing, each `576..=1500`, ≥2 entries; `adaptive_off_below ≤ adaptive_on_above`; congestion: `gain` ∈ `0.1..=4.0`, `hol_escape_ms` ∈ `4..=100`, `target_queue_delay_ms` ∈ `10..=150`, `congestion_loss_threshold` ∈ `0.3..=0.95`, `base_rtt_window_secs` ∈ `1..=60`, `base_rtt_stale_windows` ∈ `1..=10`, `probe_interval_ms` **0** or **20–1000**, `fec_recovery_recency_ms` **0** or **100–60000**, `min_decrease_factor` ∈ `0.1..=0.9`, `additive_increase_bps` ∈ `4000..=1_000_000`, `rate_smoothing_alpha` ∈ `0..=0.95`, `min_rate_bps` ≥ `1000`, `max_rate_bps` ≤ `50_000_000`, `initial_rate_bps` ∈ `[min_rate_bps, max_rate_bps]`, `loss_multiplicative_decrease` ∈ `0.3..=0.9`, `burst_cap_bytes` ∈ `512..=262144`; `pace_rate_mode` must be `pps` or `bytes`.
 
 **FEC `shard_payload_size`** is a *local send ceiling*. Reducing it is valid for all peers on this wire version (they decode smaller shards fine); values above `1279` are rejected because the FEC header cannot carry larger shards without a wire-version change. Changing it flushes in-flight FEC groups. At send time the engine also derives an **effective** ceiling `min(configured, min_path_mtu − 28 − 12)` so FEC UDP datagrams fit the PMTUD path; if that value is below `512`, FEC bypasses. While APD is in Drain, FEC *timer* flush is passthrough-only (no Reed–Solomon parity).
 
 **Failover `r2d_success_min`** is used with a ×2 factor: a route's hold-down is cleared only when `success_streak ≥ r2d_success_min * 2` *and* `quality_score ≥ r2d_quality_min` (see `apply_rtt_sample` in `src/routing.rs`).
 
-**Live apply**: editing `config.toml` by hand does **not** touch the running daemon (no file watcher). Run **`config reload`** to merge performance fields (including `advanced`) from disk, clamp, and apply via pacing/runtime/advanced engine commands; or restart. **`config reset`** restores factory performance defaults (including `advanced`). Identity/peers/crypto changes in the file are **not** applied by reload — restart the daemon.
+**Live apply**: editing `config.toml` by hand does **not** touch the running daemon (no file watcher). Run **`config reload`** to merge performance fields from disk (pacing/APD/DRR/FEC plus the sectioned tuning tables), clamp, and apply via pacing/runtime/advanced engine commands; or restart. **`config reset`** restores factory performance defaults for those same fields. Identity/peers/crypto changes in the file are **not** applied by reload — restart the daemon.
 
-The remaining constants below are still code-only (not in `advanced`). **↑ / ↓** describe qualitative effect if a developer changes the constant. Routing EWMA / quality, engine per-tick / STUN / MSYN body caps, `fec_max_total_shards`, and hole-punch stage knobs are **flat config keys** (see JSON reference above); compile-time `FEC_MAX_TOTAL_SHARDS` remains the hard ceiling.
+The remaining constants below are still code-only (not in the sectioned tuning tables). **↑ / ↓** describe qualitative effect if a developer changes the constant. Routing EWMA / quality, engine per-tick / STUN / MSYN body caps, `fec_max_total_shards`, and hole-punch stage knobs are **config keys** under `[routing_ewma]`, `[engine_limits]`, `[fec]`, and `[hole_punch]` (see sectioned TOML reference above); compile-time `FEC_MAX_TOTAL_SHARDS` remains the hard ceiling.
 
 ### Routing table (`src/routing.rs`)
 
-Beyond [Failover defaults](#failover-defaults) and the flat `routing_ewma_*` / `quality_*` keys:
+Beyond [Failover defaults](#failover-defaults) and the `[routing_ewma]` / `quality_*` keys:
 
 | Parameter | Value | Meaning | If ↑ | If ↓ |
 |-----------|------:|---------|------|------|
@@ -797,7 +816,7 @@ Beyond [Failover defaults](#failover-defaults) and the flat `routing_ewma_*` / `
 | STUN keepalive | 5 s | Binding refresh to STUN server | — | — |
 | Ping watchdog | 100 ms | Detects peer ping timeouts | Faster failure detection; more CPU | Slower detect |
 
-**Per-tick / burst caps** (flat keys: `max_direct_retry_per_tick`, `max_secondary_retry_per_tick`, `max_pending_heal_probes`, `heal_cooldown_ms`, `max_pending_stun_queries`, `max_cc_probes_per_tick`)
+**Per-tick / burst caps** (`[engine_limits]`: `max_direct_retry_per_tick`, `max_secondary_retry_per_tick`, `max_pending_heal_probes`, `heal_cooldown_ms`, `max_pending_stun_queries`, `max_cc_probes_per_tick`)
 
 | Constant | Value | Meaning | If ↑ | If ↓ |
 |----------|------:|---------|------|------|
