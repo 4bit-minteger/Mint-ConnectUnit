@@ -9,6 +9,8 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::config_toml::{encode_network_config_toml, parse_network_config_toml};
+
 /// Joiner-only durable peer roster cap (owner uses unbounded `add_peer`).
 pub const JOINER_ROSTER_MAX: usize = 64;
 
@@ -182,7 +184,7 @@ pub struct NetworkConfig {
     pub join_method: String,
 
     /// Runtime tuning (failover / timers / reliable / FEC / PMTUD / congestion).
-    /// Flattened into the root TOML table; omitted keys use defaults.
+    /// On disk these live in sectioned TOML tables via `config_toml` (not flattened).
     #[serde(default, flatten)]
     pub advanced: crate::advanced_tuning::AdvancedTuning,
 }
@@ -867,74 +869,6 @@ impl ConfigManager {
     }
 }
 
-fn reject_advanced_section_tables(root: &toml::map::Map<String, toml::Value>) -> Result<()> {
-    if root.contains_key("advanced") {
-        anyhow::bail!(
-            "[advanced] tables are unsupported; put tuning keys at the root of config.toml"
-        );
-    }
-    Ok(())
-}
-
-fn compact_apd_watermark_floats(root: &mut toml::map::Map<String, toml::Value>) {
-    for key in ["apd_low_watermark", "apd_high_watermark"] {
-        if let Some(toml::Value::Float(v)) = root.get_mut(key) {
-            // Round away f32→f64 binary noise (e.g. 0.10_f32 → 0.10000000149…).
-            *v = (*v * 1_000_000.0).round() / 1_000_000.0;
-        }
-    }
-}
-
-/// Collapse `key = [ … ]` onto one line (toml pretty-printer emits one item/line).
-fn inline_named_array(toml_text: &str, key: &str) -> String {
-    let needle = format!("{key} = [");
-    let Some(start) = toml_text.find(&needle) else {
-        return toml_text.to_string();
-    };
-    let values_start = start + needle.len();
-    let rest = &toml_text[values_start..];
-    let Some(end_rel) = rest.find(']') else {
-        return toml_text.to_string();
-    };
-    let items: Vec<&str> = rest[..end_rel]
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut out = String::with_capacity(toml_text.len());
-    out.push_str(&toml_text[..start]);
-    out.push_str(&format!("{key} = [{}]", items.join(", ")));
-    out.push_str(&rest[end_rel + 1..]);
-    out
-}
-
-/// Encode `NetworkConfig` for `NetInfo/config.toml`: fully flat keys, compact
-/// APD watermarks, inline `probe_sizes`.
-fn encode_network_config_toml(cfg: &NetworkConfig) -> Result<String> {
-    let mut value =
-        toml::Value::try_from(cfg).map_err(|e| anyhow::anyhow!("config toml encode: {e}"))?;
-    if let Some(root) = value.as_table_mut() {
-        compact_apd_watermark_floats(root);
-    }
-    let pretty =
-        toml::to_string_pretty(&value).map_err(|e| anyhow::anyhow!("config toml pretty: {e}"))?;
-    Ok(inline_named_array(&pretty, "probe_sizes"))
-}
-
-fn parse_network_config_toml(raw: &str) -> Result<NetworkConfig> {
-    let value: toml::Value = raw
-        .parse()
-        .map_err(|e| anyhow::anyhow!("config toml parse: {e}"))?;
-    if let Some(root) = value.as_table() {
-        reject_advanced_section_tables(root)?;
-    }
-    let mut cfg: NetworkConfig = value
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("config toml decode: {e}"))?;
-    cfg.advanced.clamp();
-    Ok(cfg)
-}
-
 fn promote_tmp_to_path(tmp: &PathBuf, dest: &PathBuf) -> Result<()> {
     if std::fs::rename(tmp, dest).is_err() {
         #[cfg(windows)]
@@ -1184,20 +1118,33 @@ mod tests {
     }
 
     #[test]
-    fn network_config_toml_encode_is_root_flat_inline_probe_compact_wm() {
+    fn network_config_toml_encode_is_sectioned_inline_probe_compact_wm() {
         let cfg = NetworkConfig::default();
         let raw = encode_network_config_toml(&cfg).expect("encode");
+        for section in [
+            "[session]",
+            "[drr]",
+            "[fec]",
+            "[congestion]",
+            "[pmtud]",
+            "[apd]",
+            "[timers]",
+        ] {
+            assert!(raw.contains(section), "missing section {section}: {raw}");
+        }
         assert!(
             !raw.contains("[advanced]"),
-            "advanced must be flattened to root keys"
+            "must not write [advanced]: {raw}"
         );
         assert!(
             !raw.contains("[advanced."),
-            "nested advanced tables must not be written"
+            "must not write nested advanced tables: {raw}"
         );
+        // Tuning keys live under tables, not as root scalars before the first `[`.
+        let root_prefix = raw.split('[').next().unwrap_or(&raw);
         assert!(
-            raw.contains("keepalive_secs = "),
-            "tuning keys must appear at root: {raw}"
+            !root_prefix.contains("keepalive_secs = "),
+            "keepalive_secs must not be a root key: {raw}"
         );
         assert!(
             raw.contains(
@@ -1216,13 +1163,14 @@ mod tests {
         );
         assert!(
             raw.contains("congestion_enabled = "),
-            "congestion throttle flag must use congestion_enabled at root"
+            "congestion throttle flag must use congestion_enabled"
         );
     }
 
     #[test]
-    fn network_config_toml_loads_root_tuning_keys() {
-        let flat = r#"
+    fn network_config_toml_loads_sectioned_tuning_keys() {
+        let sectioned = r#"
+[session]
 server_name = "s"
 network_id = "n"
 role = "peer"
@@ -1232,50 +1180,61 @@ owner_port = 7878
 listen_port = 7878
 node_id = "id"
 crypto_key = "aa"
-peers = []
-owner_endpoints_cache = []
-membership_version = 0
-last_membership_hash = ""
-created_at = 0
+
+[adapter]
 udp_sndbuf = 262144
 udp_rcvbuf = 1048576
 adapter_mtu = 1340
 wintun_ring_bytes = 2097152
+
+[pacing]
 pace_tick_us = 250
 pace_target_pps = 24000
 base_max_burst = 6
 pace_budget_cap_packets = 8.0
 pace_max_queue_packets = 64
+
+[timers]
 keepalive_secs = 9
-shard_payload_size = 9999
 stale_tick_secs = 50
 stale_mark_secs = 40
 stale_evict_secs = 30
+
+[fec]
+shard_payload_size = 9999
+fec_max_total_shards = 32
+fec_force_data_shards = 4
+fec_force_parity_shards = 2
+
+[routing_ewma]
 rtt_ewma_old = 0.6
 rtt_ewma_new = 0.4
+
+[engine_limits]
 max_direct_retry_per_tick = 64
+
+[hole_punch]
 punch_stage2_pps = 200
-fec_max_total_shards = 32
 "#;
-        let from_flat = parse_network_config_toml(flat).expect("flat");
-        assert_eq!(from_flat.advanced.timers.keepalive_secs, 9);
+        let cfg = parse_network_config_toml(sectioned).expect("sectioned");
+        assert_eq!(cfg.advanced.timers.keepalive_secs, 9);
         assert_eq!(
-            from_flat.advanced.fec.shard_payload_size,
+            cfg.advanced.fec.shard_payload_size,
             crate::net::fec::FEC_SHARD_PAYLOAD_SIZE
         );
-        assert!((from_flat.advanced.routing_ewma.rtt_ewma_old - 0.6).abs() < 1e-9);
-        assert!((from_flat.advanced.routing_ewma.rtt_ewma_new - 0.4).abs() < 1e-9);
-        assert_eq!(
-            from_flat.advanced.engine_limits.max_direct_retry_per_tick,
-            64
-        );
-        assert_eq!(from_flat.advanced.hole_punch.punch_stage2_pps, 200);
-        assert_eq!(from_flat.advanced.fec.fec_max_total_shards, 32);
+        assert!((cfg.advanced.routing_ewma.rtt_ewma_old - 0.6).abs() < 1e-9);
+        assert!((cfg.advanced.routing_ewma.rtt_ewma_new - 0.4).abs() < 1e-9);
+        assert_eq!(cfg.advanced.engine_limits.max_direct_retry_per_tick, 64);
+        assert_eq!(cfg.advanced.hole_punch.punch_stage2_pps, 200);
+        assert_eq!(cfg.advanced.fec.fec_max_total_shards, 32);
+        assert_eq!(cfg.fec_force_data_shards, 4);
+        assert_eq!(cfg.fec_force_parity_shards, 2);
     }
 
     #[test]
-    fn network_config_toml_rejects_advanced_section() {
+    fn network_config_toml_rejects_unknown_root_table() {
         let nested = r#"
+[session]
 server_name = "s"
 network_id = "n"
 role = "peer"
@@ -1285,34 +1244,22 @@ owner_port = 7878
 listen_port = 7878
 node_id = "id"
 crypto_key = "aa"
-peers = []
-owner_endpoints_cache = []
-membership_version = 0
-last_membership_hash = ""
-created_at = 0
-udp_sndbuf = 262144
-udp_rcvbuf = 1048576
-adapter_mtu = 1340
-wintun_ring_bytes = 2097152
-pace_tick_us = 250
-pace_target_pps = 24000
-base_max_burst = 6
-pace_budget_cap_packets = 8.0
-pace_max_queue_packets = 64
 
 [advanced]
 keepalive_secs = 9
 "#;
-        let err = parse_network_config_toml(nested).expect_err("advanced section must fail");
+        let err = parse_network_config_toml(nested).expect_err("unknown root table must fail");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("unsupported"),
+            msg.contains("unknown field") || msg.contains("advanced"),
             "unexpected err: {err}"
         );
     }
 
     #[test]
-    fn network_config_toml_partial_advanced_clamps_on_load() {
+    fn network_config_toml_partial_sections_clamp_on_load() {
         let raw = r#"
+[session]
 server_name = "s"
 network_id = "n"
 role = "peer"
@@ -1322,23 +1269,13 @@ owner_port = 7878
 listen_port = 7878
 node_id = "id"
 crypto_key = "aa"
-peers = []
-owner_endpoints_cache = []
-membership_version = 0
-last_membership_hash = ""
-created_at = 0
-udp_sndbuf = 262144
-udp_rcvbuf = 1048576
-adapter_mtu = 1340
-wintun_ring_bytes = 2097152
-pace_tick_us = 250
-pace_target_pps = 24000
-base_max_burst = 6
-pace_budget_cap_packets = 8.0
-pace_max_queue_packets = 64
+
+[timers]
 stale_tick_secs = 50
 stale_mark_secs = 40
 stale_evict_secs = 30
+
+[fec]
 shard_payload_size = 9999
 "#;
         let cfg = parse_network_config_toml(raw).expect("parse partial");
@@ -1475,6 +1412,7 @@ shard_payload_size = 9999
     #[test]
     fn network_config_toml_omitted_decentralized_fields_use_defaults() {
         let raw = r#"
+[session]
 server_name = "s"
 network_id = "n"
 role = "peer"
@@ -1484,15 +1422,8 @@ owner_port = 7878
 listen_port = 7878
 node_id = "id"
 crypto_key = "aa"
-peers = []
-owner_endpoints_cache = []
-membership_version = 0
-last_membership_hash = ""
-created_at = 0
-udp_sndbuf = 262144
-udp_rcvbuf = 1048576
-adapter_mtu = 1340
-wintun_ring_bytes = 2097152
+
+[pacing]
 pace_tick_us = 250
 pace_target_pps = 24000
 base_max_burst = 6

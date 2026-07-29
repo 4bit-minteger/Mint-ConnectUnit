@@ -40,6 +40,7 @@ pub mod cli_emit;
 pub mod cli_session;
 pub mod client_main;
 pub mod config;
+mod config_toml;
 pub mod console_util;
 pub mod cpu_affinity;
 pub mod crypto;

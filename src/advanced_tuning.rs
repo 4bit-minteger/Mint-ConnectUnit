@@ -3,8 +3,8 @@
 //! All fields default to the hard-coded constants the engine used before this
 //! preserves today's behavior byte-for-byte. `clamp()` enforces hard floors /
 //! ceilings / ordering invariants before any value reaches the runtime. Persisted
-//! as flat keys in `NetInfo/config.toml` (no `[advanced]` table); apply live with
-//! `config reload`.
+//! as sectioned tables in `NetInfo/config.toml` (`[failover]`, `[timers]`,
+//! `[fec]`, `[congestion]`, …); apply live with `config reload`.
 
 use serde::{Deserialize, Serialize};
 
