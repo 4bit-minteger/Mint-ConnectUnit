@@ -1,0 +1,22 @@
+<svg width="400" height="400" viewBox="0 0 400 400" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="disk">
+      <circle cx="200" cy="200" r="200"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#disk)">
+    <circle cx="200" cy="200" r="200" fill="#0D0D0D"/>
+    <line x1="200" y1="82" x2="302.19" y2="141" stroke="white" stroke-width="9" stroke-linecap="round"/>
+    <line x1="302.19" y1="141" x2="302.19" y2="259" stroke="white" stroke-width="9" stroke-linecap="round"/>
+    <line x1="302.19" y1="259" x2="200" y2="318" stroke="white" stroke-width="9" stroke-linecap="round"/>
+    <line x1="200" y1="318" x2="97.81" y2="259" stroke="white" stroke-width="9" stroke-linecap="round"/>
+    <line x1="97.81" y1="259" x2="97.81" y2="141" stroke="white" stroke-width="9" stroke-linecap="round"/>
+    <line x1="97.81" y1="141" x2="200" y2="82" stroke="white" stroke-width="9" stroke-linecap="round"/>
+    <circle cx="200" cy="82" r="14" fill="white"/>
+    <circle cx="302.19" cy="141" r="14" fill="white"/>
+    <circle cx="302.19" cy="259" r="14" fill="white"/>
+    <circle cx="200" cy="318" r="14" fill="white"/>
+    <circle cx="97.81" cy="259" r="14" fill="white"/>
+    <circle cx="97.81" cy="141" r="14" fill="white"/>
+  </g>
+</svg>
