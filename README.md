@@ -4,7 +4,7 @@
 
 - A light-weight portable serverless peer-to-peer VPN for **Windows**, optimized for low-bandwidth, low-latency tasks.
 - Using **Wintun** TAP adapter
-- There is no central data-plane server, only optional STUN/UPnP for NAT traversal.
+- There is no central data-plane server, only optional STUN/UPnP for NAT traversal, no online account needed.
 
 This document is the **project orientation guide**. For locked wire behaviour, engine internals, source layout, and numeric defaults, see **[`SPEC.md`](SPEC.md)**.
 
