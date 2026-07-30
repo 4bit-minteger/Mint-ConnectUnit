@@ -168,5 +168,5 @@ This project also **bundles or depends on third-party components under their own
 
 | Component | License | Notes |
 |-----------|---------|-------|
-| **Wintun** (`wintun.dll`) | WireGuard LLC's own *Prebuilt Binaries License* (not MIT/GPL) | Bundled binary, Copyright © WireGuard LLC. Full text: [`licenses/wintun-LICENSE.txt`](licenses/wintun-LICENSE.txt) (copied verbatim from the official wintun.net release archive) |
+| **Wintun** (`wintun.dll`) | WireGuard LLC's own Prebuilt Binaries License | Bundled binary, Copyright © WireGuard LLC. Full text: [`licenses/wintun-LICENSE.txt`](licenses/wintun-LICENSE.txt) |
 | Rust crate dependencies | MIT / Apache-2.0 | Full list + license texts: [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) |
