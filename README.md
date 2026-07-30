@@ -1,6 +1,6 @@
 # Mint-ConnectUnit
 
-- A light-weight portable serverless peer-to-peer VPN for **Windows** (at least now), optimized for low-bandwidth, low-latency tasks.
+- A light-weight portable serverless peer-to-peer VPN for **Windows**, optimized for low-bandwidth, low-latency tasks.
 - Using **Wintun** TAP adapter
 - There is no central data-plane server, only optional STUN/UPnP for NAT traversal.
 
@@ -10,14 +10,29 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 
 ## Table of contents
 
-1. [Features](#features)
-2. [Build and run](#build-and-run)
-3. [Architecture](#architecture)
-4. [Roles: owner vs peer](#roles-owner-vs-peer)
-5. [CLI commands](#cli-commands)
-6. [Configuration](#configuration)
+1. [Quick start](#quick-start)
+2. [Features](#features)
+3. [Build and run](#build-and-run)
+4. [Architecture](#architecture)
+5. [Roles: owner vs peer](#roles-owner-vs-peer)
+6. [CLI commands](#cli-commands)
+7. [Configuration](#configuration)
 
 ---
+
+## Quick start
+
+1. Run `ConnectUnit.exe`(or your binary build name) as **Administrator**, make sure you have `wintun.dll` in the same folder with the binary.
+2. Window defender may block it? -> More info -> Run anyway if you trust me.
+3. Command Line Interface -> type [1] to create server, [2] to join a server
+  - If you are not a power-user -> Just press Enter, it will automatically setup a new server.
+    - To invite someone to join -> Copy the Public Invite ID and send to them (or LAN Invite ID if they are in the same wifi/network).
+    - In CLI, type `?`  for help or read docs.
+  - If you join a server:
+    - Type [1] (recommended) or just press enter for `Decentralized` (using BitTorrent tracker to find others) -> paste the Public Invite ID -> Usually it will take about 1 minutes to join.
+    - Type [2] for `Parasitic` mode -> Basically, just use this option when you want to use other VPNs as a free signaling server to start handshake instead of BitTorrent tracker.
+4. Should know that the VPN will run in the background until you open CLI and type `stop` (it still run if you just close the CLI window).
+5. File `NetInfo/config.toml` automatically generate for our power-user.
 
 ## Features
 
@@ -147,10 +162,11 @@ Full field list, factory defaults, and what each knob trades off: **[`SPEC.md` �
 
 ## License
 
-This project's own source code is released under **MIT** — see [LICENSE](LICENSE).
+This project's **own source code** is licensed under the **MIT License** — see [LICENSE](LICENSE).
 
-It bundles or depends on third-party components under their own licenses:
-- **Wintun** (`wintun.dll`) — WireGuard LLC's Prebuilt Binaries License, see [licenses/wintun-LICENSE.txt](licenses/wintun-LICENSE.txt)
-- All Rust crate dependencies (Tokio, etc.) — see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
+This project also **bundles or depends on third-party components under their own, separate licenses**, which are not covered or superseded by the MIT license above:
 
-These third-party licenses are **not** superseded by this project's CC0 license.
+| Component | License | Notes |
+|-----------|---------|-------|
+| **Wintun** (`wintun.dll`) | WireGuard LLC's own *Prebuilt Binaries License* (not MIT/GPL) | Bundled binary, Copyright © WireGuard LLC. Full text: [`licenses/wintun-LICENSE.txt`](licenses/wintun-LICENSE.txt) (copied verbatim from the official wintun.net release archive) |
+| Rust crate dependencies | MIT / Apache-2.0 | Full list + license texts: [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) |
