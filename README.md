@@ -48,6 +48,7 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 
 ## Build and run
 
+[![Build and Test](https://github.com/4bit-minteger/Mint-ConnectUnit/actions/workflows/build.yml/badge.svg)](https://github.com/4bit-minteger/Mint-ConnectUnit/actions/workflows/build.yml)
 **Requirements:** Windows, Rust **1.95+**, administrator privileges at runtime (Wintun / adapter / some `netsh` operations).
 
 The release binary embeds a **`requireAdministrator`** manifest: double-click or shortcut launch shows **UAC**; approve to run elevated. Declining UAC exits with an administrator-required message.
