@@ -4842,6 +4842,10 @@ impl Cli {
         crate::cli_println!("  saved_apd_sojourn      : {}", s.apd_sojourn_enabled);
         crate::cli_println!("  saved_apd_max_sojourn  : {} ms", s.apd_max_sojourn_ms);
         crate::cli_println!("  saved_apd_target_sojourn: {} ms", s.apd_target_sojourn_ms);
+        crate::cli_println!(
+            "  saved_apd_require_cc_headroom: {}",
+            s.apd_require_cc_headroom
+        );
         crate::cli_println!("  saved_shed_enabled     : {}", s.shed_enabled);
         crate::cli_println!("  saved_shed_max_sojourn : {} ms", s.shed_max_sojourn_ms);
         crate::cli_println!("  saved_shed_min_fill    : {:.2}", s.shed_min_fill);
@@ -4898,8 +4902,8 @@ impl Cli {
     }
 
     fn print_advanced_block(a: &crate::advanced_tuning::AdvancedTuning) {
-        crate::cli_println!("  failover: d2r_quality_min={} d2r_loss_max={:.3} r2d_quality_min={} r2d_success_min={} hold_down_secs={}",
-            a.failover.d2r_quality_min, a.failover.d2r_loss_max, a.failover.r2d_quality_min, a.failover.r2d_success_min, a.failover.hold_down_secs);
+        crate::cli_println!("  failover: d2r_quality_min={} d2r_loss_max={:.3} d2r_jitter_max={:.1} r2d_quality_min={} r2d_success_min={} hold_down_secs={}",
+            a.failover.d2r_quality_min, a.failover.d2r_loss_max, a.failover.d2r_jitter_max, a.failover.r2d_quality_min, a.failover.r2d_success_min, a.failover.hold_down_secs);
         crate::cli_println!("  timers: keepalive={}s msyn={}s pmtud_batch={}s ping_watchdog={}ms stale_tick={}s stale_mark={}s stale_evict={}s",
             a.timers.keepalive_secs, a.timers.msyn_secs, a.timers.pmtud_batch_secs, a.timers.ping_watchdog_ms, a.timers.stale_tick_secs, a.timers.stale_mark_secs, a.timers.stale_evict_secs);
         crate::cli_println!(
@@ -5362,6 +5366,10 @@ impl Cli {
                     m.apd_last_max_sojourn_ms.load(Ordering::Relaxed)
                 ));
                 lines.push(format!(
+                    "  apd_cc_headroom_suppressions: {}",
+                    m.apd_cc_headroom_suppressions.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
                     "  cc_rate_limited        : {}",
                     m.cc_rate_limited_events.load(Ordering::Relaxed)
                 ));
@@ -5511,6 +5519,7 @@ impl Cli {
                 lines.push(na("apd_drain_arm_fill"));
                 lines.push(na("apd_drain_arm_sojourn"));
                 lines.push(na("apd_max_sojourn_ms"));
+                lines.push(na("apd_cc_headroom_suppressions"));
                 lines.push(na("cc_rate_limited"));
                 lines.push(na("drr_small_priority_pops"));
                 lines.push(na("drr_bulk_force_pops"));

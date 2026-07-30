@@ -205,6 +205,7 @@ pub(crate) struct ApdFile {
     pub apd_sojourn_enabled: bool,
     pub apd_max_sojourn_ms: u32,
     pub apd_target_sojourn_ms: u32,
+    pub apd_require_cc_headroom: bool,
     pub shed_enabled: bool,
     pub shed_max_sojourn_ms: u32,
     pub shed_min_fill: f32,
@@ -228,6 +229,7 @@ impl Default for ApdFile {
             apd_sojourn_enabled: d.apd_sojourn_enabled,
             apd_max_sojourn_ms: d.apd_max_sojourn_ms,
             apd_target_sojourn_ms: d.apd_target_sojourn_ms,
+            apd_require_cc_headroom: d.apd_require_cc_headroom,
             shed_enabled: d.shed_enabled,
             shed_max_sojourn_ms: d.shed_max_sojourn_ms,
             shed_min_fill: d.shed_min_fill,
@@ -391,6 +393,7 @@ impl From<&NetworkConfig> for NetworkConfigFile {
                 apd_sojourn_enabled: cfg.apd_sojourn_enabled,
                 apd_max_sojourn_ms: cfg.apd_max_sojourn_ms,
                 apd_target_sojourn_ms: cfg.apd_target_sojourn_ms,
+                apd_require_cc_headroom: cfg.apd_require_cc_headroom,
                 shed_enabled: cfg.shed_enabled,
                 shed_max_sojourn_ms: cfg.shed_max_sojourn_ms,
                 shed_min_fill: cfg.shed_min_fill,
@@ -499,6 +502,7 @@ impl From<NetworkConfigFile> for NetworkConfig {
         cfg.apd_sojourn_enabled = file.apd.apd_sojourn_enabled;
         cfg.apd_max_sojourn_ms = file.apd.apd_max_sojourn_ms;
         cfg.apd_target_sojourn_ms = file.apd.apd_target_sojourn_ms;
+        cfg.apd_require_cc_headroom = file.apd.apd_require_cc_headroom;
         cfg.shed_enabled = file.apd.shed_enabled;
         cfg.shed_max_sojourn_ms = file.apd.shed_max_sojourn_ms;
         cfg.shed_min_fill = file.apd.shed_min_fill;

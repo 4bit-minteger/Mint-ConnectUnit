@@ -1814,6 +1814,8 @@ impl P2PEngine {
             obs.apd_max_sojourn,
         );
         self.metrics
+            .set_apd_cc_headroom_suppressions(obs.apd_cc_headroom_suppressions);
+        self.metrics
             .set_cc_rate_limited_events(obs.cc_rate_limited_events);
         self.metrics
             .set_drr_small_priority_pops(obs.drr_small_priority_pops);

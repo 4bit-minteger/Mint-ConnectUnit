@@ -65,6 +65,7 @@ pub struct EngineMetrics {
     pub apd_drain_arm_fill: AtomicU64,
     pub apd_drain_arm_sojourn: AtomicU64,
     pub apd_last_max_sojourn_ms: AtomicU64,
+    pub apd_cc_headroom_suppressions: AtomicU64,
     pub fec_congestive_hold_count: AtomicU64,
     pub fec_classifier_allow_count: AtomicU64,
     pub fec_recovery_stepdown_count: AtomicU64,
@@ -363,6 +364,11 @@ impl EngineMetrics {
             .store(drain_arm_sojourn, Ordering::Relaxed);
         self.apd_last_max_sojourn_ms
             .store(last_max_sojourn_ms, Ordering::Relaxed);
+    }
+
+    pub fn set_apd_cc_headroom_suppressions(&self, n: u64) {
+        self.apd_cc_headroom_suppressions
+            .store(n, Ordering::Relaxed);
     }
 
     pub fn inc_fec_congestive_hold(&self) {

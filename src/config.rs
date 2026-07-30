@@ -135,6 +135,8 @@ pub struct NetworkConfig {
     pub apd_max_sojourn_ms: u32,
     #[serde(default = "default_apd_target_sojourn_ms")]
     pub apd_target_sojourn_ms: u32,
+    #[serde(default = "default_apd_require_cc_headroom")]
+    pub apd_require_cc_headroom: bool,
     #[serde(default = "default_shed_enabled")]
     pub shed_enabled: bool,
     #[serde(default = "default_shed_max_sojourn_ms")]
@@ -285,6 +287,10 @@ fn default_apd_max_sojourn_ms() -> u32 {
 
 fn default_apd_target_sojourn_ms() -> u32 {
     crate::net::pacing_defaults::DEFAULT_APD_TARGET_SOJOURN_MS
+}
+
+fn default_apd_require_cc_headroom() -> bool {
+    crate::net::pacing_defaults::DEFAULT_APD_REQUIRE_CC_HEADROOM
 }
 
 fn default_shed_enabled() -> bool {
@@ -456,6 +462,7 @@ impl Default for NetworkConfig {
             apd_sojourn_enabled: default_apd_sojourn_enabled(),
             apd_max_sojourn_ms: default_apd_max_sojourn_ms(),
             apd_target_sojourn_ms: default_apd_target_sojourn_ms(),
+            apd_require_cc_headroom: default_apd_require_cc_headroom(),
             shed_enabled: default_shed_enabled(),
             shed_max_sojourn_ms: default_shed_max_sojourn_ms(),
             shed_min_fill: default_shed_min_fill(),
@@ -522,6 +529,7 @@ impl NetworkConfig {
         self.apd_sojourn_enabled = other.apd_sojourn_enabled;
         self.apd_max_sojourn_ms = other.apd_max_sojourn_ms;
         self.apd_target_sojourn_ms = other.apd_target_sojourn_ms;
+        self.apd_require_cc_headroom = other.apd_require_cc_headroom;
         self.shed_enabled = other.shed_enabled;
         self.shed_max_sojourn_ms = other.shed_max_sojourn_ms;
         self.shed_min_fill = other.shed_min_fill;
@@ -1518,7 +1526,7 @@ pace_max_queue_packets = 64
     fn shed_fields_round_trip_and_defaults() {
         let cfg = NetworkConfig::default();
         assert!(cfg.shed_enabled);
-        assert_eq!(cfg.shed_max_sojourn_ms, 40);
+        assert_eq!(cfg.shed_max_sojourn_ms, 50);
         assert!((cfg.shed_min_fill - 0.2).abs() < f32::EPSILON);
         assert_eq!(cfg.shed_max_per_tick, 2);
 

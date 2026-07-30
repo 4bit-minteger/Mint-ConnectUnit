@@ -12,8 +12,8 @@ use super::pacing_defaults::{
     APD_TARGET_SOJOURN_MS_MAX, APD_TARGET_SOJOURN_MS_MIN, DEFAULT_APD_CONFIRM_TICKS,
     DEFAULT_APD_COOLDOWN_MS, DEFAULT_APD_DRAIN_FREEZE_DRR, DEFAULT_APD_DRAIN_TICK_US,
     DEFAULT_APD_ENABLED, DEFAULT_APD_HIGH_WM, DEFAULT_APD_LOW_WM, DEFAULT_APD_MAX_SOJOURN_MS,
-    DEFAULT_APD_SOJOURN_ENABLED, DEFAULT_APD_SPINLOOP_BUDGET_MS, DEFAULT_APD_TARGET_SOJOURN_MS,
-    DEFAULT_DRAIN_MAX_BURST, DEFAULT_DRR_SMALL_PACKET_PRIORITY,
+    DEFAULT_APD_REQUIRE_CC_HEADROOM, DEFAULT_APD_SOJOURN_ENABLED, DEFAULT_APD_SPINLOOP_BUDGET_MS,
+    DEFAULT_APD_TARGET_SOJOURN_MS, DEFAULT_DRAIN_MAX_BURST, DEFAULT_DRR_SMALL_PACKET_PRIORITY,
     DEFAULT_DRR_SMALL_PACKET_THRESHOLD_BYTES, DEFAULT_MAX_TICK_WORK_US,
     DEFAULT_PACE_BUDGET_PACKETS, DEFAULT_PACE_BURST_PER_TICK, DEFAULT_PACE_MAX_QUEUE,
     DEFAULT_PACE_TARGET_PPS, DEFAULT_PACE_TICK_US, DEFAULT_RAMP_MAX_BURST, DEFAULT_SHED_ENABLED,
@@ -60,6 +60,9 @@ pub struct ApdConfig {
     pub sojourn_enabled: bool,
     pub max_sojourn_ms: f32,
     pub target_sojourn_ms: f32,
+    /// When true and background CC is enabled, suppress APD ramp-up / Drain arm /
+    /// mid-Drain spin unless at least one non-empty data peer is CC-sendable.
+    pub require_cc_headroom: bool,
 }
 
 impl Default for ApdConfig {
@@ -78,6 +81,7 @@ impl Default for ApdConfig {
             sojourn_enabled: DEFAULT_APD_SOJOURN_ENABLED,
             max_sojourn_ms: DEFAULT_APD_MAX_SOJOURN_MS as f32,
             target_sojourn_ms: DEFAULT_APD_TARGET_SOJOURN_MS as f32,
+            require_cc_headroom: DEFAULT_APD_REQUIRE_CC_HEADROOM,
         }
     }
 }
@@ -199,6 +203,7 @@ pub fn apd_config_from_network(cfg: &crate::config::NetworkConfig) -> ApdConfig 
         sojourn_enabled: cfg.apd_sojourn_enabled,
         max_sojourn_ms: cfg.apd_max_sojourn_ms as f32,
         target_sojourn_ms: cfg.apd_target_sojourn_ms as f32,
+        require_cc_headroom: cfg.apd_require_cc_headroom,
     };
     apd.clamp_to_user_ranges(tick, base_burst);
     apd.sanitize();
@@ -278,6 +283,7 @@ struct ApdState {
     drain_arm_fill: u64,
     drain_arm_sojourn: u64,
     last_max_sojourn_ms: u64,
+    cc_headroom_suppressions: u64,
 }
 
 impl ApdState {
@@ -302,6 +308,7 @@ impl ApdState {
             drain_arm_fill: 0,
             drain_arm_sojourn: 0,
             last_max_sojourn_ms: 0,
+            cc_headroom_suppressions: 0,
         }
     }
 }
@@ -1392,6 +1399,7 @@ impl PacingEngine {
         self.apd.drain_arm_fill = 0;
         self.apd.drain_arm_sojourn = 0;
         self.apd.last_max_sojourn_ms = 0;
+        self.apd.cc_headroom_suppressions = 0;
         self.last_tick = Instant::now();
     }
 
@@ -1537,6 +1545,42 @@ impl PacingEngine {
         )
     }
 
+    /// Ticks where CC headroom gate suppressed APD ramp-up, Drain arm, or mid-Drain spin.
+    pub fn apd_cc_headroom_suppressions(&self) -> u64 {
+        self.apd.cc_headroom_suppressions
+    }
+
+    /// True when background CC is off, no non-empty data peers exist (vacuous), or at least
+    /// one non-empty peer HOL passes `can_send_data` (including `hol_escape`).
+    fn any_peer_data_cc_sendable(&self, now: Instant) -> bool {
+        if !self.config.background_cc.enabled {
+            return true;
+        }
+        let (priority_on, threshold) = self.peer_lane_config();
+        let mut scanned = 0usize;
+        for (dest, q) in self.peer_queues.iter() {
+            if q.is_empty() {
+                continue;
+            }
+            scanned = scanned.saturating_add(1);
+            let front_len = q.front_len(priority_on, threshold, now);
+            let hol = q.hol_sojourn_ms(now);
+            if self.background_cc_can_send(*dest, front_len, hol) {
+                return true;
+            }
+        }
+        scanned == 0
+    }
+
+    /// Decay ramp toward base without allowing pin/increase (CC headroom suppress path).
+    fn apd_decay_ramp_burst_only(&mut self, fill_ratio: f32, base_burst: u64) {
+        if self.apd.ramp_burst == 0 {
+            self.apd.ramp_burst = base_burst;
+        }
+        self.apd.ramp_burst = self.apd.ramp_burst.saturating_sub(1).max(base_burst);
+        self.apd.last_fill_ratio = fill_ratio;
+    }
+
     fn apd_update_ramp_burst(
         &mut self,
         fill_ratio: f32,
@@ -1598,6 +1642,7 @@ impl PacingEngine {
         let base_burst = self.config.base_max_burst;
         let ramp_ceiling = cfg.ramp_max_burst.max(base_burst);
         let drain_burst = cfg.drain_max_burst.clamp(1, ramp_ceiling);
+        let suppress_cc = cfg.require_cc_headroom && !self.any_peer_data_cc_sendable(now);
 
         match self.apd.phase {
             ApdPhase::Cooldown => {
@@ -1607,7 +1652,13 @@ impl PacingEngine {
                     self.apd.confirm_counter = 0;
                     self.apd.cooldown_until = None;
                 }
-                self.apd_update_ramp_burst(fill_ratio, base_burst, cfg, ramp_ceiling);
+                if suppress_cc {
+                    self.apd_decay_ramp_burst_only(fill_ratio, base_burst);
+                    self.apd.cc_headroom_suppressions =
+                        self.apd.cc_headroom_suppressions.saturating_add(1);
+                } else {
+                    self.apd_update_ramp_burst(fill_ratio, base_burst, cfg, ramp_ceiling);
+                }
                 self.apd.last_pure_spin = false;
                 self.apd.last_tick_us = 0;
                 let burst = self.apd.ramp_burst.max(base_burst);
@@ -1619,11 +1670,17 @@ impl PacingEngine {
             }
 
             ApdPhase::Alert => {
-                self.apd_update_ramp_burst(fill_ratio, base_burst, cfg, ramp_ceiling);
+                if suppress_cc {
+                    self.apd_decay_ramp_burst_only(fill_ratio, base_burst);
+                    self.apd.cc_headroom_suppressions =
+                        self.apd.cc_headroom_suppressions.saturating_add(1);
+                } else {
+                    self.apd_update_ramp_burst(fill_ratio, base_burst, cfg, ramp_ceiling);
+                }
                 let pinned = self.apd_ramp_pinned(base_burst, cfg, ramp_ceiling);
                 let fill_arm = pinned && fill_ratio > cfg.high_watermark;
                 let sojourn_arm = cfg.sojourn_enabled && hol_sojourn_ms > cfg.max_sojourn_ms;
-                if fill_arm || sojourn_arm {
+                if (fill_arm || sojourn_arm) && !suppress_cc {
                     let enter = if cfg.confirm_ticks == 0 {
                         true
                     } else {
@@ -1662,6 +1719,12 @@ impl PacingEngine {
             }
 
             ApdPhase::Drain => {
+                if suppress_cc {
+                    self.apd.cc_headroom_suppressions =
+                        self.apd.cc_headroom_suppressions.saturating_add(1);
+                    return self.apd_exit_drain_to_cooldown(now, false);
+                }
+
                 let budget_exhausted = cfg.spinloop_budget_ms > 0
                     && self
                         .apd
@@ -2061,6 +2124,7 @@ mod tests {
             sojourn_enabled: true,
             max_sojourn_ms: 20.0,
             target_sojourn_ms: 8.0,
+            require_cc_headroom: true,
         };
         p.set_config(cfg);
         p
@@ -2278,6 +2342,7 @@ mod tests {
         assert!(apd.sojourn_enabled);
         assert!((apd.max_sojourn_ms - 6.0).abs() < f32::EPSILON);
         assert!((apd.target_sojourn_ms - 2.0).abs() < f32::EPSILON);
+        assert!(apd.require_cc_headroom);
     }
 
     #[test]
@@ -2837,5 +2902,112 @@ mod tests {
             _ => panic!("expected clear peer data packet"),
         }
         assert!(p.cc_rate_limited_events() >= 1);
+    }
+
+    fn enable_cc_starve(p: &mut PacingEngine, dest: SocketAddr) {
+        use crate::net::background_cc::BackgroundCcConfig;
+        let cc_cfg = BackgroundCcConfig {
+            enabled: true,
+            hol_escape_ms: 50,
+            burst_cap_bytes: 100.0,
+            ..BackgroundCcConfig::default()
+        };
+        p.set_background_cc_config(cc_cfg);
+        p.enqueue_peer(Bytes::from(vec![0u8; 200]), dest);
+        p.background_cc.set_peer_tokens_for_test(dest, 0.0);
+    }
+
+    #[test]
+    fn apd_cc_headroom_suppresses_drain_and_ramp_pin() {
+        let mut p = apd_engine();
+        p.apd.cfg.confirm_ticks = 1;
+        let dest = addr(80);
+        enable_cc_starve(&mut p, dest);
+        let now = Instant::now();
+        let ceiling = p.apd.cfg.ramp_max_burst.max(p.config.base_max_burst);
+        p.apd_step(0.0, now, 0.0); // → Alert
+        for _ in 0..8 {
+            p.apd_step(0.95, now, 100.0);
+        }
+        assert_ne!(p.apd.phase, ApdPhase::Drain);
+        assert!(p.apd.ramp_burst < ceiling);
+        assert!(p.apd_cc_headroom_suppressions() >= 1);
+    }
+
+    #[test]
+    fn apd_cc_headroom_allows_drain_when_peer_has_tokens() {
+        let mut p = apd_engine();
+        let dest = addr(81);
+        enable_cc_starve(&mut p, dest);
+        p.background_cc.set_peer_tokens_for_test(dest, 10_000.0);
+        let now = Instant::now();
+        pin_apd_ramp(&mut p, now);
+        p.apd.cfg.confirm_ticks = 1;
+        p.apd_step(0.95, now, 100.0);
+        assert_eq!(p.apd.phase, ApdPhase::Drain);
+    }
+
+    #[test]
+    fn apd_cc_headroom_disabled_allows_drain_under_cc_starve() {
+        let mut p = apd_engine();
+        p.apd.cfg.require_cc_headroom = false;
+        let dest = addr(82);
+        enable_cc_starve(&mut p, dest);
+        let now = Instant::now();
+        pin_apd_ramp(&mut p, now);
+        p.apd.cfg.confirm_ticks = 1;
+        p.apd_step(0.95, now, 100.0);
+        assert_eq!(p.apd.phase, ApdPhase::Drain);
+    }
+
+    #[test]
+    fn apd_cc_headroom_vacuous_without_data_peers_allows_drain() {
+        use crate::net::background_cc::BackgroundCcConfig;
+
+        let mut p = apd_engine();
+        p.set_background_cc_config(BackgroundCcConfig {
+            enabled: true,
+            ..BackgroundCcConfig::default()
+        });
+        // Control-only backlog: no non-empty data peers → vacuous headroom.
+        p.enqueue_control(Bytes::from_static(b"ctrl"), addr(83));
+        let now = Instant::now();
+        pin_apd_ramp(&mut p, now);
+        p.apd.cfg.confirm_ticks = 1;
+        p.apd_step(0.95, now, 100.0);
+        assert_eq!(p.apd.phase, ApdPhase::Drain);
+    }
+
+    #[test]
+    fn apd_cc_headroom_early_exits_drain_when_tokens_gone() {
+        let mut p = apd_engine();
+        p.apd.cfg.spinloop_budget_ms = 0; // would otherwise stick in Drain
+        let dest = addr(84);
+        enable_cc_starve(&mut p, dest);
+        p.background_cc.set_peer_tokens_for_test(dest, 10_000.0);
+        let now = Instant::now();
+        pin_apd_ramp(&mut p, now);
+        p.apd.cfg.confirm_ticks = 1;
+        p.apd_step(0.95, now, 100.0);
+        assert_eq!(p.apd.phase, ApdPhase::Drain);
+        p.background_cc.set_peer_tokens_for_test(dest, 0.0);
+        p.apd_step(0.95, now, 100.0);
+        assert_eq!(p.apd.phase, ApdPhase::Cooldown);
+        assert!(p.apd_cc_headroom_suppressions() >= 1);
+    }
+
+    #[test]
+    fn apd_require_cc_headroom_toml_default_true() {
+        use crate::config::NetworkConfig;
+        use crate::config_toml::NetworkConfigFile;
+
+        let net = NetworkConfig::default();
+        assert!(net.apd_require_cc_headroom);
+        let file = NetworkConfigFile::from(&net);
+        assert!(file.apd.apd_require_cc_headroom);
+        let round = NetworkConfig::from(file);
+        assert!(round.apd_require_cc_headroom);
+        let apd = super::apd_config_from_network(&round);
+        assert!(apd.require_cc_headroom);
     }
 }

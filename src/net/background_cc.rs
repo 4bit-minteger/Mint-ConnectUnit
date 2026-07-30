@@ -5,17 +5,17 @@ use std::net::SocketAddr;
 
 use crate::routing::failover;
 
-pub const DEFAULT_BURST_CAP_BYTES: u64 = 32_000;
-pub const DEFAULT_GAIN: f64 = 0.1;
-pub const DEFAULT_MIN_DECREASE_FACTOR: f64 = 0.8;
-pub const DEFAULT_ADDITIVE_INCREASE_BPS: f64 = 64_000.0;
-pub const DEFAULT_RATE_SMOOTHING_ALPHA: f64 = 0.7;
+pub const DEFAULT_BURST_CAP_BYTES: u64 = 16_000;
+pub const DEFAULT_GAIN: f64 = 0.35;
+pub const DEFAULT_MIN_DECREASE_FACTOR: f64 = 0.85;
+pub const DEFAULT_ADDITIVE_INCREASE_BPS: f64 = 48_000.0;
+pub const DEFAULT_RATE_SMOOTHING_ALPHA: f64 = 0.8;
 pub const DEFAULT_MIN_RATE_BPS: f64 = 1_500_000.0;
 pub const DEFAULT_MAX_RATE_BPS: f64 = 20_000_000.0;
 pub const DEFAULT_INITIAL_RATE_BPS: f64 = 8_000_000.0;
-pub const DEFAULT_LOSS_MD: f64 = 0.7;
-pub const DEFAULT_HOL_ESCAPE_MS: u32 = 15;
-pub const DEFAULT_TARGET_QUEUE_DELAY_MS: u32 = 15;
+pub const DEFAULT_LOSS_MD: f64 = 0.85;
+pub const DEFAULT_HOL_ESCAPE_MS: u32 = 5;
+pub const DEFAULT_TARGET_QUEUE_DELAY_MS: u32 = 10;
 
 /// Runtime copy of user tuning (from `CongestionTuning`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -309,7 +309,14 @@ mod tests {
             ..PeerCcState::new(100_000.0)
         };
         let cfg = test_cfg();
-        assert!(peer_can_send_bytes(&st, &cfg, 1400, 20.0));
-        assert!(!peer_can_send_bytes(&st, &cfg, 1400, 5.0));
+        let escape = cfg.hol_escape_ms as f32;
+        assert!(peer_can_send_bytes(&st, &cfg, 1400, escape));
+        assert!(peer_can_send_bytes(&st, &cfg, 1400, escape + 1.0));
+        assert!(!peer_can_send_bytes(
+            &st,
+            &cfg,
+            1400,
+            (escape - 1.0).max(0.0)
+        ));
     }
 }

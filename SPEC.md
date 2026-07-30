@@ -273,7 +273,7 @@ Important internal state (non-exhaustive):
 
 - Multiple **`PathCandidate`** records: `Direct`, `OwnerRelay`, `IceSrflx`
 - EWMA: RTT, loss, bandwidth; **`quality_score`**; state `Candidate` / `Active` / `Degraded` / `Stale`
-- Optional delay telemetry: **`rtt_base_ms`** (windowed min-RTT) and **`queuing_delay_ms`** (`max(0, smoothed_rtt − base)`) — fed by periodic **`MPNG`** probes (`probe_interval_ms`, default **30**; **0** = off); used by the FEC loss classifier and **Background CC (LEDBAT)** when `congestion_enabled = true` (default **on**). VIP-level delay updates only from the **active** multipath endpoint; secondary-path samples stay path-local.
+- Optional delay telemetry: **`rtt_base_ms`** (windowed min-RTT) and **`queuing_delay_ms`** (`max(0, smoothed_rtt − base)`) — fed by periodic **`MPNG`** probes (`probe_interval_ms`, default **20**; **0** = off); used by the FEC loss classifier and **Background CC (LEDBAT)** when `congestion_enabled = true` (default **on**). VIP-level delay updates only from the **active** multipath endpoint; secondary-path samples stay path-local.
 - **Control path race** (default on with multipath): recovery **`MHOL`** (`direct_retry`) and predictive **heal `MPNG`** fan out to up to **3** live `PathSet` endpoints in parallel. Periodic CC `MPNG` probes stay single-endpoint.
 - **Tombstones** when peers leave (revision counters for MSYN)
 
@@ -290,11 +290,12 @@ Defaults live in `src/routing.rs` (`failover` module) and are mirrored under the
 |----------|------:|---------|------|------|
 | `D2R_QUALITY_MIN` / `d2r_quality_min` | 35 | Minimum quality to stay “healthy” on direct path; below → degraded / relay sooner | Harder to trigger relay; may keep bad direct paths longer | Relay kicks in sooner; more multipath traffic |
 | `D2R_LOSS_MAX` / `d2r_loss_max` | 0.12 | Loss EWMA ceiling before treating path as relay-worthy | Tolerates more loss before relay | Stricter; relay on moderate loss |
+| `D2R_JITTER_MAX` / `d2r_jitter_max` | 50.0 | EWMA `\|RTT − smoothed_RTT\|` (ms) ceiling before relay; `0` = hair-trigger | Tolerates more RTT variance before relay | Stricter; relay on moderate jitter |
 | `R2D_QUALITY_MIN` / `r2d_quality_min` | 50 | Quality required before allowing return to direct | Stricter return; longer relay | Easier flip-flop back to direct |
 | `R2D_SUCCESS_MIN` / `r2d_success_min` | 3 | Consecutive success samples needed to return direct (and hold-down clear uses ×2 on RTT path) | More stable return; slower leave relay | Faster return; risk of oscillation |
 | `HOLD_DOWN_SECS` / `hold_down_secs` | 2 | After failover to relay, block immediate flip back to direct | Less route flapping; slower recovery to direct | Faster direct retry; more flapping risk |
 
-- Degraded → relay: quality below `D2R_QUALITY_MIN`, state degraded/stale, or `loss_ewma` above `D2R_LOSS_MAX`.
+- Degraded → relay: quality below `D2R_QUALITY_MIN`, state degraded/stale, `loss_ewma` above `D2R_LOSS_MAX`, or `jitter_ms` above `D2R_JITTER_MAX`.
 - Data-plane relay hop: `select_relay_endpoint` prefers owner when hop-usable; otherwise one usable peer hub (one-hop MDAT; forward to dest direct ep only). Peer relay does not apply until the owner route already fails hop-usable.
 - Return to direct: quality ≥ `R2D_QUALITY_MIN`, `success_streak` ≥ `R2D_SUCCESS_MIN`, hold-down elapsed.
 
@@ -318,6 +319,12 @@ Defaults live in `src/routing.rs` (`failover` module) and are mirrored under the
 
 **Goals:** cap transmit rate, bound latency under load, prioritize small control traffic, fair share between peers (DRR).
 
+**Cascade hierarchy (TX):**
+
+1. **Background CC (LEDBAT)** — per-peer byte rate via token bucket (`congestion_enabled`).
+2. **Global pacing bucket** — aggregate ceiling (`pace_target_bps` / `pace_target_pps`); peer sends only when CC *and* global budget allow (AND at pop).
+3. **APD** — local latency safety (burst ramp / Drain spin), **not** a third rate controller. With `apd_require_cc_headroom` (default **true**), APD does not ramp-up, arm Drain, or stay in Drain while every non-empty data peer is CC-blocked (vacuous: no data peers → gate off so control/retransmit path is unaffected).
+
 | Mechanism | Purpose |
 |-----------|---------|
 | Token bucket | `pace_target_pps` / `pace_target_bps`, `pace_budget_cap_packets`, burst per tick |
@@ -325,7 +332,7 @@ Defaults live in `src/routing.rs` (`failover` module) and are mirrored under the
 | DRR | Deficit round-robin across peers (`drr_enabled`) |
 | DRR small-packet priority | Optional per-peer lane: frames under `drr_small_packet_threshold_bytes` dequeue before bulk |
 | DRR RTT-aware quantum | Optional: scale per-peer DRR quantum by **base RTT** vs median base among active peers |
-| APD | High queue fill → Tier-1 burst ramp (`ramp_max_burst`), then drain mode (`drain_max_burst`, faster tick, spin budget, optional DRR freeze) |
+| APD | High queue fill → Tier-1 burst ramp (`ramp_max_burst`), then drain mode (`drain_max_burst`, faster tick, spin budget, optional DRR freeze); gated by CC headroom when enabled |
 | FAB (`pace_fab_enabled`) | After repeated timer overshoots, temporarily longer tick |
 | Pace clock thread | Fires ticks into the pacing worker; exposes overshoot metrics to `EngineMetrics` |
 | Pacing worker thread | Owns `PacingEngine`; dequeue + paced UDP send; publishes `PacingObs` and `TickDone` |
@@ -390,9 +397,9 @@ Cooldown ──cooldown elapsed──> Alert
 - **Alert:** ramp runs at the normal clock; drain confirmation advances while fill is above `high_watermark` with ramp pinned, or while HOL sojourn exceeds `apd_max_sojourn_ms` when sojourn gate is on.
 - **Drain:** pace clock switches to pure spin with `apd_drain_tick_us`, burst held at `drain_max_burst`, optional DRR freeze.
 
-Drain exits when fill falls below `apd_low_watermark` **and** (sojourn gate on) HOL sojourn below `apd_target_sojourn_ms`, or when `apd_spinloop_budget_ms` expires; then Cooldown for `apd_cooldown_ms`.
+Drain exits when fill falls below `apd_low_watermark` **and** (sojourn gate on) HOL sojourn below `apd_target_sojourn_ms`, when `apd_spinloop_budget_ms` expires, or (when `apd_require_cc_headroom` and background CC is on) when no non-empty data peer is CC-sendable; then Cooldown for `apd_cooldown_ms`.
 
-The faster drain clock does **not** bypass the token bucket. Retransmit priority and control interleaving are preserved during Drain. Optional local-sojourn shedding can drop stale **bulk HOL** packets only when `shed_enabled` and queue fill is above `shed_min_fill`.
+The faster drain clock does **not** bypass the token bucket. Retransmit priority and control interleaving are preserved during Drain. Optional local-sojourn shedding can drop stale **bulk HOL** packets only when `shed_enabled` and queue fill is above `shed_min_fill`. Under sustained CC starve with headroom gating on, APD spins less often — shed may trim backlog more, and FEC Drain passthrough is rarer (accepted).
 
 Field-level defaults and ↑/↓ semantics: [Operational defaults](#operational-defaults-user-tunable) § Pacing / APD.
 
@@ -617,7 +624,9 @@ Scheduler capacity (packets/s) is approximately `base_max_burst × (1_000_000 / 
 
 ### APD (configured via `pace`)
 
-Tier 1: linear burst ramp between watermarks (same base tick), ceiling `ramp_max_burst`. Tier 2: pure-spin drain when ramp is pinned at `ramp_max_burst` and (**fill** above `apd_high_watermark` **or** HOL sojourn above `apd_max_sojourn_ms` when `apd_sojourn_enabled`) for `apd_confirm_ticks`; drain uses `drain_max_burst`. Exit drain when fill below `apd_low_watermark` **and** HOL sojourn below `apd_target_sojourn_ms` (sojourn gate on), or spin budget expires.
+Tier 1: linear burst ramp between watermarks (same base tick), ceiling `ramp_max_burst`. Tier 2: pure-spin drain when ramp is pinned at `ramp_max_burst` and (**fill** above `apd_high_watermark` **or** HOL sojourn above `apd_max_sojourn_ms` when `apd_sojourn_enabled`) for `apd_confirm_ticks`; drain uses `drain_max_burst`. Exit drain when fill below `apd_low_watermark` **and** HOL sojourn below `apd_target_sojourn_ms` (sojourn gate on), spin budget expires, or CC headroom is lost while `apd_require_cc_headroom` is on.
+
+When `apd_require_cc_headroom` is **true** and `congestion_enabled` is on, APD does not increase/pin the ramp, does not arm Drain, and early-exits Drain unless at least one non-empty data peer HOL passes `can_send_data` (tokens or `hol_escape_ms`). No non-empty data peers → gate does not apply (control/retransmit-only pressure still uses APD). Recommended: keep `hol_escape_ms ≤ apd_max_sojourn_ms` so sojourn-arm can fire soon after HOL escape under CC starve (not enforced).
 
 | Field | Default | Meaning | If ↑ | If ↓ |
 |-------|--------:|---------|------|------|
@@ -627,6 +636,7 @@ Tier 1: linear burst ramp between watermarks (same base tick), ceiling `ramp_max
 | `apd_sojourn_enabled` | true | Dual-gate drain arm/exit via HOL sojourn | Catches stale packets when fill is low | Fill-only arm/exit |
 | `apd_max_sojourn_ms` | 6 | Arm drain when HOL age exceeds this (ms, **2–500**) | Less sensitive to latency | Arms drain sooner on old HOL |
 | `apd_target_sojourn_ms` | 2 | Exit drain only when HOL age below this (ms, **1–200**, must be &lt; max − 2) | Exit drain sooner | Hold drain until queue is fresher |
+| `apd_require_cc_headroom` | **true** | Gate APD ramp-up / Drain arm / mid-Drain on data CC sendability | On: no false Drain/spin while CC starves all data HOL | Off: APD reacts to fill/sojourn even when CC blocks pops |
 | `ramp_max_burst` | 8 | **Absolute** max packets/tick for Tier-1 ramp ceiling (must be ≥ `base_max_burst`) | Faster ramp; bigger wire bursts in Alert | Slower ramp; smoother |
 | `drain_max_burst` | 2 | Max packets/tick during Tier-2 drain (≤ `ramp_max_burst`) | Faster drain micro-bursts | Gentler on upstream routers |
 | `apd_spinloop_budget_ms` | 4 | Max pure-spin time per drain episode (user **0–100** ms; **`0` = unlimited** until fill &lt; low WM) | Longer spin cap; more CPU | Shorter cap; may exit drain before queue empties |
@@ -644,7 +654,7 @@ When enabled, pacing may proactively drop stale **bulk** HOL packets before the 
 | Field | Default | Meaning | If ↑ | If ↓ |
 |-------|--------:|---------|------|------|
 | `shed_enabled` | true | Enable bulk HOL stale shedding | Backlog pressure can be trimmed earlier | No proactive stale bulk drop |
-| `shed_max_sojourn_ms` | 40 | Drop bulk HOL older than this (**2–500** ms) | More tolerant to queue age | Drops stale bulk sooner |
+| `shed_max_sojourn_ms` | 50 | Drop bulk HOL older than this (**2–500** ms) | More tolerant to queue age | Drops stale bulk sooner |
 | `shed_min_fill` | 0.2 | Shedding gate: require fill ≥ this (**0.1–0.95**) | Shedding activates only under heavier fill | Can shed earlier under moderate fill |
 | `shed_max_per_tick` | 2 | Per-tick cap on stale bulk drops (**1–64**) | Faster stale-bulk cleanup in one tick | Smaller per-tick shedding work |
 
@@ -668,25 +678,25 @@ Tracks base RTT and queuing delay on each `RouteEntry`. Optional gate on adaptiv
 | Field | Default | Meaning | If ↑ / on | If ↓ / off |
 |-------|--------:|---------|-----------|------------|
 | `congestion_enabled` | **true** | LEDBAT background CC (token bucket + delay gradient) | On: per-peer rate limits from queuing delay | Off: telemetry/FEC only; no pacing CC actuation |
-| `gain` | 0.1 | Multiplicative decrease when `queuing_delay / target > 1` (**0.1–4.0**) | Drops peer rate faster under delay | Gentler decrease |
-| `hol_escape_ms` | 15 | Send despite empty tokens when peer HOL sojourn ≥ this (**4–100**) | Escape starvation sooner | Longer throttle under backlog |
+| `gain` | 0.35 | Multiplicative decrease when `queuing_delay / target > 1` (**0.1–4.0**) | Drops peer rate faster under delay | Gentler decrease |
+| `hol_escape_ms` | 5 | Send despite empty tokens when peer HOL sojourn ≥ this (**4–100**); recommend ≤ `apd_max_sojourn_ms` when `apd_require_cc_headroom` is on | Escape starvation sooner | Longer throttle under backlog |
 | `initial_rate_bps` | 8M | New peer starting rate (**≤ max_rate_bps**) | Higher cold-start send cap | Lower initial cap |
-| `additive_increase_bps` | 64000 | Linear increase per probe when delay ≤ target (**4000–1e6**) | Faster headroom use | Slower ramp |
-| `min_decrease_factor` | 0.8 | Floor on one multiplicative decrease step (**0.1–0.9**) | Shallower single-step cuts | Deeper cuts |
-| `rate_smoothing_alpha` | 0.7 | EWMA on applied rate (**0–0.95**) | Smoother rates | Faster response |
+| `additive_increase_bps` | 48000 | Linear increase per probe when delay ≤ target (**4000–1e6**) | Faster headroom use | Slower ramp |
+| `min_decrease_factor` | 0.85 | Floor on one multiplicative decrease step (**0.1–0.9**) | Shallower single-step cuts | Deeper cuts |
+| `rate_smoothing_alpha` | 0.8 | EWMA on applied rate (**0–0.95**) | Smoother rates | Faster response |
 | `min_rate_bps` / `max_rate_bps` | 1.5M / 20M | Absolute per-peer rate clamps | Wider/narrower range | Tighter caps |
-| `loss_multiplicative_decrease` | 0.7 | On rising `loss_ewma` past failover threshold (**0.3–0.9**) | Stronger loss reaction | Weaker loss reaction |
-| `burst_cap_bytes` | 32000 | Per-peer token burst cap (**512–262144**) | Larger micro-bursts | Tighter pacing |
+| `loss_multiplicative_decrease` | 0.85 | On rising `loss_ewma` past failover threshold (**0.3–0.9**) | Stronger loss reaction | Weaker loss reaction |
+| `burst_cap_bytes` | 16000 | Per-peer token burst cap (**512–262144**) | Larger micro-bursts | Tighter pacing |
 | `rtt_base_tracking` | true | Update `rtt_base_ms` / `queuing_delay_ms` on RTT samples | On: delay telemetry available | Off: skip base updates (`queuing_delay` stays 0) |
 | `loss_classifier_enabled` | **true** | Gate adaptive FEC increases by delay ratio; enable post-congestion recovery step-down | On: hold parity up under congestion; step down after QD recovers (see `fec_recovery_recency_ms`) | Off: loss-only adaptive FEC |
-| `target_queue_delay_ms` | 15 | Denominator for `delay_ratio` (**10–150**) | Higher → less likely to classify as congestive | Lower → hold FEC increases sooner |
+| `target_queue_delay_ms` | 10 | Denominator for `delay_ratio` (**10–150**) | Higher → less likely to classify as congestive | Lower → hold FEC increases sooner |
 | `congestion_loss_threshold` | 0.7 | Hold increase / mark congestive when `queuing_delay / target >` this (**0.3–0.95**); recovery uses the same threshold for “delay recovered” | More tolerant of delay before hold | Holds sooner |
-| `base_rtt_window_secs` | 4 | Min-RTT window length (**1–60**) | Slower base adaptation | Faster base churn |
+| `base_rtt_window_secs` | 3 | Min-RTT window length (**1–60**) | Slower base adaptation | Faster base churn |
 | `base_rtt_stale_windows` | 2 | Consecutive windows before base may **rise** (**1–10**) | Base rises only after more confirmation | Base rises sooner when path worsens |
-| `probe_interval_ms` | 30 | Periodic `MPNG`/`MPON` for RTT samples (**0** = off, else **20–1000**) | Fresher queuing-delay telemetry | Less control traffic; sparser RTT |
+| `probe_interval_ms` | 20 | Periodic `MPNG`/`MPON` for RTT samples (**0** = off, else **20–1000**) | Fresher queuing-delay telemetry | Less control traffic; sparser RTT |
 | `fec_recovery_recency_ms` | **3000** | After last congestive sample, how long recovery may step parity down one ladder rung (**0** = off; else **100–60000**) | Longer sticky post-bloat shed window | Shorter / disable step-down (hold-increase only) |
 
-With defaults, `congestion_enabled = true` applies a per-peer token bucket (initial rate `initial_rate_bps`, burst `burst_cap_bytes`) in addition to global APD/pacing budget — unlike the old quantum-only soft-throttle. Under-target paths may slowly increase rate via `additive_increase_bps`.
+With defaults, `congestion_enabled = true` applies a per-peer token bucket (initial rate `initial_rate_bps`, burst `burst_cap_bytes`) in addition to the global pacing budget. APD is a local latency valve on top (see cascade hierarchy), gated by `apd_require_cc_headroom` so CC-induced backlog does not false-trigger Drain spin. Under-target paths may slowly increase rate via `additive_increase_bps`.
 
 Metrics (`runtime` dashboard): `fec_congestive_hold_count`, `fec_classifier_allow_count`, `fec_recovery_stepdown_count`, `cc_rate_limited_events`, `cc_rate_bps_{min,avg,max}`, `cc_{increase,decrease,loss_decrease}_events`, `drr_small_priority_pops`, `drr_bulk_force_pops`, `drr_rtt_scale_applied` (DRR/FEC/CC counters sync from engine each metrics tick).
 
@@ -762,6 +772,7 @@ fec_max_total_shards = 64
 [failover]
 d2r_quality_min = 35
 d2r_loss_max = 0.12
+d2r_jitter_max = 50.0
 r2d_quality_min = 50
 r2d_success_min = 3
 hold_down_secs = 2
@@ -937,7 +948,7 @@ Owned exclusively by the **`mint-pacing`** OS thread (`src/net/pacing_worker.rs`
 
 **`EngineMetrics`** (Arc, shared CLI + engine): pacing overshoots, tick observations, queue/channel drop counters (`pacing_cmd_channel_full`, data/control drops), timer resolution, APD/DRR/FEC/CC counters surfaced in **`runtime`**. Terminal output uses **`term_style`** (colors, prompts).
 
-`runtime` highlights include: `apd_ramp_active_ticks`, `apd_ramp_pinned_ticks`, `apd_effective_burst`, `apd_drain_arm_fill` / `apd_drain_arm_sojourn`, `apd_max_sojourn_ms`, `pacing_shed_sojourn`, `cc_rate_limited`, `drr_small_priority_pops` / `drr_bulk_force_pops`, `drr_rtt_scale_applied`, `fec_congestive_hold` / `fec_classifier_allow` / `fec_recovery_stepdown`, drain episode stats.
+`runtime` highlights include: `apd_ramp_active_ticks`, `apd_ramp_pinned_ticks`, `apd_effective_burst`, `apd_drain_arm_fill` / `apd_drain_arm_sojourn`, `apd_max_sojourn_ms`, `apd_cc_headroom_suppressions`, `pacing_shed_sojourn`, `cc_rate_limited`, `drr_small_priority_pops` / `drr_bulk_force_pops`, `drr_rtt_scale_applied`, `fec_congestive_hold` / `fec_classifier_allow` / `fec_recovery_stepdown`, drain episode stats.
 
 Frequent active ticks with few pinned ticks means Tier 1 is absorbing pressure. Frequent pinned ticks plus repeated Drain episodes indicates sustained overload.
 

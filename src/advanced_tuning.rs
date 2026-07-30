@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct FailoverTuning {
     pub d2r_quality_min: i32,
     pub d2r_loss_max: f64,
+    pub d2r_jitter_max: f64,
     pub r2d_quality_min: i32,
     pub r2d_success_min: i32,
     pub hold_down_secs: u64,
@@ -24,6 +25,7 @@ impl Default for FailoverTuning {
         Self {
             d2r_quality_min: crate::routing::failover::D2R_QUALITY_MIN,
             d2r_loss_max: crate::routing::failover::D2R_LOSS_MAX,
+            d2r_jitter_max: crate::routing::failover::D2R_JITTER_MAX,
             r2d_quality_min: crate::routing::failover::R2D_QUALITY_MIN,
             r2d_success_min: crate::routing::failover::R2D_SUCCESS_MIN,
             hold_down_secs: crate::routing::failover::HOLD_DOWN_SECS,
@@ -369,9 +371,9 @@ impl Default for CongestionTuning {
             loss_classifier_enabled: true,
             target_queue_delay_ms: crate::net::background_cc::DEFAULT_TARGET_QUEUE_DELAY_MS,
             congestion_loss_threshold: 0.7,
-            base_rtt_window_secs: 4,
+            base_rtt_window_secs: 3,
             base_rtt_stale_windows: 2,
-            probe_interval_ms: 30,
+            probe_interval_ms: 20,
             fec_recovery_recency_ms: 3_000,
             enabled: true,
             gain: crate::net::background_cc::DEFAULT_GAIN,
@@ -485,6 +487,7 @@ impl AdvancedTuning {
     pub fn clamp(&mut self) {
         // Failover
         self.failover.d2r_loss_max = self.failover.d2r_loss_max.clamp(0.0, 1.0);
+        self.failover.d2r_jitter_max = self.failover.d2r_jitter_max.max(0.0);
         self.failover.d2r_quality_min = self.failover.d2r_quality_min.clamp(0, 100);
         self.failover.r2d_quality_min = self.failover.r2d_quality_min.clamp(0, 100);
         if self.failover.r2d_quality_min < self.failover.d2r_quality_min {
@@ -591,6 +594,10 @@ mod tests {
             crate::routing::failover::D2R_LOSS_MAX
         );
         assert_eq!(
+            d.failover.d2r_jitter_max,
+            crate::routing::failover::D2R_JITTER_MAX
+        );
+        assert_eq!(
             d.failover.r2d_quality_min,
             crate::routing::failover::R2D_QUALITY_MIN
         );
@@ -635,21 +642,23 @@ mod tests {
 
         assert!(d.congestion.rtt_base_tracking);
         assert!(d.congestion.loss_classifier_enabled);
-        assert_eq!(d.congestion.target_queue_delay_ms, 15);
+        assert_eq!(d.congestion.target_queue_delay_ms, 10);
         assert_eq!(d.congestion.congestion_loss_threshold, 0.7);
-        assert_eq!(d.congestion.base_rtt_window_secs, 4);
+        assert_eq!(d.congestion.base_rtt_window_secs, 3);
         assert_eq!(d.congestion.base_rtt_stale_windows, 2);
-        assert_eq!(d.congestion.probe_interval_ms, 30);
+        assert_eq!(d.congestion.probe_interval_ms, 20);
         assert_eq!(d.congestion.fec_recovery_recency_ms, 3_000);
         assert!(d.congestion.enabled);
-        assert_eq!(d.congestion.gain, 0.1);
-        assert_eq!(d.congestion.hol_escape_ms, 15);
+        assert_eq!(d.congestion.gain, 0.35);
+        assert_eq!(d.congestion.hol_escape_ms, 5);
         assert_eq!(d.congestion.initial_rate_bps, 8_000_000.0);
-        assert_eq!(d.congestion.additive_increase_bps, 64_000.0);
-        assert_eq!(d.congestion.min_decrease_factor, 0.8);
+        assert_eq!(d.congestion.additive_increase_bps, 48_000.0);
+        assert_eq!(d.congestion.min_decrease_factor, 0.85);
+        assert_eq!(d.congestion.rate_smoothing_alpha, 0.8);
+        assert_eq!(d.congestion.loss_multiplicative_decrease, 0.85);
         assert_eq!(d.congestion.min_rate_bps, 1_500_000.0);
         assert_eq!(d.congestion.max_rate_bps, 20_000_000.0);
-        assert_eq!(d.congestion.burst_cap_bytes, 32_000);
+        assert_eq!(d.congestion.burst_cap_bytes, 16_000);
 
         assert_eq!(d.routing_ewma.rtt_ewma_old, 0.8);
         assert_eq!(d.routing_ewma.rtt_ewma_new, 0.2);
@@ -883,6 +892,14 @@ base_rtt_stale_windows = 5
         t.failover.r2d_quality_min = 20;
         t.clamp();
         assert!(t.failover.r2d_quality_min >= t.failover.d2r_quality_min);
+    }
+
+    #[test]
+    fn clamp_failover_jitter_max_non_negative() {
+        let mut t = AdvancedTuning::default();
+        t.failover.d2r_jitter_max = -10.0;
+        t.clamp();
+        assert!(t.failover.d2r_jitter_max >= 0.0);
     }
 
     #[test]

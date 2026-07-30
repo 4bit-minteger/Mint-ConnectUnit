@@ -40,8 +40,10 @@ pub const DEFAULT_APD_DRAIN_FREEZE_DRR: bool = true;
 pub const DEFAULT_APD_SOJOURN_ENABLED: bool = true;
 pub const DEFAULT_APD_MAX_SOJOURN_MS: u32 = 6;
 pub const DEFAULT_APD_TARGET_SOJOURN_MS: u32 = 2;
+/// When CC is on, suppress APD ramp-up / Drain arm / mid-Drain spin unless a data peer is CC-sendable.
+pub const DEFAULT_APD_REQUIRE_CC_HEADROOM: bool = true;
 pub const DEFAULT_SHED_ENABLED: bool = true;
-pub const DEFAULT_SHED_MAX_SOJOURN_MS: u32 = 40;
+pub const DEFAULT_SHED_MAX_SOJOURN_MS: u32 = 50;
 pub const DEFAULT_SHED_MIN_FILL: f32 = 0.2;
 pub const DEFAULT_SHED_MAX_PER_TICK: u32 = 2;
 pub const DEFAULT_MIN_CONTROL_RESERVED_BYTES_PER_TICK: u32 = 200;
@@ -259,8 +261,9 @@ mod tests {
         assert_eq!(DEFAULT_RAMP_MAX_BURST, 8);
         assert_eq!(DEFAULT_APD_MAX_SOJOURN_MS, 6);
         assert_eq!(DEFAULT_APD_TARGET_SOJOURN_MS, 2);
+        assert!(DEFAULT_APD_REQUIRE_CC_HEADROOM);
         assert!(DEFAULT_SHED_ENABLED);
-        assert_eq!(DEFAULT_SHED_MAX_SOJOURN_MS, 40);
+        assert_eq!(DEFAULT_SHED_MAX_SOJOURN_MS, 50);
         assert!((DEFAULT_SHED_MIN_FILL - 0.2).abs() < f32::EPSILON);
         assert_eq!(DEFAULT_SHED_MAX_PER_TICK, 2);
         assert_eq!(DEFAULT_DRR_SMALL_PACKET_THRESHOLD_BYTES, 450);

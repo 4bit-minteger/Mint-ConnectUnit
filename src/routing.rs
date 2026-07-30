@@ -321,6 +321,7 @@ pub struct RelayPathSnapshot {
     pub state: RouteState,
     pub quality_score: i32,
     pub loss_ewma: f64,
+    pub jitter_ms: f64,
     pub success_streak: i32,
     pub hold_down_until: Option<Instant>,
 }
@@ -331,6 +332,7 @@ impl RelayPathSnapshot {
             state: e.state,
             quality_score: e.quality_score,
             loss_ewma: e.loss_ewma,
+            jitter_ms: e.jitter_ms,
             success_streak: e.success_streak,
             hold_down_until: e.hold_down_until,
         }
@@ -1208,6 +1210,7 @@ impl RoutingTable {
 pub mod failover {
     pub const D2R_QUALITY_MIN: i32 = 35;
     pub const D2R_LOSS_MAX: f64 = 0.12;
+    pub const D2R_JITTER_MAX: f64 = 50.0;
     pub const R2D_QUALITY_MIN: i32 = 50;
     pub const R2D_SUCCESS_MIN: i32 = 3;
     pub const HOLD_DOWN_SECS: u64 = 2;
@@ -1302,6 +1305,7 @@ pub fn should_relay_snap(
         || s.state == RouteState::Degraded
         || s.state == RouteState::Stale
         || s.loss_ewma > fo.d2r_loss_max
+        || s.jitter_ms > fo.d2r_jitter_max
 }
 
 pub fn can_return_to_direct(
@@ -2140,5 +2144,41 @@ mod tests {
         let _ = rt.note_fail(ep, None);
         let after = rt.table.get("10.0.0.40").unwrap().loss_ewma;
         assert!((after - (before + 0.25)).abs() < 1e-9);
+    }
+
+    fn healthy_relay_snap(jitter_ms: f64) -> RelayPathSnapshot {
+        RelayPathSnapshot {
+            state: RouteState::Active,
+            quality_score: 80,
+            loss_ewma: 0.01,
+            jitter_ms,
+            success_streak: 10,
+            hold_down_until: None,
+        }
+    }
+
+    #[test]
+    fn should_relay_trips_on_high_jitter_despite_healthy_quality() {
+        let fo = crate::advanced_tuning::FailoverTuning::default();
+        let s = healthy_relay_snap(fo.d2r_jitter_max + 1.0);
+        assert!(should_relay_snap(&s, &fo));
+    }
+
+    #[test]
+    fn should_relay_ignores_jitter_at_or_below_threshold() {
+        let fo = crate::advanced_tuning::FailoverTuning::default();
+        let at = healthy_relay_snap(fo.d2r_jitter_max);
+        let below = healthy_relay_snap(fo.d2r_jitter_max - 1.0);
+        assert!(!should_relay_snap(&at, &fo));
+        assert!(!should_relay_snap(&below, &fo));
+    }
+
+    #[test]
+    fn can_return_to_direct_ignores_jitter() {
+        let fo = crate::advanced_tuning::FailoverTuning::default();
+        let s = healthy_relay_snap(fo.d2r_jitter_max + 100.0);
+        assert!(s.quality_score >= fo.r2d_quality_min);
+        assert!(s.success_streak >= fo.r2d_success_min);
+        assert!(can_return_to_direct_snap(&s, Instant::now(), &fo));
     }
 }
