@@ -147,4 +147,10 @@ Full field list, factory defaults, and what each knob trades off: **[`SPEC.md` �
 
 ## License
 
-[LICENSE-MIT](LICENSE-MIT)
+This project's own source code is released under **MIT** — see [LICENSE](LICENSE).
+
+It bundles or depends on third-party components under their own licenses:
+- **Wintun** (`wintun.dll`) — WireGuard LLC's Prebuilt Binaries License, see [licenses/wintun-LICENSE.txt](licenses/wintun-LICENSE.txt)
+- All Rust crate dependencies (Tokio, etc.) — see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
+
+These third-party licenses are **not** superseded by this project's CC0 license.
