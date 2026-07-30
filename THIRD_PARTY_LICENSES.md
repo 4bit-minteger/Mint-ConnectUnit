@@ -1,3 +1,7 @@
+> Note: `wintun` is the Rust binding crate (MIT). The bundled
+> `wintun.dll` binary itself is under a separate license — see
+> `licenses/wintun-LICENSE.txt`.
+
 (Apache-2.0 OR MIT) AND Unicode-3.0 (1): unicode-ident
 Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT (1): wasi
 Apache-2.0 OR BSD-2-Clause OR MIT (2): zerocopy, zerocopy-derive
