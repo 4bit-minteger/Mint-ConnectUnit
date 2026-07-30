@@ -936,8 +936,11 @@ mod tests {
 
     #[test]
     fn control_rate_limiter_reap_unblocks_new_source_after_full() {
+        // Avoid Instant::now() - large Duration: panics when monotonic clock history
+        // (e.g. Windows QPC since boot) is shorter than the subtracted span.
         let mut rl = ControlRateLimiter::new(2.0, 0.0);
-        let old = Instant::now() - Duration::from_secs(400);
+        let old = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
         for key in 0..65_536u64 {
             rl.entries.insert(
                 key,
@@ -948,8 +951,8 @@ mod tests {
                 },
             );
         }
-        rl.reap_after = Duration::from_secs(300);
-        rl.last_reap = Instant::now() - Duration::from_secs(120);
+        rl.reap_after = Duration::from_millis(1);
+        // Force-reap path runs when map is full; last_reap age is irrelevant.
 
         assert!(rl.allow(200_001));
         assert!(rl.entries.contains_key(&200_001));

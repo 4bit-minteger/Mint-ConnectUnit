@@ -4703,7 +4703,7 @@ impl Cli {
         crate::cli_println!("  │|  Listen Port : {}", s.listen_port);
         crate::cli_println!("  │|  Peers       : {}/{}", s.peers.len(), MAX_PEERS);
         if !s.public_invite_code.is_empty() {
-            crate::cli_println!("  │|> Invite       : {}", s.public_invite_code);
+            crate::cli_println!("  │|> Invite ID < {}", s.public_invite_code);
         }
 
         let routes = self.routing.read().snapshot();

@@ -416,7 +416,10 @@ impl DecentralizedState {
     }
 
     fn prune_discovered(&mut self) {
-        let now = Instant::now();
+        self.prune_discovered_at(Instant::now());
+    }
+
+    fn prune_discovered_at(&mut self, now: Instant) {
         self.discovered
             .retain(|_, seen| now.duration_since(*seen) < DISCOVERED_TTL);
         if self.discovered.len() <= MAX_DISCOVERED {
@@ -911,13 +914,10 @@ mod tests {
         let mut d = DecentralizedState::default();
         d.active = true;
         let ep = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 4000));
-        d.discovered.insert(
-            ep,
-            Instant::now()
-                .checked_sub(DISCOVERED_TTL + Duration::from_secs(5))
-                .unwrap(),
-        );
-        d.prune_discovered();
+        // Advance "now" instead of subtracting from Instant (overflow on short uptime).
+        let seen = Instant::now();
+        d.discovered.insert(ep, seen);
+        d.prune_discovered_at(seen + DISCOVERED_TTL + Duration::from_secs(5));
         assert!(!d.discovered.contains_key(&ep));
 
         for i in 0..(MAX_DISCOVERED + 10) {

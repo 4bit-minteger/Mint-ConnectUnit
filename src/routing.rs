@@ -1397,10 +1397,10 @@ mod tests {
     #[test]
     fn prune_tombstones_retains_pending_vip() {
         let mut rt = RoutingTable::new();
-        rt.tombstones.insert(
-            "10.0.0.9".to_string(),
-            (1, Instant::now() - Duration::from_secs(400)),
-        );
+        // Age is irrelevant: retain_vips short-circuits before TTL checks.
+        // Do not use Instant::now() - large Duration (overflow on short uptime).
+        rt.tombstones
+            .insert("10.0.0.9".to_string(), (1, Instant::now()));
         let mut retain = HashSet::new();
         retain.insert("10.0.0.9".to_string());
         rt.prune_tombstones(&retain);
