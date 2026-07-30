@@ -64,6 +64,7 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
 
     let s2_sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     s2_sock.set_reuse_address(true)?;
+    s2_sock.set_broadcast(true)?;
     s2_sock.bind(&SocketAddr::from(([0, 0, 0, 0], listen_port)).into())?;
     let _ = s2_sock.set_send_buffer_size(sndbuf);
     let _ = s2_sock.set_recv_buffer_size(rcvbuf);

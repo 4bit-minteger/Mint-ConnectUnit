@@ -352,6 +352,33 @@ async fn handle_ipc(state: Arc<DaemonState>, req: IpcRequest) -> IpcResponse {
             let captured = end_capture();
             ipc_response_from_capture(result, captured)
         }
+        IpcRequest::DiscoverParasiticLan => {
+            begin_capture();
+            let result = {
+                let mut cli = state.cli_lock();
+                cli.discover_parasitic_lan().await
+            };
+            let captured = end_capture();
+            // Still emit discover progress lines to UI, then return structured owners.
+            for line in captured {
+                let _ = state.controller.ui.emit_plain(line);
+            }
+            match result {
+                Ok(owners) => IpcResponse::ParasiticLanOwners { owners },
+                Err(e) => IpcResponse::Err {
+                    message: e.to_string(),
+                },
+            }
+        }
+        IpcRequest::JoinParasiticLan { target } => {
+            begin_capture();
+            let result = {
+                let mut cli = state.cli_lock();
+                cli.join_parasitic_lan_from_str(target).await
+            };
+            let captured = end_capture();
+            ipc_response_from_capture(result, captured)
+        }
         IpcRequest::ResetPerformanceDefaults => {
             begin_capture();
             let result = {

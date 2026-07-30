@@ -43,7 +43,7 @@ impl Default for NetworkConfigFile {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct SessionFile {
     pub server_name: String,
     pub network_id: String,
@@ -54,7 +54,6 @@ pub(crate) struct SessionFile {
     pub listen_port: u16,
     pub node_id: String,
     pub crypto_key: String,
-    pub lan_invite_code: String,
     pub public_invite_code: String,
     pub membership_version: u64,
     pub last_membership_hash: String,
@@ -76,7 +75,6 @@ impl Default for SessionFile {
             listen_port: d.listen_port,
             node_id: d.node_id,
             crypto_key: d.crypto_key,
-            lan_invite_code: d.lan_invite_code,
             public_invite_code: d.public_invite_code,
             membership_version: d.membership_version,
             last_membership_hash: d.last_membership_hash,
@@ -96,6 +94,12 @@ pub(crate) struct ParasiticFile {
     pub parasitic_peer_port: u16,
     pub parasitic_peer_node_id: String,
     pub parasitic_self_is_owner: bool,
+    #[serde(default = "default_parasitic_use_public_toml")]
+    pub parasitic_use_public: bool,
+}
+
+fn default_parasitic_use_public_toml() -> bool {
+    true
 }
 
 impl Default for ParasiticFile {
@@ -108,6 +112,7 @@ impl Default for ParasiticFile {
             parasitic_peer_port: d.parasitic_peer_port,
             parasitic_peer_node_id: d.parasitic_peer_node_id,
             parasitic_self_is_owner: d.parasitic_self_is_owner,
+            parasitic_use_public: d.parasitic_use_public,
         }
     }
 }
@@ -328,7 +333,6 @@ impl From<&NetworkConfig> for NetworkConfigFile {
                 listen_port: cfg.listen_port,
                 node_id: cfg.node_id.clone(),
                 crypto_key: cfg.crypto_key.clone(),
-                lan_invite_code: cfg.lan_invite_code.clone(),
                 public_invite_code: cfg.public_invite_code.clone(),
                 membership_version: cfg.membership_version,
                 last_membership_hash: cfg.last_membership_hash.clone(),
@@ -344,6 +348,7 @@ impl From<&NetworkConfig> for NetworkConfigFile {
                 parasitic_peer_port: cfg.parasitic_peer_port,
                 parasitic_peer_node_id: cfg.parasitic_peer_node_id.clone(),
                 parasitic_self_is_owner: cfg.parasitic_self_is_owner,
+                parasitic_use_public: cfg.parasitic_use_public,
             },
             adapter: AdapterFile {
                 udp_sndbuf: cfg.udp_sndbuf,
@@ -444,7 +449,6 @@ impl From<NetworkConfigFile> for NetworkConfig {
         cfg.listen_port = file.session.listen_port;
         cfg.node_id = file.session.node_id;
         cfg.crypto_key = file.session.crypto_key;
-        cfg.lan_invite_code = file.session.lan_invite_code;
         cfg.public_invite_code = file.session.public_invite_code;
         cfg.membership_version = file.session.membership_version;
         cfg.last_membership_hash = file.session.last_membership_hash;
@@ -458,6 +462,7 @@ impl From<NetworkConfigFile> for NetworkConfig {
         cfg.parasitic_peer_port = file.parasitic.parasitic_peer_port;
         cfg.parasitic_peer_node_id = file.parasitic.parasitic_peer_node_id;
         cfg.parasitic_self_is_owner = file.parasitic.parasitic_self_is_owner;
+        cfg.parasitic_use_public = file.parasitic.parasitic_use_public;
         cfg.udp_sndbuf = file.adapter.udp_sndbuf;
         cfg.udp_rcvbuf = file.adapter.udp_rcvbuf;
         cfg.adapter_mtu = file.adapter.adapter_mtu;

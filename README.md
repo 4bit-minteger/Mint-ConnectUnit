@@ -28,11 +28,14 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 2. Window defender may block it? -> `More info` -> `Run anyway` if you trust me.
 3. Command Line Interface -> type [1] to create server, [2] to join a server
   - If you are not a power-user -> Just press Enter, it will automatically setup a new server.
-    - To invite someone to join -> Copy the Public Invite ID and send to them (or LAN Invite ID if they are in the same wifi/network).
+    - To invite someone to join -> Copy the Invite ID and send it to them.
     - In CLI, type `?`  for help or read docs.
   - If you join a server:
-    - Type [1] (recommended) or just press enter for `Decentralized` (using BitTorrent tracker to find others) -> paste the Public Invite ID -> Usually it will take about 1 minutes to join.
-    - Type [2] for `Parasitic` mode -> Basically, just use this option when you want to use other VPNs as a free signaling server to start handshake instead of BitTorrent tracker.
+    - Type [1] (recommended) or just press enter for `Decentralized` (using BitTorrent tracker to find others) -> paste the Invite ID -> Usually it will take about 1 minutes to join.
+    - Type [2] for `Parasitic` mode:
+      - **Public**: use another VPN’s VIP path as a signaling pipe (STUN/UPnP/punch).
+      - **LAN**: UDP broadcast discovers a Mint owner on the same Wi‑Fi/LAN (no IP prompt when exactly one owner replies; optional `ip:port` fallback). Owner listen port defaults to **7878**.
+    - Type [3] for `Manual` invite join (Public or LAN punch path).
 4. Should know that the VPN will run in the background until you open CLI and type `stop` (it still run if you just close the CLI window).
 5. File `NetInfo/config.toml` automatically generate for our power-user.
 
@@ -120,7 +123,7 @@ One **`P2PEngine`** task owns RX/decrypt/routing/encrypt; a **`mint-pacing`** OS
 | `config.toml` peers | Authoritative peer list | Stores owner endpoint + crypto |
 | Relay | Relays packets for peers on degraded paths | Uses owner as relay when needed |
 | Membership sync | Publishes membership / route sync | Applies deltas from owner |
-| Parasitic listener | Can accept LAN parasitic joins | Can join via first-run menu without a full invite |
+| Parasitic listener | Can accept LAN parasitic joins (`discover_only` + admit) | Join menu: Parasitic Public (VIP) or Parasitic LAN (broadcast) |
 | Kick | Can disconnect a peer | Clears local session on kick |
 
 Full detail on membership sync, kick/removal, and the parasitic join handshake: **[`SPEC.md` § Membership sync](SPEC.md#membership-sync-msyn)** and **[§ NAT, hole punch, and parasitic join](SPEC.md#nat-hole-punch-and-parasitic-join)**.

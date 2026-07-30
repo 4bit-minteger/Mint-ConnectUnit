@@ -251,6 +251,16 @@ async fn run_join_entry_wizard(ipc: &IpcClient) -> Result<()> {
 }
 
 async fn run_join_parasitic_wizard(ipc: &IpcClient) -> Result<()> {
+    println!("  Parasitic mode:");
+    println!("    [1] Public (VIP signaling, default)");
+    println!("    [2] LAN (UDP broadcast discover)");
+    print!("  Choose [1/2, default 1]: ");
+    std::io::stdout().flush()?;
+    let mut mode = String::new();
+    std::io::stdin().read_line(&mut mode)?;
+    if mode.trim() == "2" {
+        return run_join_parasitic_lan_wizard(ipc).await;
+    }
     println!("  Use any pre-existing VPN/route as a signaling pipe.");
     println!("  Both sides must reach each other on UDP at the VIP/port below.");
     println!("  Peer VIP (ip or ip:port): ");
@@ -272,6 +282,66 @@ async fn run_join_parasitic_wizard(ipc: &IpcClient) -> Result<()> {
         upnp_port,
     )
     .await
+}
+
+async fn run_join_parasitic_lan_wizard(ipc: &IpcClient) -> Result<()> {
+    println!("  Discovering Mint owners on LAN…");
+    let owners = ipc.discover_parasitic_lan().await?;
+    let target = if owners.is_empty() {
+        println!("  No owners replied. AP client isolation may block UDP broadcast.");
+        println!("  Owner listen port defaults to 7878 (non-default needs ip:port fallback).");
+        print!("  Owner ip:port (or empty to abort): ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let t = line.trim().to_string();
+        if t.is_empty() {
+            anyhow::bail!("LAN discover found no owners and no fallback target");
+        }
+        t
+    } else if owners.len() == 1 {
+        println!(
+            "  Found owner: {} ({}) at {}",
+            if owners[0].network_name.is_empty() {
+                "(unnamed)"
+            } else {
+                owners[0].network_name.as_str()
+            },
+            &owners[0].network_id.chars().take(12).collect::<String>(),
+            owners[0].from
+        );
+        owners[0].from.clone()
+    } else {
+        println!("  Multiple Mint owners on LAN:");
+        for (i, o) in owners.iter().enumerate() {
+            let name = if o.network_name.is_empty() {
+                "(unnamed)"
+            } else {
+                o.network_name.as_str()
+            };
+            let short_id: String = o.network_id.chars().take(12).collect();
+            println!(
+                "    [{}] {}  id={}…  from={}",
+                i + 1,
+                name,
+                short_id,
+                o.from
+            );
+        }
+        print!("  Choose owner [1-{}]: ", owners.len());
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let idx: usize = line
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid owner selection"))?;
+        if idx == 0 || idx > owners.len() {
+            anyhow::bail!("owner selection out of range");
+        }
+        owners[idx - 1].from.clone()
+    };
+    ipc.join_parasitic_lan(target).await
 }
 
 async fn run_runtime_view(ipc: &IpcClient) -> Result<()> {

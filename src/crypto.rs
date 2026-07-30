@@ -683,16 +683,16 @@ mod tests {
     }
 
     #[test]
-    fn room_id_same_for_lan_and_public_invite_key() {
+    fn room_id_same_for_two_endpoint_encodings() {
         let key = [9u8; 32];
-        let lan = InvitePayload {
-            mode: 0,
+        let a = InvitePayload {
+            mode: 1,
             owner_ip: [192, 168, 1, 1],
             owner_port: 7878,
             key,
             protocol: PROTO_UDP,
         };
-        let pub_inv = InvitePayload {
+        let b = InvitePayload {
             mode: 1,
             owner_ip: [1, 2, 3, 4],
             owner_port: 9999,
@@ -701,8 +701,8 @@ mod tests {
         };
         let k = Key(key);
         assert_eq!(
-            room_id_20b_from_raw_key(&lan.key, lan.protocol),
-            room_id_20b_from_raw_key(&pub_inv.key, pub_inv.protocol)
+            room_id_20b_from_raw_key(&a.key, a.protocol),
+            room_id_20b_from_raw_key(&b.key, b.protocol)
         );
         assert_eq!(room_id_hex(&k, PROTO_UDP).len(), 40);
     }

@@ -275,6 +275,7 @@ pub enum ParaSignal {
         candidates: Vec<ParaCandidate>,
         start_at_ms: u64,
         session_id: String,
+        discover_only: bool,
     },
     ReplyReceived {
         from: SocketAddr,
@@ -288,6 +289,8 @@ pub enum ParaSignal {
         session_id: String,
         responder_vip: String,
         responder_is_owner: bool,
+        network_name: String,
+        network_key_hex: String,
     },
     OkReceived {
         from: SocketAddr,
@@ -709,6 +712,8 @@ struct ParaHelloMsg {
     start_at_ms: u64,
     #[serde(default)]
     session_id: String,
+    #[serde(default)]
+    discover_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -731,6 +736,12 @@ struct ParaReplyMsg {
 
     #[serde(default)]
     responder_is_owner: bool,
+
+    #[serde(default)]
+    network_name: String,
+
+    #[serde(default)]
+    network_key_hex: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3633,6 +3644,7 @@ impl P2PEngine {
                 candidates: v.candidates,
                 start_at_ms: v.start_at_ms,
                 session_id: v.session_id,
+                discover_only: v.discover_only,
             });
             return;
         }
@@ -3656,6 +3668,8 @@ impl P2PEngine {
                 session_id: v.session_id,
                 responder_vip: v.responder_vip,
                 responder_is_owner: v.responder_is_owner,
+                network_name: v.network_name,
+                network_key_hex: v.network_key_hex,
             });
             return;
         }

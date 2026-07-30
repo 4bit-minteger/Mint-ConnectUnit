@@ -77,10 +77,24 @@ pub enum IpcRequest {
         self_vip: String,
         upnp_port: Option<u16>,
     },
+    /// Broadcast discover_only MPHI; returns `ParasiticLanOwners`.
+    DiscoverParasiticLan,
+    /// Unicast admit Hello to a LAN owner (`ip` or `ip:port`).
+    JoinParasiticLan {
+        target: String,
+    },
     ResetPerformanceDefaults,
     JoinDecentralized {
         invite: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParasiticLanOwner {
+    pub network_name: String,
+    pub network_id: String,
+    pub from: String,
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +105,7 @@ pub enum IpcResponse {
     Pong,
     RuntimeSnapshot { payload: Vec<u8> },
     BootstrapSnapshot { payload: Vec<u8> },
+    ParasiticLanOwners { owners: Vec<ParasiticLanOwner> },
 }
 
 pub async fn write_frame(stream: &mut TcpStream, req: &IpcRequest) -> Result<()> {
@@ -175,6 +190,25 @@ impl IpcClient {
             })
             .await?
         {
+            IpcResponse::Ok { lines } => {
+                crate::cli_emit::render_lines_to_user_terminal(&lines).await;
+                Ok(())
+            }
+            IpcResponse::Err { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected ipc response: {other:?}")),
+        }
+    }
+
+    pub async fn discover_parasitic_lan(&self) -> Result<Vec<ParasiticLanOwner>> {
+        match self.call(IpcRequest::DiscoverParasiticLan).await? {
+            IpcResponse::ParasiticLanOwners { owners } => Ok(owners),
+            IpcResponse::Err { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected ipc response: {other:?}")),
+        }
+    }
+
+    pub async fn join_parasitic_lan(&self, target: String) -> Result<()> {
+        match self.call(IpcRequest::JoinParasiticLan { target }).await? {
             IpcResponse::Ok { lines } => {
                 crate::cli_emit::render_lines_to_user_terminal(&lines).await;
                 Ok(())

@@ -159,7 +159,7 @@ Largest behavioural surface: `cli.rs` and `net/engine.rs`. Trace bugs from CLI a
 | `config.toml` peers | Authoritative peer list | Stores owner endpoint + crypto; joiner roster (FIFO 64) from MSYN |
 | Relay | Relays packets for peers on degraded paths | Uses owner (or peer hub) as relay when `should_relay` |
 | MSYN | Publishes membership / route sync (coalesced 50ms) | Applies deltas, tracks `membership_version` |
-| Parasitic listener | Can accept LAN **parasitic** joins (`MPHI`…) | Can join via first-run menu without full invite |
+| Parasitic listener | Can accept LAN **parasitic** joins (`MPHI`/`MPHR`, including `discover_only`) | Join via menu: Parasitic Public (VIP) or Parasitic LAN (broadcast discover) |
 | Kick | Can **`MKCK`** peer | Clears local session on kick |
 
 ---
@@ -448,7 +448,9 @@ UDP and HTTP trackers run in parallel; join uses the same canonical tiered punch
 
 **Peer rediscovery (joiner):** After join, peers keep announcing on the tracker. When the **owner route is missing or not hop-usable**, joiners may run a separate **`peer-reconnect:*`** canonical punch toward announced endpoints (budget 8 addrs per announce, max 4 concurrent keys, 30s per-key cooldown). VIP binding uses **unique public IP** only. Routes update via authenticated `HPCH`/`HACK`. While the owner path is healthy, peer reconnect is suppressed; **MSYN** stops in-flight peer reconnect workflows. Joiners persist a **roster** in `config.peers` (FIFO cap **64**, `name` = `node_id`). Boot hydrates roster as **Candidate** routes, then overlays **`peer_cache.json`**. Owner `config.peers` remains authoritative (up to **253** VIPs in the UI).
 
-**Parasitic join** (LAN, optional): peer discovers owner via broadcast-style **`MPHI`** flow; owner listener in CLI allocates VIP, negotiates time sync (`start_at_ms`), runs focused/wide punch windows (`PARA_*` constants in `cli.rs`). Enabled via config `parasitic_enabled` and first-run join wizard.
+**Parasitic join**:
+- **Public**: VIP unicast signaling over an existing VPN/route + STUN/UPnP + punch (`join_parasitic_with_params`).
+- **LAN**: joiner broadcasts `discover_only` **`MPHI`**, collects owner **`MPHR`** (~2.5s), client picks owner (or `ip:port` fallback), then unicasts a real Hello; owner admits with VIP + `network_key_hex`; punch uses private candidates only (no STUN/UPnP). Owner listen port defaults to **7878**. Config: `parasitic_enabled`, `parasitic_use_public`.
 
 Canonical punch stages and `PARA_*` constants: [Performance parameters](#performance-parameters) § Punch / NAT.
 
@@ -526,12 +528,13 @@ These are written by create/join/leave flows. Changing them by hand requires a *
 | `listen_port` | `0` | Saved bind preference; effective = `max(saved, 7878)` |
 | `node_id` | `""` | Local node id (hex) |
 | `crypto_key` | `""` | Network key (hex) |
-| `lan_invite_code` / `public_invite_code` | `""` | Invite blobs for LAN / public join |
-| `parasitic_enabled` | `false` | Parasitic (LAN) join mode active |
-| `parasitic_peer_vip` / `parasitic_self_vip` | `""` | Parasitic VIP pair |
+| `public_invite_code` | `""` | Single invite blob (mode=1; STUN endpoint or local IP:port fallback) |
+| `parasitic_enabled` | `false` | Parasitic join mode active |
+| `parasitic_peer_vip` / `parasitic_self_vip` | `""` | Parasitic signal peer / self |
 | `parasitic_peer_port` | `0` | Peer signal port in parasitic mode |
 | `parasitic_peer_node_id` | `""` | Peer node id in parasitic mode |
 | `parasitic_self_is_owner` | `false` | Local side is parasitic owner |
+| `parasitic_use_public` | `true` | `true` = Public parasitic (STUN/UPnP); `false` = LAN parasitic |
 | `peers` | `[]` | Authoritative peer list (`node_id`, `name`, `virtual_ip`, `real_ip`) |
 | `owner_endpoints_cache` | `[]` | Cached owner endpoints |
 | `membership_version` / `last_membership_hash` | `0` / `""` | Membership revision + hash |
@@ -980,7 +983,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 | Why relay instead of direct? | `routing.rs` `should_relay`, quality/loss EWMA |
 | Join failed? | `cli.rs` `handle_join`, `EngineCmd::PrepareJoin`, `MPJN`/`MPJA` in engine |
 | MTU issues? | `pmtud.rs`, `MPMT`/`MPAR`, adapter MTU in config |
-| LAN join without invite? | Parasitic: `handle_join_parasitic`, `MPHI`/`MPHR`/`MPHO` |
+| LAN join without invite? | Parasitic LAN: `discover_parasitic_lan` / `join_parasitic_lan_with_target`, `MPHI`/`MPHR`/`MPHO` |
 | TUN not receiving? | `tun/wintun.rs` read loop, inject broadcast capacity |
 
 Behaviour on the wire is always defined by **`src/`**, **`tests/`**, and this document.

@@ -34,8 +34,6 @@ pub struct NetworkConfig {
     pub node_id: String,
     pub crypto_key: String,
     #[serde(default)]
-    pub lan_invite_code: String,
-    #[serde(default)]
     pub public_invite_code: String,
     #[serde(default)]
     pub parasitic_enabled: bool,
@@ -51,6 +49,10 @@ pub struct NetworkConfig {
 
     #[serde(default)]
     pub parasitic_self_is_owner: bool,
+
+    /// `true` = Public parasitic (VIP + STUN); `false` = LAN parasitic (no STUN/UPnP).
+    #[serde(default = "default_parasitic_use_public")]
+    pub parasitic_use_public: bool,
     pub peers: Vec<PeerInfo>,
     pub owner_endpoints_cache: Vec<String>,
     pub membership_version: u64,
@@ -219,6 +221,10 @@ fn default_apd_drain_tick_us() -> u64 {
 
 fn default_subnet_prefix() -> u8 {
     24
+}
+
+fn default_parasitic_use_public() -> bool {
+    true
 }
 
 fn default_pace_rate_mode() -> String {
@@ -403,7 +409,6 @@ impl Default for NetworkConfig {
             listen_port: 0,
             node_id: String::new(),
             crypto_key: String::new(),
-            lan_invite_code: String::new(),
             public_invite_code: String::new(),
             parasitic_enabled: false,
             parasitic_peer_vip: String::new(),
@@ -411,6 +416,7 @@ impl Default for NetworkConfig {
             parasitic_peer_port: 0,
             parasitic_peer_node_id: String::new(),
             parasitic_self_is_owner: false,
+            parasitic_use_public: true,
             peers: Vec::new(),
             owner_endpoints_cache: Vec::new(),
             membership_version: 0,
@@ -1304,8 +1310,9 @@ shard_payload_size = 9999
             real_ip: "1.2.3.4:7878".into(),
         });
         cfg.membership_version = 42;
-        cfg.lan_invite_code = "lan".into();
+        cfg.public_invite_code = "invite".into();
         cfg.parasitic_enabled = true;
+        cfg.parasitic_use_public = false;
 
         cfg.udp_sndbuf = 1;
         cfg.pace_tick_us = 9999;
@@ -1322,8 +1329,9 @@ shard_payload_size = 9999
         let peers_len = cfg.peers.len();
         let peer_node = cfg.peers[0].node_id.clone();
         let membership_version = cfg.membership_version;
-        let lan_invite_code = cfg.lan_invite_code.clone();
+        let public_invite_code = cfg.public_invite_code.clone();
         let parasitic_enabled = cfg.parasitic_enabled;
+        let parasitic_use_public = cfg.parasitic_use_public;
 
         cfg.reset_performance_fields();
 
@@ -1343,8 +1351,9 @@ shard_payload_size = 9999
         assert_eq!(cfg.peers.len(), peers_len);
         assert_eq!(cfg.peers[0].node_id, peer_node);
         assert_eq!(cfg.membership_version, membership_version);
-        assert_eq!(cfg.lan_invite_code, lan_invite_code);
+        assert_eq!(cfg.public_invite_code, public_invite_code);
         assert_eq!(cfg.parasitic_enabled, parasitic_enabled);
+        assert_eq!(cfg.parasitic_use_public, parasitic_use_public);
     }
 
     #[test]
