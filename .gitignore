@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+*.log
+config.toml
+peer_cache.json
+wintun.dll
