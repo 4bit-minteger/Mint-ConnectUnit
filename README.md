@@ -25,7 +25,7 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 ## Quick start
 
 1. Run `ConnectUnit.exe`(or your binary build name) as **Administrator**, make sure you have `wintun.dll` in the same folder with the binary.
-2. Window defender may block it? -> More info -> Run anyway if you trust me.
+2. Window defender may block it? -> `More info` -> `Run anyway` if you trust me.
 3. Command Line Interface -> type [1] to create server, [2] to join a server
   - If you are not a power-user -> Just press Enter, it will automatically setup a new server.
     - To invite someone to join -> Copy the Public Invite ID and send to them (or LAN Invite ID if they are in the same wifi/network).
