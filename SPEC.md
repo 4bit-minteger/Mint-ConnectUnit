@@ -1,4 +1,4 @@
-# Mint Spec (Locked)
+# Mint Spec
 
 Technical reference for **Mint / ConnectUnit**: wire contract, engine behaviour, source layout, and tunable defaults. Orientation for operators: **`README.md`**. Implementation authority: **`src/`**, **`tests/`**, and this document — any wire or behavioural change must update this file and matching tests.
 
