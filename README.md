@@ -50,7 +50,7 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 - **Serverless P2P**: no central data-plane server; the owner node coordinates membership while STUN/UPnP/ICE handle NAT traversal and BitTorrent-style trackers handle discovery
 - **Encrypted data plane**: AEGIS-128L data plane, HMAC-BLAKE2b control plane
 - **Adaptive pacing & congestion control**: token bucket + deficit round-robin (DRR) + adaptive pressure drain (APD) to bound latency under load
-- **Adaptive FEC**: Reed–Solomon shards recover lost packets without waiting on retransmission + loss classifier
+- **Adaptive FEC**: Reed-Solomon shards recover lost packets without waiting on retransmission + loss classifier
 - **Automatic failover**: quality-scored routing switches between direct and owner-relayed paths.
 - **NAT traversal**: STUN, UPnP, ICE-style candidates, canonical hole punching, plus a LAN "parasitic" mode that needs no invite ID
 - **Path MTU discovery**: adaptive shard/frame sizing to the live path MTU
