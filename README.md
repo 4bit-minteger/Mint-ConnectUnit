@@ -26,16 +26,22 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 
 1. Run `ConnectUnit.exe`(or your binary build name) as **Administrator**, make sure you have `wintun.dll` in the same folder with the binary.
 2. Window defender may block it (need administrator privileges to install Wintun driver). -> `More info` -> `Run anyway` if you trust me.
-3. Command Line Interface -> type [1] to create server, [2] to join a server
-  - If you are not a power-user -> Just press Enter, it will automatically setup a new room.
-    - To invite someone to join -> Copy the Invite ID and send it to them.
-    - In CLI, type `?`  for help or read docs.
-  - If you join a server:
-    - Type [1] (recommended) or just press enter for `Decentralized` (using BitTorrent tracker to find others) -> paste the Invite ID -> Usually it will take about 1 min to join.
-    - Type [2] for `Parasitic` mode:
-      - **Public**: use another VPN’s VIP path as a signaling pipe (STUN/UPnP/punch).
-      - **LAN**: UDP broadcast discovers a Mint owner on the same Wi‑Fi/LAN (no IP prompt when exactly one owner replies; optional `ip:port` fallback). Owner listen port defaults to **7878**.
-    - Type [3] for `Manual` invite join (Public or LAN punch path).
+3. Command Line Interface, first run:
+- type `1` to create server, `2` to join a server
+<img src="./windows/option.png" width="400" alt="apple">
+
+- If you are not a power-user -> Just press Enter, it will automatically setup a new room.
+  - To invite someone to join -> Copy the Invite ID and send it to them.
+  - In CLI, type `?`  for help or read docs.
+
+- If you join a server:
+<img src="./windows/option2.png" width="400" alt="pen">
+
+- Type `1` (recommended) or just press enter for "Decentralized" (using BitTorrent tracker to find others) -> paste the Invite ID -> Usually it will take about 1 min to join.
+  - Type `2` for "ParasitiC" mode:
+    - **Public**: use another VPN’s VIP path as a signaling pipe (STUN/UPnP/punch).
+    - **LAN**: UDP broadcast discovers a Mint owner on the same Wi‑Fi/LAN (no IP prompt when exactly one owner replies; optional `ip:port` fallback). Owner listen port defaults to **7878**.
+  - Type `3` for "Manual" invite join (Public or LAN punch path).
 4. Should know that the VPN will run in the background until you open CLI and type `stop` (it still run if you just close the CLI window).
 5. File `NetInfo/config.toml` automatically generate for our power-user.
 
