@@ -38,7 +38,7 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 <img src="./windows/option2.png" width="400" alt="pen">
 
 - Type `1` (recommended) or just press enter for "Decentralized" (using BitTorrent tracker to find others) -> paste the Invite ID -> Usually it will take about 1 min to join.
-  - Type `2` for "ParasitiC" mode:
+  - Type `2` for "Parasitic" mode:
     - **Public**: use another VPN’s VIP path as a signaling pipe (STUN/UPnP/punch).
     - **LAN**: UDP broadcast discovers a Mint owner on the same Wi‑Fi/LAN (no IP prompt when exactly one owner replies; optional `ip:port` fallback). Owner listen port defaults to **7878**.
   - Type `3` for "Manual" invite join (Public or LAN punch path).
