@@ -1,18 +1,16 @@
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use aegis::aegis128l::Aegis128L;
 use anyhow::{anyhow, bail, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use blake2::{Blake2b512, Blake2bMac, Digest};
+use blake2::{Blake2b512, Digest};
 use bytes::BytesMut;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
 use crate::net::packet::CompactPacketType;
-use hmac::Mac;
 use rand::RngCore;
 
 pub const KEY_LEN: usize = 32;
@@ -22,13 +20,13 @@ pub const DATA_SALT_LEN: usize = 10;
 pub const WIRE_COUNTER_LEN: usize = 6;
 pub const NONCE_LEN: usize = WIRE_COUNTER_LEN;
 pub const DATA_TAG_LEN: usize = 16;
-pub const MAC_TRUNC_LEN: usize = 16;
 pub const DATA_REPLAY_WINDOW_BITS: usize = 128;
+pub const CTRL_REPLAY_MAX_SOURCES: usize = 4096;
+pub const CTRL_AAD: &[u8] = b"mcts";
 const DATA_REPLAY_MAX_COUNTER: u64 = (1u64 << 48) - 1;
 const HKDF_DOMAIN_SALT: &[u8] = b"mint-aegis-128l-v1";
 const HKDF_DOMAIN_INFO: &[u8] = b"data";
-
-pub const CTRL_TS_FUTURE_TOLERANCE_MS: u64 = 5_000;
+const HKDF_DOMAIN_INFO_CTRL: &[u8] = b"ctrl";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Key(pub [u8; KEY_LEN]);
@@ -150,6 +148,70 @@ pub fn derive_data_plane_material(
 }
 
 #[derive(Clone)]
+pub struct ControlPlaneAead {
+    key: [u8; AEAD_KEY_LEN],
+    salt: [u8; DATA_SALT_LEN],
+}
+
+impl ControlPlaneAead {
+    pub fn new(key: [u8; AEAD_KEY_LEN], salt: [u8; DATA_SALT_LEN]) -> Self {
+        Self { key, salt }
+    }
+
+    /// Seal control plaintext (`inner_tag || body`) to `ctr6 || ct || tag16` (no outer `MCTS`).
+    pub fn seal_into(&self, counter: u64, plaintext: &[u8], out: &mut BytesMut) -> Result<()> {
+        let counter_wire = encode_wire_counter(counter)?;
+        let nonce = nonce_from_counter(&self.salt, &counter_wire);
+        let cipher = Aegis128L::<DATA_TAG_LEN>::new(&self.key, &nonce);
+        out.clear();
+        out.reserve(WIRE_COUNTER_LEN + plaintext.len() + DATA_TAG_LEN);
+        out.extend_from_slice(&counter_wire);
+        out.extend_from_slice(plaintext);
+        let body_start = WIRE_COUNTER_LEN;
+        let tag = cipher.encrypt_in_place(&mut out[body_start..], CTRL_AAD);
+        out.extend_from_slice(&tag);
+        Ok(())
+    }
+
+    /// Open sealed body (`ctr6 || ct || tag16`) into plaintext (`inner_tag || body`).
+    pub fn open_into(
+        &self,
+        counter_wire: &[u8; WIRE_COUNTER_LEN],
+        payload: &[u8],
+        out: &mut BytesMut,
+    ) -> Result<()> {
+        if payload.len() < DATA_TAG_LEN {
+            out.clear();
+            bail!("packet too short");
+        }
+        let nonce = nonce_from_counter(&self.salt, counter_wire);
+        let cipher = Aegis128L::<DATA_TAG_LEN>::new(&self.key, &nonce);
+        out.clear();
+        out.extend_from_slice(payload);
+        let tag_start = out.len() - DATA_TAG_LEN;
+        let mut tag = [0u8; DATA_TAG_LEN];
+        tag.copy_from_slice(&out[tag_start..]);
+        out.truncate(tag_start);
+        cipher
+            .decrypt_in_place(out.as_mut(), &tag, CTRL_AAD)
+            .map_err(|_| anyhow!("decrypt failure"))?;
+        Ok(())
+    }
+}
+
+pub fn derive_control_plane_material(network_key: &Key) -> Result<ControlPlaneAead> {
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_DOMAIN_SALT), &network_key.0);
+    let mut okm = [0u8; AEAD_KEY_LEN + DATA_SALT_LEN];
+    hk.expand(HKDF_DOMAIN_INFO_CTRL, &mut okm)
+        .map_err(|_| anyhow!("hkdf expand failure"))?;
+    let mut key = [0u8; AEAD_KEY_LEN];
+    let mut salt = [0u8; DATA_SALT_LEN];
+    key.copy_from_slice(&okm[..AEAD_KEY_LEN]);
+    salt.copy_from_slice(&okm[AEAD_KEY_LEN..]);
+    Ok(ControlPlaneAead::new(key, salt))
+}
+
+#[derive(Clone)]
 pub struct DataReplayWindow {
     top: Option<u64>,
     bits: u128,
@@ -225,93 +287,6 @@ fn nonce_from_counter(
     nonce
 }
 
-#[derive(Clone, Debug)]
-pub struct CtrlFrame {
-    pub timestamp_ms: u64,
-    pub inner_tag: [u8; 4],
-    pub body: Vec<u8>,
-}
-
-pub struct CtrlAuth;
-
-impl CtrlAuth {
-    pub fn wrap(key: &Key, inner_tag: &[u8; 4], body: &[u8], ts_ms: u64) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + 8 + MAC_TRUNC_LEN + 4 + body.len());
-        out.extend_from_slice(b"MCTS");
-        out.extend_from_slice(&ts_ms.to_le_bytes());
-
-        let mut mac = <Blake2bMac<blake2::digest::consts::U32> as Mac>::new_from_slice(&key.0)
-            .expect("valid key len");
-        mac.update(&ts_ms.to_le_bytes());
-        mac.update(inner_tag);
-        mac.update(body);
-        let full = mac.finalize().into_bytes();
-        out.extend_from_slice(&full[..MAC_TRUNC_LEN]);
-        out.extend_from_slice(inner_tag);
-        out.extend_from_slice(body);
-        out
-    }
-
-    pub fn unwrap_parts<'a>(
-        key: &Key,
-        payload: &'a [u8],
-        now_ms: u64,
-        window_ms: u64,
-    ) -> Result<(u64, [u8; 4], &'a [u8])> {
-        if payload.len() < 4 + 8 + MAC_TRUNC_LEN + 4 {
-            bail!("payload too short");
-        }
-        if &payload[0..4] != b"MCTS" {
-            bail!("invalid wrapper tag");
-        }
-        let ts_ms = u64::from_le_bytes(payload[4..12].try_into().map_err(|_| anyhow!("ts"))?);
-        let age_past = now_ms.saturating_sub(ts_ms);
-        let age_future = ts_ms.saturating_sub(now_ms);
-        let ts_ok = if ts_ms <= now_ms {
-            age_past <= window_ms
-        } else {
-            age_future <= CTRL_TS_FUTURE_TOLERANCE_MS
-        };
-        if !ts_ok {
-            bail!("replay window");
-        }
-
-        let mac_start = 12;
-        let tag_start = mac_start + MAC_TRUNC_LEN;
-        let body_start = tag_start + 4;
-        let mut inner_tag = [0u8; 4];
-        inner_tag.copy_from_slice(&payload[tag_start..body_start]);
-        let body = &payload[body_start..];
-        let mac_expected = &payload[mac_start..tag_start];
-
-        let mut mac = <Blake2bMac<blake2::digest::consts::U32> as Mac>::new_from_slice(&key.0)
-            .expect("valid key len");
-        mac.update(&ts_ms.to_le_bytes());
-        mac.update(&inner_tag);
-        mac.update(body);
-        let full = mac.finalize().into_bytes();
-
-        let mut diff: u8 = 0;
-        for (a, b) in full[..MAC_TRUNC_LEN].iter().zip(mac_expected.iter()) {
-            diff |= a ^ b;
-        }
-        if diff != 0 {
-            bail!("bad mac");
-        }
-
-        Ok((ts_ms, inner_tag, body))
-    }
-
-    pub fn unwrap(key: &Key, payload: &[u8], now_ms: u64, window_ms: u64) -> Result<CtrlFrame> {
-        let (timestamp_ms, inner_tag, body) = Self::unwrap_parts(key, payload, now_ms, window_ms)?;
-        Ok(CtrlFrame {
-            timestamp_ms,
-            inner_tag,
-            body: body.to_vec(),
-        })
-    }
-}
-
 pub fn derive_network_id(key: &Key) -> String {
     let mut hasher = Blake2b512::new();
     hasher.update(key.0);
@@ -381,221 +356,76 @@ pub fn decode_invite(invite: &str) -> Result<InvitePayload> {
     })
 }
 
-pub const CTRL_REPLAY_WINDOW_MS: u64 =
-    SlidingReplayWindow::WINDOW_BITS * SlidingReplayWindow::BUCKET_MS;
-
-pub struct AntiReplayWindow {
-    sources: HashMap<u64, (SlidingReplayWindow, u64)>,
-    eviction_heap: BinaryHeap<Reverse<(u64, u64)>>,
+pub struct CtrlReplayTable {
+    sources: HashMap<u64, (DataReplayWindow, Instant)>,
     max_sources: usize,
 }
 
-impl AntiReplayWindow {
+impl CtrlReplayTable {
     pub fn new() -> Self {
         Self {
             sources: HashMap::with_capacity(8),
-            eviction_heap: BinaryHeap::with_capacity(8),
-            max_sources: 4096,
+            max_sources: CTRL_REPLAY_MAX_SOURCES,
         }
     }
 
-    fn rebuild_eviction_heap_from_sources(&mut self) {
-        let mut h = BinaryHeap::new();
-        for (&k, (_, ls)) in &self.sources {
-            h.push(Reverse((*ls, k)));
-        }
-        self.eviction_heap = h;
+    pub fn clear(&mut self) {
+        self.sources.clear();
     }
 
-    /// Drop heap entries superseded by newer `last_seen` (or removed keys). Rebuild if duplicate
-    /// pushes made the heap far larger than `sources`.
-    fn prune_eviction_heap(&mut self) {
-        const MAX_POP: usize = 64;
-        for _ in 0..MAX_POP {
-            let obsolete = match self.eviction_heap.peek() {
-                None => break,
-                Some(Reverse((heap_ts, key))) => match self.sources.get(key) {
-                    None => true,
-                    Some((_, current)) => *current != *heap_ts,
-                },
-            };
-            if !obsolete {
-                break;
-            }
-            self.eviction_heap.pop();
-        }
-        let cap = self
-            .sources
-            .len()
-            .saturating_mul(2)
-            .max(64)
-            .saturating_add(256);
-        if self.eviction_heap.len() > cap {
-            self.rebuild_eviction_heap_from_sources();
+    pub fn allows(&self, src_key: u64, counter: u64) -> bool {
+        match self.sources.get(&src_key) {
+            Some((window, _)) => window.allows(counter),
+            None => true,
         }
     }
 
-    pub fn accept(&mut self, src_key: u64, ts_ms: u64, now_ms: u64, window_ms: u64) -> bool {
-        let age_past = now_ms.saturating_sub(ts_ms);
-        let age_future = ts_ms.saturating_sub(now_ms);
-        let ts_ok = if ts_ms <= now_ms {
-            age_past <= window_ms
-        } else {
-            age_future <= CTRL_TS_FUTURE_TOLERANCE_MS
-        };
-        if !ts_ok {
-            return false;
-        }
-        let existing_accept = if let Some((window, last_seen)) = self.sources.get_mut(&src_key) {
-            *last_seen = now_ms;
-            self.eviction_heap.push(Reverse((now_ms, src_key)));
-            Some(window.accept(ts_ms, now_ms, window_ms))
-        } else {
-            None
-        };
-        if let Some(accepted) = existing_accept {
-            self.prune_eviction_heap();
-            return accepted;
-        }
-        if self.sources.len() >= self.max_sources {
-            let threshold = now_ms.saturating_sub(window_ms);
-            while self.sources.len() >= self.max_sources {
-                let Some(Reverse((heap_seen, key))) = self.eviction_heap.pop() else {
-                    break;
-                };
-                let Some((_, current_seen)) = self.sources.get(&key) else {
-                    continue;
-                };
-                if *current_seen != heap_seen {
-                    continue;
-                }
-                if *current_seen > threshold {
-                    break;
-                }
-                self.sources.remove(&key);
-            }
-            if self.sources.len() >= self.max_sources {
-                self.sources.retain(|_, (_, ls)| *ls > threshold);
-            }
-        }
-        let mut window = SlidingReplayWindow::new();
-        let accepted = window.accept(ts_ms, now_ms, window_ms);
-        if accepted {
-            self.sources.insert(src_key, (window, now_ms));
-            self.eviction_heap.push(Reverse((now_ms, src_key)));
-            self.prune_eviction_heap();
-        }
-        accepted
-    }
-}
-
-#[cfg(test)]
-impl AntiReplayWindow {
-    pub fn eviction_heap_len(&self) -> usize {
-        self.eviction_heap.len()
-    }
-}
-
-pub struct SlidingReplayWindow {
-    bits: [u64; 4],
-    top_bucket: u64,
-}
-
-impl SlidingReplayWindow {
-    pub const WINDOW_BITS: u64 = 256;
-    /// Bucket width; `WINDOW_BITS * BUCKET_MS` ≈ 40.96s past skew/replay window (+~15s vs 100ms buckets).
-    pub const BUCKET_MS: u64 = 160;
-
-    pub fn new() -> Self {
-        Self {
-            bits: [0u64; 4],
-            top_bucket: 0,
-        }
-    }
-
-    pub fn accept(&mut self, ts_ms: u64, now_ms: u64, window_ms: u64) -> bool {
-        let age_past = now_ms.saturating_sub(ts_ms);
-        let age_future = ts_ms.saturating_sub(now_ms);
-        let ts_ok = if ts_ms <= now_ms {
-            age_past <= window_ms
-        } else {
-            age_future <= CTRL_TS_FUTURE_TOLERANCE_MS
-        };
-        if !ts_ok {
-            return false;
-        }
-        let bucket = ts_ms / Self::BUCKET_MS;
-        if bucket + Self::WINDOW_BITS <= self.top_bucket {
-            return false;
-        }
-        if bucket > self.top_bucket {
-            self.shift_window((bucket - self.top_bucket).min(Self::WINDOW_BITS));
-            self.top_bucket = bucket;
-        }
-        let offset = (self.top_bucket - bucket) as usize;
-        if offset >= Self::WINDOW_BITS as usize {
-            return false;
-        }
-        let word = offset / 64;
-        let bit = offset % 64;
-        let mask = 1u64 << bit;
-        if self.bits[word] & mask != 0 {
-            return false;
-        }
-        self.bits[word] |= mask;
-        true
-    }
-
-    fn shift_window(&mut self, shift: u64) {
-        if shift >= Self::WINDOW_BITS {
-            self.bits = [0u64; 4];
+    pub fn commit(&mut self, src_key: u64, counter: u64) {
+        let now = Instant::now();
+        if let Some((window, last_seen)) = self.sources.get_mut(&src_key) {
+            window.commit(counter);
+            *last_seen = now;
             return;
         }
-        let mut merged: U256 =
-            U256::from_words(self.bits[0], self.bits[1], self.bits[2], self.bits[3]);
-        merged = merged << (shift as u32);
-        self.bits = [merged.w0, merged.w1, merged.w2, merged.w3];
+        if self.sources.len() >= self.max_sources {
+            self.evict_oldest_until_room();
+        }
+        if self.sources.len() >= self.max_sources {
+            return;
+        }
+        let mut window = DataReplayWindow::new();
+        window.commit(counter);
+        self.sources.insert(src_key, (window, now));
+    }
+
+    fn evict_oldest_until_room(&mut self) {
+        while self.sources.len() >= self.max_sources {
+            let oldest = self
+                .sources
+                .iter()
+                .min_by_key(|(_, (_, last_seen))| *last_seen)
+                .map(|(k, _)| *k);
+            let Some(key) = oldest else {
+                break;
+            };
+            self.sources.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, src_key: u64) -> bool {
+        self.sources.contains_key(&src_key)
     }
 }
 
-#[derive(Clone, Copy)]
-struct U256 {
-    w0: u64,
-    w1: u64,
-    w2: u64,
-    w3: u64,
-}
-
-impl U256 {
-    fn from_words(w0: u64, w1: u64, w2: u64, w3: u64) -> Self {
-        Self { w0, w1, w2, w3 }
-    }
-}
-
-impl std::ops::Shl<u32> for U256 {
-    type Output = U256;
-
-    fn shl(self, rhs: u32) -> Self::Output {
-        if rhs == 0 {
-            return self;
-        }
-        if rhs >= 256 {
-            return Self::from_words(0, 0, 0, 0);
-        }
-        let word_shift = (rhs / 64) as usize;
-        let bit_shift = rhs % 64;
-        let words = [self.w0, self.w1, self.w2, self.w3];
-        let mut out = [0u64; 4];
-        for i in 0..4usize {
-            if i + word_shift >= 4 {
-                continue;
-            }
-            out[i + word_shift] |= words[i] << bit_shift;
-            if bit_shift > 0 && i + word_shift + 1 < 4 {
-                out[i + word_shift + 1] |= words[i] >> (64 - bit_shift);
-            }
-        }
-        Self::from_words(out[0], out[1], out[2], out[3])
+impl Default for CtrlReplayTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -708,17 +538,63 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_auth_unwrap_parts_matches_unwrap() {
-        let k = MintCrypto::generate_key();
-        let body = b"hello-control";
-        let ts = now_epoch_ms();
-        let pkt = CtrlAuth::wrap(&k, b"JACK", body, ts);
-        let frame = CtrlAuth::unwrap(&k, &pkt, ts, CTRL_REPLAY_WINDOW_MS).unwrap();
-        let (ts2, tag2, body2) =
-            CtrlAuth::unwrap_parts(&k, &pkt, ts, CTRL_REPLAY_WINDOW_MS).unwrap();
-        assert_eq!(frame.timestamp_ms, ts2);
-        assert_eq!(frame.inner_tag, tag2);
-        assert_eq!(frame.body.as_slice(), body2);
+    fn control_plane_aead_roundtrip() {
+        let network = Key([3u8; KEY_LEN]);
+        let aead = derive_control_plane_material(&network).unwrap();
+        let mut plain = Vec::new();
+        plain.extend_from_slice(b"JACK");
+        plain.extend_from_slice(b"hello-control");
+        let mut sealed = BytesMut::new();
+        aead.seal_into(7, &plain, &mut sealed).unwrap();
+        assert_eq!(sealed.len(), WIRE_COUNTER_LEN + plain.len() + DATA_TAG_LEN);
+        assert_ne!(&sealed[..4], b"MCTS");
+        let mut ctr = [0u8; WIRE_COUNTER_LEN];
+        ctr.copy_from_slice(&sealed[..WIRE_COUNTER_LEN]);
+        assert_eq!(decode_wire_counter(&ctr), 7);
+        let mut out = BytesMut::new();
+        aead.open_into(&ctr, &sealed[WIRE_COUNTER_LEN..], &mut out)
+            .unwrap();
+        assert_eq!(&out[..], plain.as_slice());
+    }
+
+    #[test]
+    fn control_plane_rejects_modified_tag() {
+        let network = Key([4u8; KEY_LEN]);
+        let aead = derive_control_plane_material(&network).unwrap();
+        let mut sealed = BytesMut::new();
+        aead.seal_into(1, b"JACKx", &mut sealed).unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        let mut ctr = [0u8; WIRE_COUNTER_LEN];
+        ctr.copy_from_slice(&sealed[..WIRE_COUNTER_LEN]);
+        let mut out = BytesMut::new();
+        assert!(aead
+            .open_into(&ctr, &sealed[WIRE_COUNTER_LEN..], &mut out)
+            .is_err());
+    }
+
+    #[test]
+    fn control_plane_rejects_counter_exhaustion() {
+        let network = Key([4u8; KEY_LEN]);
+        let aead = derive_control_plane_material(&network).unwrap();
+        let mut sealed = BytesMut::new();
+        assert!(aead.seal_into(1u64 << 48, b"JACKx", &mut sealed).is_err());
+    }
+
+    #[test]
+    fn control_and_data_hkdf_are_distinct() {
+        let network = Key([8u8; KEY_LEN]);
+        let ctrl = derive_control_plane_material(&network).unwrap();
+        let data = derive_data_plane_material(&network, 1, 2).unwrap();
+        let mut ctrl_sealed = BytesMut::new();
+        ctrl.seal_into(3, b"JACKx", &mut ctrl_sealed).unwrap();
+        let mut ctr = [0u8; WIRE_COUNTER_LEN];
+        ctr.copy_from_slice(&ctrl_sealed[..WIRE_COUNTER_LEN]);
+        let aad = aad(1, 2);
+        let mut out = BytesMut::new();
+        assert!(data
+            .decrypt_framed_payload_into(&ctr, &aad, &ctrl_sealed[WIRE_COUNTER_LEN..], &mut out)
+            .is_err());
     }
 
     #[test]
@@ -734,74 +610,29 @@ mod tests {
     }
 
     #[test]
-    fn anti_replay_accepts_then_rejects_duplicate_ts_bucket() {
-        let mut w = AntiReplayWindow::new();
-        let now = 1_000_000u64;
-        assert!(w.accept(1, now, now, CTRL_REPLAY_WINDOW_MS));
-        assert!(!w.accept(1, now, now, CTRL_REPLAY_WINDOW_MS));
+    fn ctrl_replay_rejects_duplicate_and_allows_far_ahead() {
+        let mut t = CtrlReplayTable::new();
+        assert!(t.allows(1, 10));
+        t.commit(1, 10);
+        assert!(!t.allows(1, 10));
+        assert!(t.allows(1, 400));
+        t.commit(1, 400);
+        assert!(!t.allows(1, 400));
+        assert!(!t.allows(1, 10));
     }
 
     #[test]
-    fn anti_replay_evicts_oldest_when_at_cap_to_admit_new_source() {
-        let mut w = AntiReplayWindow::new();
-        let now = 2_000_000u64;
-        for k in 0u64..4096 {
-            assert!(
-                w.accept(k, now + k, now + k, CTRL_REPLAY_WINDOW_MS),
-                "k={k}"
-            );
+    fn ctrl_replay_evicts_oldest_when_at_cap_to_admit_new_source() {
+        let mut t = CtrlReplayTable::new();
+        for k in 0u64..CTRL_REPLAY_MAX_SOURCES as u64 {
+            assert!(t.allows(k, 1), "k={k}");
+            t.commit(k, 1);
         }
-        assert!(w.accept(9999, now, now, CTRL_REPLAY_WINDOW_MS));
-        assert!(w.accept(100, now + 10_000, now + 10_000, CTRL_REPLAY_WINDOW_MS));
-    }
-
-    #[test]
-    fn anti_replay_evicts_stale_entries_when_full_before_new_source() {
-        let mut w = AntiReplayWindow::new();
-        let window_ms = CTRL_REPLAY_WINDOW_MS;
-        let base = 1_000_000u64;
-        for k in 0u64..256 {
-            assert!(w.accept(k, base + k, base + k, window_ms));
-        }
-        let now_ms = base + 2 * window_ms + 10_000;
-        assert!(w.accept(9999, now_ms, now_ms, window_ms));
-    }
-
-    #[test]
-    fn anti_replay_eviction_heap_stays_bounded_for_single_hot_source() {
-        let mut w = AntiReplayWindow::new();
-        let window_ms = CTRL_REPLAY_WINDOW_MS;
-        let base = 5_000_000u64;
-        for i in 0..10_000 {
-            let t = base + i * SlidingReplayWindow::BUCKET_MS;
-            assert!(w.accept(42, t, t, window_ms), "i={i}");
-        }
-        assert!(
-            w.eviction_heap_len() <= 512,
-            "heap len {}",
-            w.eviction_heap_len()
-        );
-    }
-
-    #[test]
-    fn ctrl_auth_unwrap_accepts_slightly_future_timestamp() {
-        let k = MintCrypto::generate_key();
-        let body = b"body";
-        let now = 1_000_000u64;
-        let ts = now + CTRL_TS_FUTURE_TOLERANCE_MS / 2;
-        let pkt = CtrlAuth::wrap(&k, b"JACK", body, ts);
-        CtrlAuth::unwrap_parts(&k, &pkt, now, CTRL_REPLAY_WINDOW_MS)
-            .expect("future within tolerance");
-    }
-
-    #[test]
-    fn ctrl_auth_unwrap_rejects_far_future_timestamp() {
-        let k = MintCrypto::generate_key();
-        let body = b"body";
-        let now = 1_000_000u64;
-        let ts = now + CTRL_TS_FUTURE_TOLERANCE_MS + 1;
-        let pkt = CtrlAuth::wrap(&k, b"JACK", body, ts);
-        assert!(CtrlAuth::unwrap_parts(&k, &pkt, now, CTRL_REPLAY_WINDOW_MS).is_err());
+        assert_eq!(t.len(), CTRL_REPLAY_MAX_SOURCES);
+        assert!(t.allows(99_999, 1));
+        t.commit(99_999, 1);
+        assert!(t.contains(99_999));
+        assert_eq!(t.len(), CTRL_REPLAY_MAX_SOURCES);
     }
 
     fn aad(sender: u32, receiver: u32) -> [u8; 8] {

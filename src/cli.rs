@@ -1986,7 +1986,7 @@ impl Cli {
             "  │  VIP     : {:<46}",
             format!("{vip}/{}  (owner)", self.config.snapshot().subnet_prefix)
         );
-        crate::cli_println!("  │> Invite : {public_invite}");
+        crate::cli_println!("  │> Invite  : {public_invite}");
         crate::cli_println!();
         Ok(())
     }

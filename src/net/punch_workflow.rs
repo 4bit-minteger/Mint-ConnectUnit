@@ -45,6 +45,7 @@ pub(crate) async fn punch_targets_at_pps(
     let snap = state_view.read().clone();
     let hpch_pkt = build_signed_or_plain_static_for_punch(
         snap.crypto_key.clone(),
+        &snap.ctrl_send_ctr,
         PKT_HPCH,
         snap.my_vip.as_bytes(),
     );
@@ -76,6 +77,7 @@ async fn punch_stage1_direct(
             let snap = state_view.read().clone();
             let pkt = build_signed_or_plain_static_for_punch(
                 snap.crypto_key.clone(),
+                &snap.ctrl_send_ctr,
                 PKT_HPCH,
                 snap.my_vip.as_bytes(),
             );

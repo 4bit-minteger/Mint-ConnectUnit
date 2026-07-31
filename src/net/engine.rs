@@ -24,9 +24,9 @@ use tokio::time::{interval, interval_at, Interval, MissedTickBehavior};
 use crate::bcast::BroadcastDeduplicator;
 use crate::config::PeerInfo;
 use crate::crypto::{
-    decode_wire_counter, derive_data_plane_material, now_epoch_ms, AeadKey, AntiReplayWindow,
-    ControlRateLimiter, CtrlAuth, DataPlaneAead, DataReplayWindow, Key, DATA_TAG_LEN,
-    WIRE_COUNTER_LEN,
+    decode_wire_counter, derive_control_plane_material, derive_data_plane_material, now_epoch_ms,
+    AeadKey, ControlPlaneAead, ControlRateLimiter, CtrlReplayTable, DataPlaneAead,
+    DataReplayWindow, Key, DATA_TAG_LEN, WIRE_COUNTER_LEN,
 };
 use crate::metrics::EngineMetrics;
 use crate::nat::{ice::IceCandidate, stun};
@@ -319,6 +319,7 @@ type RosterChangedHandler = Arc<dyn Fn(RosterChange) + Send + Sync>;
 pub struct EngineState {
     pub crypto_keys: CryptoPool,
     pub data_ciphers: HashMap<(u32, u32), Arc<DataPlaneAead>>,
+    pub control_ciphers: HashMap<[u8; 32], Arc<ControlPlaneAead>>,
     pub data_send_ctr: HashMap<u32, u64>,
     pub data_replay: HashMap<u32, DataReplayWindow>,
     pub owner_ep: Option<SocketAddr>,
@@ -480,6 +481,7 @@ impl CryptoPool {
 pub(crate) struct PunchState {
     pub(crate) my_vip: String,
     pub(crate) crypto_key: Option<Arc<AeadKey>>,
+    pub(crate) ctrl_send_ctr: Arc<AtomicU64>,
 }
 
 pub(crate) type PunchStateView = Arc<RwLock<PunchState>>;
@@ -548,7 +550,8 @@ pub struct P2PEngine {
     manual_punch_stops: HashMap<String, Arc<AtomicBool>>,
     ice_check_stops: HashMap<String, Arc<AtomicBool>>,
     peer_keepalive_stops: HashMap<String, Arc<AtomicBool>>,
-    anti_replay: AntiReplayWindow,
+    ctrl_send_ctr: Arc<AtomicU64>,
+    ctrl_replay: CtrlReplayTable,
     ctrl_limiter: ControlRateLimiter,
 
     plain_data_limiter: ControlRateLimiter,
@@ -762,7 +765,6 @@ struct ParaPunchAckMsg {
 
 #[derive(Debug, Clone, Copy)]
 struct RuntimeFeatureFlags {
-    replay_sliding_window: bool,
     multipath_core: bool,
     dual_write_transition: bool,
     predictive_heal: bool,
@@ -773,7 +775,6 @@ struct RuntimeFeatureFlags {
 impl Default for RuntimeFeatureFlags {
     fn default() -> Self {
         Self {
-            replay_sliding_window: true,
             multipath_core: true,
             dual_write_transition: true,
             predictive_heal: true,
@@ -853,9 +854,11 @@ impl P2PEngine {
         let (stun_resolve_tx, stun_resolve_rx) = mpsc::unbounded_channel();
         let (decentralized_resolve_tx, decentralized_resolve_rx) = mpsc::unbounded_channel();
         let (decentralized_http_tx, decentralized_http_rx) = mpsc::unbounded_channel();
+        let ctrl_send_ctr = Arc::new(AtomicU64::new(0));
         let state_view = Arc::new(RwLock::new(PunchState {
             my_vip: my_vip_s.clone(),
             crypto_key: None,
+            ctrl_send_ctr: ctrl_send_ctr.clone(),
         }));
         Self {
             socket,
@@ -890,6 +893,7 @@ impl P2PEngine {
             state: EngineState {
                 crypto_keys: CryptoPool::new(),
                 data_ciphers: HashMap::new(),
+                control_ciphers: HashMap::new(),
                 data_send_ctr: HashMap::new(),
                 data_replay: HashMap::new(),
                 owner_ep: None,
@@ -923,7 +927,8 @@ impl P2PEngine {
             manual_punch_stops: HashMap::new(),
             ice_check_stops: HashMap::new(),
             peer_keepalive_stops: HashMap::new(),
-            anti_replay: AntiReplayWindow::new(),
+            ctrl_send_ctr,
+            ctrl_replay: CtrlReplayTable::new(),
             ctrl_limiter: ControlRateLimiter::new(400.0, 400.0),
             plain_data_limiter: ControlRateLimiter::new(200.0, 200.0),
             join_rate_limiter: ControlRateLimiter::new(8.0, 4.0),
@@ -1261,7 +1266,12 @@ impl P2PEngine {
                 }
                 let snap = state_view.read().clone();
                 let hpch_body = snap.my_vip.into_bytes();
-                let hpch_pkt = build_signed_or_plain_static(snap.crypto_key, PKT_HPCH, &hpch_body);
+                let hpch_pkt = build_signed_or_plain_static(
+                    snap.crypto_key,
+                    &snap.ctrl_send_ctr,
+                    PKT_HPCH,
+                    &hpch_body,
+                );
                 for _ in 0..BURST_PER_TARGET {
                     if stop.load(Ordering::Acquire) {
                         break;
@@ -1564,6 +1574,24 @@ impl P2PEngine {
         self.state.crypto_keys.key_for_dest(dest)
     }
 
+    fn control_plane_cipher(&mut self, key: &AeadKey) -> Option<Arc<ControlPlaneAead>> {
+        let material = key.as_key().0;
+        if let Some(found) = self.state.control_ciphers.get(&material) {
+            return Some(found.clone());
+        }
+        let aead = Arc::new(derive_control_plane_material(&key.as_key()).ok()?);
+        self.state.control_ciphers.insert(material, aead.clone());
+        Some(aead)
+    }
+
+    fn next_ctrl_send_counter(ctr: &AtomicU64) -> Option<u64> {
+        let out = ctr.fetch_add(1, Ordering::Relaxed);
+        if out >= (1u64 << 48) {
+            return None;
+        }
+        Some(out)
+    }
+
     fn data_plane_cipher(
         &mut self,
         sender_vip: u32,
@@ -1592,6 +1620,7 @@ impl P2PEngine {
 
     fn clear_data_crypto_state(&mut self) {
         self.state.data_ciphers.clear();
+        self.state.control_ciphers.clear();
         self.state.data_send_ctr.clear();
         self.state.data_replay.clear();
     }
@@ -1756,7 +1785,8 @@ impl P2PEngine {
         self.reliable_seen_timeline.clear();
         self.msmd_seen.clear();
         self.msmd_timeline.clear();
-        self.anti_replay = AntiReplayWindow::new();
+        self.ctrl_replay.clear();
+        self.ctrl_send_ctr.store(0, Ordering::Relaxed);
         self.pmtud = PathMtuDiscovery::new();
         self.heal_cooldown_until.clear();
         self.pending_pings.clear();
@@ -2894,6 +2924,7 @@ impl P2PEngine {
                     let snap = sv.read().clone();
                     let pkt = build_signed_or_plain_static(
                         snap.crypto_key.clone(),
+                        &snap.ctrl_send_ctr,
                         PKT_HPCH,
                         snap.my_vip.as_bytes(),
                     );
@@ -2925,8 +2956,12 @@ impl P2PEngine {
                     let hpch_body = snap.my_vip.into_bytes();
                     let crypto_key = snap.crypto_key;
                     for _ in 0..count {
-                        let pkt =
-                            build_signed_or_plain_static(crypto_key.clone(), PKT_HPCH, &hpch_body);
+                        let pkt = build_signed_or_plain_static(
+                            crypto_key.clone(),
+                            &snap.ctrl_send_ctr,
+                            PKT_HPCH,
+                            &hpch_body,
+                        );
                         let _ = socket.send_to(&pkt, target).await;
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
@@ -2971,11 +3006,16 @@ impl P2PEngine {
                         let crypto_key = snap.crypto_key;
                         let hpch = build_signed_or_plain_static(
                             crypto_key.clone(),
+                            &snap.ctrl_send_ctr,
                             PKT_HPCH,
                             &keepalive_body,
                         );
-                        let kpal =
-                            build_signed_or_plain_static(crypto_key, PKT_KPAL, &keepalive_body);
+                        let kpal = build_signed_or_plain_static(
+                            crypto_key,
+                            &snap.ctrl_send_ctr,
+                            PKT_KPAL,
+                            &keepalive_body,
+                        );
                         for target in &targets {
                             let _ = socket.send_to(&hpch, target).await;
                             let _ = socket.send_to(&kpal, target).await;
@@ -3493,7 +3533,12 @@ impl P2PEngine {
     }
 
     async fn send_ctrl_signed_to(&self, dest: SocketAddr, tag: &[u8; 4], body: &[u8]) -> bool {
-        let pkt = build_signed_or_plain_static(self.outbound_crypto_key_for(dest), tag, body);
+        let pkt = build_signed_or_plain_static(
+            self.outbound_crypto_key_for(dest),
+            &self.ctrl_send_ctr,
+            tag,
+            body,
+        );
         self.socket.send_to(&pkt, dest).await.is_ok()
     }
 
@@ -3563,42 +3608,52 @@ impl P2PEngine {
 
     async fn handle_signed_wrapper(&mut self, body: &[u8], from: SocketAddr) {
         let src_key = src_addr_key(from);
-        let now = now_epoch_ms();
+        const MIN_CTRL_AEAD: usize = WIRE_COUNTER_LEN + 4 + DATA_TAG_LEN;
+        if body.len() < MIN_CTRL_AEAD {
+            self.metrics.inc_auth_failures();
+            return;
+        }
+        let mut counter_wire = [0u8; WIRE_COUNTER_LEN];
+        counter_wire.copy_from_slice(&body[..WIRE_COUNTER_LEN]);
+        let counter = decode_wire_counter(&counter_wire);
+        let sealed = &body[WIRE_COUNTER_LEN..];
+
+        let keys = self.state.crypto_keys.keys_for_decrypt(from);
         let mut chosen_key: Option<Arc<AeadKey>> = None;
-        let mut chosen_frame: Option<(u64, [u8; 4], &[u8])> = None;
-        for key in self.state.crypto_keys.keys_for_decrypt(from) {
-            if let Ok((timestamp_ms, inner_tag, inner_body)) = CtrlAuth::unwrap_parts(
-                &key.as_key(),
-                body,
-                now,
-                crate::crypto::CTRL_REPLAY_WINDOW_MS,
-            ) {
+        for key in keys {
+            let Some(aead) = self.control_plane_cipher(key.as_ref()) else {
+                continue;
+            };
+            self.decrypt_scratch.clear();
+            if aead
+                .open_into(&counter_wire, sealed, &mut self.decrypt_scratch)
+                .is_ok()
+            {
                 chosen_key = Some(key);
-                chosen_frame = Some((timestamp_ms, inner_tag, inner_body));
                 break;
             }
         }
-        let Some((timestamp_ms, inner_tag, frame_body)) = chosen_frame else {
+        let Some(chosen_key) = chosen_key else {
             self.metrics.inc_auth_failures();
             return;
         };
+        if self.decrypt_scratch.len() < 4 {
+            self.metrics.inc_auth_failures();
+            return;
+        }
+        let mut inner_tag = [0u8; 4];
+        inner_tag.copy_from_slice(&self.decrypt_scratch[..4]);
+        let frame_body = self.decrypt_scratch[4..].to_vec();
+
         if !self.ctrl_limiter.allow(src_key) {
             return;
         }
-        if self.state.feature_flags.replay_sliding_window
-            && !self.anti_replay.accept(
-                src_key,
-                timestamp_ms,
-                now,
-                crate::crypto::CTRL_REPLAY_WINDOW_MS,
-            )
-        {
+        if !self.ctrl_replay.allows(src_key, counter) {
             return;
         }
+        self.ctrl_replay.commit(src_key, counter);
         self.touch_routing_endpoint(from);
-        if let Some(key) = chosen_key {
-            self.state.crypto_keys.bind_peer_key(from, key);
-        }
+        self.state.crypto_keys.bind_peer_key(from, chosen_key);
         self.dispatch_control(inner_tag, &frame_body, from, true)
             .await;
     }
@@ -4478,10 +4533,24 @@ impl P2PEngine {
             return self.frame_with_tag_reuse(tag, body);
         }
         if let Some(key) = crypto_key.as_ref() {
-            let wrapped = CtrlAuth::wrap(&key.as_key(), tag, body, now_epoch_ms());
-            return self.frame_with_tag_reuse(PKT_CTSIG, &wrapped);
+            if let Some(sealed) = self.seal_control_body(key.as_ref(), tag, body) {
+                return self.frame_with_tag_reuse(PKT_CTSIG, &sealed);
+            }
+            return Bytes::new();
         }
         self.frame_with_tag_reuse(tag, body)
+    }
+
+    fn seal_control_body(&mut self, key: &AeadKey, tag: &[u8; 4], body: &[u8]) -> Option<Bytes> {
+        let counter = Self::next_ctrl_send_counter(&self.ctrl_send_ctr)?;
+        let aead = self.control_plane_cipher(key)?;
+        self.encrypt_scratch.clear();
+        self.encrypt_scratch.extend_from_slice(tag);
+        self.encrypt_scratch.extend_from_slice(body);
+        let plain = self.encrypt_scratch.split();
+        aead.seal_into(counter, &plain, &mut self.encrypt_scratch)
+            .ok()?;
+        Some(self.encrypt_scratch.split().freeze())
     }
 
     fn encrypt_framed_packet_reuse(
@@ -5063,9 +5132,11 @@ impl P2PEngine {
                 .outbound_crypto_key_for(dest)
                 .or_else(|| self.state.crypto_keys.shared_signing_key());
             if let Some(key) = key {
-                let wrapped = CtrlAuth::wrap(&key.as_key(), tag, body, now_epoch_ms());
-                let pkt = self.frame_with_tag_reuse(PKT_CTSIG, &wrapped);
-                return self.socket.send_to(&pkt, dest).await.is_ok();
+                if let Some(sealed) = self.seal_control_body(key.as_ref(), tag, body) {
+                    let pkt = self.frame_with_tag_reuse(PKT_CTSIG, &sealed);
+                    return self.socket.send_to(&pkt, dest).await.is_ok();
+                }
+                return false;
             }
             if self.has_crypto() {
                 self.ui_err(format!(
@@ -5195,6 +5266,7 @@ impl P2PEngine {
             for ep in secondary_eps {
                 let pkt = build_signed_or_plain_static(
                     self.outbound_crypto_key_for(ep),
+                    &self.ctrl_send_ctr,
                     PKT_KPAL,
                     &keepalive_body,
                 );
@@ -5207,6 +5279,7 @@ impl P2PEngine {
                 if !owner_known {
                     let pkt = build_signed_or_plain_static(
                         self.outbound_crypto_key_for(owner_ep),
+                        &self.ctrl_send_ctr,
                         PKT_HPCH,
                         &keepalive_body,
                     );
@@ -5449,6 +5522,7 @@ impl P2PEngine {
                     let take = MAX_PER_TICK.min(targets.len());
                     let pkt = build_signed_or_plain_static(
                         snap.crypto_key.clone(),
+                        &snap.ctrl_send_ctr,
                         PKT_HPCH,
                         snap.my_vip.as_bytes(),
                     );
@@ -5978,6 +6052,7 @@ fn peer_announce_needs_work_unbound(rt: &RoutingTable, addr: SocketAddr) -> bool
 
 fn build_signed_or_plain_static(
     crypto_key: Option<Arc<AeadKey>>,
+    ctrl_send_ctr: &AtomicU64,
     tag: &[u8; 4],
     body: &[u8],
 ) -> Bytes {
@@ -5985,18 +6060,31 @@ fn build_signed_or_plain_static(
         return frame_with_tag(tag, body);
     }
     if let Some(key) = crypto_key.as_ref() {
-        let wrapped = CtrlAuth::wrap(&key.as_key(), tag, body, now_epoch_ms());
-        return frame_with_tag(PKT_CTSIG, &wrapped);
+        let Some(counter) = P2PEngine::next_ctrl_send_counter(ctrl_send_ctr) else {
+            return Bytes::new();
+        };
+        let Ok(aead) = derive_control_plane_material(&key.as_key()) else {
+            return Bytes::new();
+        };
+        let mut plain = Vec::with_capacity(4 + body.len());
+        plain.extend_from_slice(tag);
+        plain.extend_from_slice(body);
+        let mut sealed = BytesMut::new();
+        if aead.seal_into(counter, &plain, &mut sealed).is_err() {
+            return Bytes::new();
+        }
+        return frame_with_tag(PKT_CTSIG, &sealed);
     }
     frame_with_tag(tag, body)
 }
 
 pub(crate) fn build_signed_or_plain_static_for_punch(
     crypto_key: Option<Arc<AeadKey>>,
+    ctrl_send_ctr: &AtomicU64,
     tag: &[u8; 4],
     body: &[u8],
 ) -> Bytes {
-    build_signed_or_plain_static(crypto_key, tag, body)
+    build_signed_or_plain_static(crypto_key, ctrl_send_ctr, tag, body)
 }
 
 fn allow_unauth_control_tag_with_crypto(tag: [u8; 4]) -> bool {

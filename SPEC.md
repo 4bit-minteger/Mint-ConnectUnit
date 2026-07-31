@@ -116,7 +116,7 @@ flowchart TB
 | `src/net/pmtud_probe.rs` | Separate socket for PMTUD probe traffic |
 | `src/net/punch_workflow.rs` | Canonical 3-stage hole-punch workflow |
 | `src/routing.rs` | Per-VIP routes, path candidates, failover, tombstones |
-| `src/crypto.rs` | AEGIS-128L data-plane framing, HMAC control (`MCTS`), invites, HKDF derivation, anti-replay |
+| `src/crypto.rs` | AEGIS-128L data + control framing, invites, HKDF derivation, counter anti-replay |
 | `src/netinfo.rs` | `NetInfo/` paths next to executable (`config.toml`, `peer_cache.json`) |
 | `src/config.rs` | `NetInfo/config.toml` schema, `IPPool` for owner VIP allocation |
 | `src/peer_cache.rs` | Serialize/deserialize learned endpoints |
@@ -168,8 +168,8 @@ Largest behavioural surface: `cli.rs` and `net/engine.rs`. Trace bugs from CLI a
 
 - **Authority**: protocol behaviour is defined by this repository (`src/`, `tests/`) and this document. Any wire or behavioural change requires an update here and matching tests.
 - **Data plane crypto**: AEGIS-128L with wire frame `0x02 | ctr_le_6 | ciphertext | tag_16`; per-direction HKDF (`data|sender_vip_be|receiver_vip_be`) from the 32-byte network key; nonce is `salt_10 | ctr_le_6`.
-- **Control-plane auth**: HMAC-BLAKE2b truncated to 8 bytes.
-- **Wire protocol version**: join `MPJN` / `MPJA` JSON field `proto_ver` must equal **4** (`WIRE_PROTOCOL_VERSION`). Enforced on-wire only; config does not store a protocol version field. Mismatch ⇒ join fails.
+- **Control-plane crypto**: AEGIS-128L AEAD; HKDF info `ctrl` (no VIP) from the same network key and salt `mint-aegis-128l-v1`; wire after outer `MCTS` is `ctr_le_6 | ciphertext | tag_16` where plaintext is `inner_tag || body`; AAD is `mcts`; nonce is `salt_10 | ctr_le_6`. Global 48-bit send counter; per-source 128-bit counter replay (`CtrlReplayTable`, max 4096 sources).
+- **Wire protocol version**: join `MPJN` / `MPJA` JSON field `proto_ver` must equal **5** (`WIRE_PROTOCOL_VERSION`). Enforced on-wire only; config does not store a protocol version field. Mismatch ⇒ join fails.
 - **Packet tags — control plane**: 4-byte ASCII (`M…`): `MPJN`, `MPJA`, `MCTS`, signaling, PMTU, MSYN family, etc.
 - **Packet tags — data / reliable plane**: 1-byte compact type (`0x01` data, `0x02` encrypted, `0x03` FEC, `0x04` reliable, `0x05` ack, `0x06` inner JoinAck inside reliable). Reserved: `0x00`, `0x07`–`0xF9` unassigned, `0xFA`–`0xFE` reserved, `0xFF` sentinel. First byte `b'M'` ⇒ 4-byte control tag; otherwise compact parse.
 - **Control-sign wrapper tag**: `MCTS`.
@@ -185,7 +185,7 @@ Legend for tuning notes below: **↑** = increase value in code/config; **↓** 
 
 ## Wire protocol (tags)
 
-Code tags: `src/net/packet.rs`. Join handshake requires `proto_ver: 4` in `MPJN` / `MPJA`.
+Code tags: `src/net/packet.rs`. Join handshake requires `proto_ver: 5` in `MPJN` / `MPJA`.
 
 | Tag | Role |
 |-----|------|
@@ -233,7 +233,7 @@ User-tunable data-path knobs: edit `NetInfo/config.toml`, then `config reload` �
 1. UDP datagram → if STUN-shaped, handled separately.
 2. Compact reliable / ack → `ReliableChannel` (ordered retry, RTO EWMA).
 3. **`MPMT` / `MPAR`** → PMTUD state (+ probe socket for some paths).
-4. **`MCTS`** → verify HMAC → `dispatch_control` (join, sync, kick, para signals, etc.).
+4. **`MCTS`** → AEGIS-128L open + per-source counter replay → `dispatch_control` (join, sync, kick, para signals, etc.).
 5. Rate limiters protect join and plain control floods.
 
 Control messages update **`RoutingTable`**, **`CryptoPool`**, session identity, and CLI-visible state (via oneshot replies on some `EngineCmd`).
@@ -256,7 +256,7 @@ Important internal state (non-exhaustive):
 
 - `PacingWorkerHandle` (commands / `PacingObs` / events), `ReliableChannel`, `RetransmitDirectSender`
 - `fec_send_by_dest` / `fec_decoders`
-- `PathMtuDiscovery`, `BroadcastDeduplicator`, `AntiReplayWindow`
+- `PathMtuDiscovery`, `BroadcastDeduplicator`, `CtrlReplayTable`
 - `CryptoPool`, feature flags (multipath, dual-write, predictive heal, control path race, …)
 - `peer_sync_state`, `peer_pending_removals`, `msyn_applied_to_rev`
 - STUN query maps, pending pings/heal cooldowns, parasitic notify channels
@@ -307,8 +307,7 @@ Defaults live in `src/routing.rs` (`failover` module) and are mirrored under the
 - **`MintCrypto`**: encrypt/decrypt with random nonce per message.
 - **`AeadKey`**: cached cipher + monotonic nonce suffix for high-volume sends.
 - **`CryptoPool`**: network key + per-peer bindings + limited extra keys.
-- **Control signing**: `MCTS` wrapper; timestamp tolerance **`CTRL_TS_FUTURE_TOLERANCE_MS`** (5s).
-- **Anti-replay** window for accepted control timestamps.
+- **Control AEAD**: `MCTS` wrapper; AEGIS-128L with HKDF `ctrl`; encrypts inner tag + body; global send counter; `CtrlReplayTable` (4096-source cap).
 - **Invites** encode network id, keys, endpoints — decode in CLI for `join`.
 
 **Rule:** no `panic!` / `unwrap()` on user or network input paths.
@@ -360,7 +359,7 @@ With current defaults (`500 µs`, base burst `3`), scheduler capacity is `6,000 
 
 `pace_max_queue_packets` is a queue **basis** split into a data depth per active peer and global control/retransmit depths. The APD denominator grows with the number of non-empty peer queues.
 
-### APD pressure signal and ramp
+### APD (Adaptive Pressure Drain) pressure signal and ramp
 
 APD computes one aggregate pressure sample per accepted tick:
 

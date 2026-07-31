@@ -16,7 +16,6 @@ socket2 = "0.5"
 aegis = { version = "0.9.15", default-features = false, features = ["pure-rust", "std"] }
 hkdf = "0.12"
 blake2 = "0.10"
-hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"

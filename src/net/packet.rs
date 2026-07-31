@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 
 /// Join handshake / wire framing version (independent of MSYN `proto_ver` schema).
-pub const WIRE_PROTOCOL_VERSION: u64 = 4;
+pub const WIRE_PROTOCOL_VERSION: u64 = 5;
 
 pub const COMPACT_HEADER_LEN: usize = 1;
 pub const CONTROL_TAG_LEN: usize = 4;
