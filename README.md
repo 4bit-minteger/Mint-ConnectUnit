@@ -1,6 +1,6 @@
 # Mint-ConnectUnit
 
-<img src="./windows/ConnectUnit.ico" width="200" alt="Project Icon">
+<img src="./windows/Band.png" width="1900" alt="Project">
 
 - A light-weight portable serverless peer-to-peer VPN for **Windows** (at least now), optimized for low-bandwidth, low-latency tasks.
 - Using **Wintun** TAP adapter
