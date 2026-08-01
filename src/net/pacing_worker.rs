@@ -53,6 +53,9 @@ pub struct PacingObs {
     pub cc_min_bps: f64,
     pub cc_avg_bps: f64,
     pub cc_max_bps: f64,
+    pub cc_delivery_min_bps: f64,
+    pub cc_delivery_avg_bps: f64,
+    pub cc_delivery_max_bps: f64,
     pub cc_counters: CcUpdateCounters,
     pub drr_rtt_aware: bool,
     pub drr_enabled: bool,
@@ -93,6 +96,9 @@ impl Default for PacingObs {
             cc_min_bps: 0.0,
             cc_avg_bps: 0.0,
             cc_max_bps: 0.0,
+            cc_delivery_min_bps: 0.0,
+            cc_delivery_avg_bps: 0.0,
+            cc_delivery_max_bps: 0.0,
             cc_counters: CcUpdateCounters::default(),
             drr_rtt_aware: config.drr_rtt_aware,
             drr_enabled: config.drr_enabled,
@@ -115,6 +121,8 @@ impl PacingObs {
         let (apd_ramp_active, apd_ramp_pinned, apd_last_burst) = p.apd_ramp_observability();
         let (apd_arm_fill, apd_arm_sojourn, apd_max_sojourn) = p.apd_sojourn_observability();
         let (cc_min_bps, cc_avg_bps, cc_max_bps) = p.cc_metrics_snapshot();
+        let (cc_delivery_min_bps, cc_delivery_avg_bps, cc_delivery_max_bps) =
+            p.cc_delivery_metrics_snapshot();
         let mut peer_data_lens = HashMap::with_capacity(p.config.max_data_queue_packets.min(64));
         for (dest, len) in p.peer_data_lens_snapshot() {
             peer_data_lens.insert(dest, len);
@@ -148,6 +156,9 @@ impl PacingObs {
             cc_min_bps,
             cc_avg_bps,
             cc_max_bps,
+            cc_delivery_min_bps,
+            cc_delivery_avg_bps,
+            cc_delivery_max_bps,
             cc_counters: p.cc_counters(),
             drr_rtt_aware: p.config.drr_rtt_aware,
             drr_enabled: p.config.drr_enabled,

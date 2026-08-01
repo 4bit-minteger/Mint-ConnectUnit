@@ -343,7 +343,9 @@ pub struct CongestionTuning {
     pub congestion_loss_threshold: f64,
     pub base_rtt_window_secs: u64,
     pub base_rtt_stale_windows: u8,
-    /// MPNG probe period for congestion telemetry (`0` = off). Independent of `keepalive_secs`.
+    /// Reject forward OWD sample (and reset base cold) when `|sample − base|` exceeds this (ms).
+    pub owd_clock_jump_reject_ms: u64,
+    /// Compact ping probe period for congestion telemetry (`0` = off). Independent of `keepalive_secs`.
     pub probe_interval_ms: u64,
     /// How long after last congestive delay sample FEC recovery step-down may fire (`0` = off).
     pub fec_recovery_recency_ms: u64,
@@ -362,6 +364,14 @@ pub struct CongestionTuning {
     pub max_rate_bps: f64,
     pub loss_multiplicative_decrease: f64,
     pub burst_cap_bytes: u64,
+    /// Window for delivered TX rate samples before one EWMA update.
+    pub delivery_rate_window_ms: u32,
+    /// Weight of a new delivery-rate window sample.
+    pub delivery_rate_ewma_alpha: f64,
+    /// Multiplier applied to delivery EWMA on a hard-anchored decrease.
+    pub delivery_anchor_factor: f64,
+    /// Ceiling/delivery ratio that triggers hard-anchored decrease.
+    pub delivery_decouple_ratio: f64,
 }
 
 impl Default for CongestionTuning {
@@ -373,6 +383,7 @@ impl Default for CongestionTuning {
             congestion_loss_threshold: 0.7,
             base_rtt_window_secs: 3,
             base_rtt_stale_windows: 2,
+            owd_clock_jump_reject_ms: crate::routing::DEFAULT_OWD_CLOCK_JUMP_REJECT_MS,
             probe_interval_ms: 20,
             fec_recovery_recency_ms: 3_000,
             enabled: true,
@@ -386,6 +397,10 @@ impl Default for CongestionTuning {
             max_rate_bps: crate::net::background_cc::DEFAULT_MAX_RATE_BPS,
             loss_multiplicative_decrease: crate::net::background_cc::DEFAULT_LOSS_MD,
             burst_cap_bytes: crate::net::background_cc::DEFAULT_BURST_CAP_BYTES,
+            delivery_rate_window_ms: crate::net::background_cc::DEFAULT_DELIVERY_RATE_WINDOW_MS,
+            delivery_rate_ewma_alpha: crate::net::background_cc::DEFAULT_DELIVERY_RATE_EWMA_ALPHA,
+            delivery_anchor_factor: crate::net::background_cc::DEFAULT_DELIVERY_ANCHOR_FACTOR,
+            delivery_decouple_ratio: crate::net::background_cc::DEFAULT_DELIVERY_DECOUPLE_RATIO,
         }
     }
 }
@@ -404,6 +419,10 @@ impl CongestionTuning {
         self.initial_rate_bps = self
             .initial_rate_bps
             .clamp(self.min_rate_bps, self.max_rate_bps);
+        self.delivery_rate_window_ms = self.delivery_rate_window_ms.clamp(100, 5_000);
+        self.delivery_rate_ewma_alpha = self.delivery_rate_ewma_alpha.clamp(0.05, 1.0);
+        self.delivery_anchor_factor = self.delivery_anchor_factor.clamp(0.5, 0.99);
+        self.delivery_decouple_ratio = self.delivery_decouple_ratio.clamp(1.05, 3.0);
     }
 
     pub fn to_background_cc_config(&self) -> crate::net::background_cc::BackgroundCcConfig {
@@ -420,6 +439,13 @@ impl CongestionTuning {
             burst_cap_bytes: self.burst_cap_bytes as f64,
             target_queue_delay_ms: self.target_queue_delay_ms,
             hol_escape_ms: self.hol_escape_ms,
+            delivery_rate_window_ms: self.delivery_rate_window_ms,
+            delivery_rate_ewma_alpha: self.delivery_rate_ewma_alpha,
+            delivery_anchor_factor: self.delivery_anchor_factor,
+            delivery_decouple_ratio: self.delivery_decouple_ratio,
+            loss_classifier_enabled: self.loss_classifier_enabled,
+            congestion_loss_threshold: self.congestion_loss_threshold,
+            qd_telemetry_valid: self.rtt_base_tracking,
         }
     }
 }
@@ -544,6 +570,10 @@ impl AdvancedTuning {
         self.congestion.base_rtt_window_secs = self.congestion.base_rtt_window_secs.clamp(1, 60);
         self.congestion.base_rtt_stale_windows =
             self.congestion.base_rtt_stale_windows.clamp(1, 10);
+        self.congestion.owd_clock_jump_reject_ms = self
+            .congestion
+            .owd_clock_jump_reject_ms
+            .clamp(1_000, 600_000);
         if self.congestion.probe_interval_ms != 0 {
             self.congestion.probe_interval_ms = self.congestion.probe_interval_ms.clamp(20, 1000);
         }
@@ -646,6 +676,10 @@ mod tests {
         assert_eq!(d.congestion.congestion_loss_threshold, 0.7);
         assert_eq!(d.congestion.base_rtt_window_secs, 3);
         assert_eq!(d.congestion.base_rtt_stale_windows, 2);
+        assert_eq!(
+            d.congestion.owd_clock_jump_reject_ms,
+            crate::routing::DEFAULT_OWD_CLOCK_JUMP_REJECT_MS
+        );
         assert_eq!(d.congestion.probe_interval_ms, 20);
         assert_eq!(d.congestion.fec_recovery_recency_ms, 3_000);
         assert!(d.congestion.enabled);
@@ -659,6 +693,10 @@ mod tests {
         assert_eq!(d.congestion.min_rate_bps, 1_500_000.0);
         assert_eq!(d.congestion.max_rate_bps, 20_000_000.0);
         assert_eq!(d.congestion.burst_cap_bytes, 16_000);
+        assert_eq!(d.congestion.delivery_rate_window_ms, 500);
+        assert_eq!(d.congestion.delivery_rate_ewma_alpha, 0.25);
+        assert_eq!(d.congestion.delivery_anchor_factor, 0.9);
+        assert_eq!(d.congestion.delivery_decouple_ratio, 1.25);
 
         assert_eq!(d.routing_ewma.rtt_ewma_old, 0.8);
         assert_eq!(d.routing_ewma.rtt_ewma_new, 0.2);
@@ -696,17 +734,33 @@ mod tests {
         t.congestion.min_decrease_factor = 0.01;
         t.congestion.hol_escape_ms = 1;
         t.congestion.initial_rate_bps = 100.0;
+        t.congestion.delivery_rate_window_ms = 10;
+        t.congestion.delivery_rate_ewma_alpha = 0.01;
+        t.congestion.delivery_anchor_factor = 0.1;
+        t.congestion.delivery_decouple_ratio = 1.0;
         t.clamp();
         assert_eq!(t.congestion.gain, 0.1);
         assert_eq!(t.congestion.min_decrease_factor, 0.1);
         assert_eq!(t.congestion.hol_escape_ms, 4);
         assert!(t.congestion.initial_rate_bps >= t.congestion.min_rate_bps);
+        assert_eq!(t.congestion.delivery_rate_window_ms, 100);
+        assert_eq!(t.congestion.delivery_rate_ewma_alpha, 0.05);
+        assert_eq!(t.congestion.delivery_anchor_factor, 0.5);
+        assert_eq!(t.congestion.delivery_decouple_ratio, 1.05);
 
         t.congestion.gain = 9.0;
         t.congestion.hol_escape_ms = 200;
+        t.congestion.delivery_rate_window_ms = 9_000;
+        t.congestion.delivery_rate_ewma_alpha = 2.0;
+        t.congestion.delivery_anchor_factor = 1.5;
+        t.congestion.delivery_decouple_ratio = 9.0;
         t.clamp();
         assert_eq!(t.congestion.gain, 4.0);
         assert_eq!(t.congestion.hol_escape_ms, 100);
+        assert_eq!(t.congestion.delivery_rate_window_ms, 5_000);
+        assert_eq!(t.congestion.delivery_rate_ewma_alpha, 1.0);
+        assert_eq!(t.congestion.delivery_anchor_factor, 0.99);
+        assert_eq!(t.congestion.delivery_decouple_ratio, 3.0);
     }
 
     #[test]
@@ -723,6 +777,24 @@ mod tests {
             cfg.target_queue_delay_ms,
             t.congestion.target_queue_delay_ms
         );
+        assert!(cfg.loss_classifier_enabled);
+        assert_eq!(
+            cfg.congestion_loss_threshold,
+            t.congestion.congestion_loss_threshold
+        );
+        assert!(cfg.qd_telemetry_valid);
+    }
+
+    #[test]
+    fn to_background_cc_config_maps_classifier_and_qd_validity() {
+        let mut t = AdvancedTuning::default();
+        t.congestion.loss_classifier_enabled = false;
+        t.congestion.congestion_loss_threshold = 0.8;
+        t.congestion.rtt_base_tracking = false;
+        let cfg = t.congestion.to_background_cc_config();
+        assert!(!cfg.loss_classifier_enabled);
+        assert!((cfg.congestion_loss_threshold - 0.8).abs() < f64::EPSILON);
+        assert!(!cfg.qd_telemetry_valid);
     }
 
     #[test]
@@ -775,6 +847,11 @@ target_queue_delay_ms = 45
 congestion_loss_threshold = 0.8
 base_rtt_window_secs = 20
 base_rtt_stale_windows = 5
+owd_clock_jump_reject_ms = 45000
+delivery_rate_window_ms = 250
+delivery_rate_ewma_alpha = 0.4
+delivery_anchor_factor = 0.85
+delivery_decouple_ratio = 1.5
 "#;
         #[derive(Deserialize)]
         struct Wrap {
@@ -788,6 +865,11 @@ base_rtt_stale_windows = 5
         t.clamp();
         assert_eq!(t.congestion.target_queue_delay_ms, 150);
         assert_eq!(t.congestion.base_rtt_window_secs, 1);
+        assert_eq!(t.congestion.owd_clock_jump_reject_ms, 45_000);
+        assert_eq!(t.congestion.delivery_rate_window_ms, 250);
+        assert_eq!(t.congestion.delivery_rate_ewma_alpha, 0.4);
+        assert_eq!(t.congestion.delivery_anchor_factor, 0.85);
+        assert_eq!(t.congestion.delivery_decouple_ratio, 1.5);
     }
 
     #[test]

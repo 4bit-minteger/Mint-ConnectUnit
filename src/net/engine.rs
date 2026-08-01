@@ -1552,8 +1552,9 @@ impl P2PEngine {
         let rt = self.routing.read();
         let vip = rt.ep_to_vip.get(&dest)?;
         let entry = rt.table.get(vip)?;
-        if entry.queuing_delay_ms >= 0.0 {
-            Some(entry.queuing_delay_ms as f32)
+        let qd = crate::routing::effective_queuing_delay_ms(entry);
+        if qd >= 0.0 {
+            Some(qd as f32)
         } else {
             None
         }
@@ -1855,10 +1856,17 @@ impl P2PEngine {
             .set_drr_rtt_scale_applied(obs.drr_rtt_scale_applied);
         self.metrics
             .set_background_cc_rates(obs.cc_min_bps, obs.cc_avg_bps, obs.cc_max_bps);
+        self.metrics.set_background_cc_delivery_rates(
+            obs.cc_delivery_min_bps,
+            obs.cc_delivery_avg_bps,
+            obs.cc_delivery_max_bps,
+        );
         self.metrics.set_cc_event_counters(
             obs.cc_counters.increase_events,
             obs.cc_counters.decrease_events,
             obs.cc_counters.loss_decrease_events,
+            obs.cc_counters.delivery_anchor_events,
+            obs.cc_counters.loss_ignored_random_events,
         );
     }
 
@@ -2242,6 +2250,12 @@ impl P2PEngine {
                 let plain = self.plain_data_scratch.split().freeze();
                 self.handle_mdat_like(plain, from).await;
             }
+            CompactPacketType::Ping => {
+                self.handle_ping_body(body, from).await;
+            }
+            CompactPacketType::Pong => {
+                self.handle_pong_body(body, from).await;
+            }
             CompactPacketType::Fec | CompactPacketType::JoinAck => {}
         }
     }
@@ -2528,7 +2542,10 @@ impl P2PEngine {
                     },
                 },
             );
-            if self.send_ctrl_signed_to(ep, PKT_PING, &payload).await {
+            if self
+                .send_compact_to(ep, CompactPacketType::Ping, &payload)
+                .await
+            {
                 probes_sent += 1;
             } else {
                 self.pending_pings.remove(&ping_id);
@@ -3354,7 +3371,7 @@ impl P2PEngine {
                 let mut payload = [0u8; 16];
                 payload[..8].copy_from_slice(&ping_id.to_le_bytes());
                 payload[8..].copy_from_slice(&ts.to_le_bytes());
-                let pkt = self.frame_with_tag_reuse(PKT_PING, &payload);
+                let pkt = self.frame_compact_reuse(CompactPacketType::Ping, &payload);
                 if self.socket.send_to(&pkt, dest).await.is_err() {
                     let _ = reply.send(-1);
                     return false;
@@ -4325,51 +4342,6 @@ impl P2PEngine {
             return;
         }
 
-        if tag == *PKT_PING {
-            let echo = if body.len() > 256 { &body[..256] } else { body };
-            self.touch_routing_endpoint(from);
-            self.send_ctrl_signed_to(from, PKT_PONG, echo).await;
-            return;
-        }
-
-        if tag == *PKT_PONG {
-            if let Some((ping_id, _fallback_ts)) = decode_ping_payload(body) {
-                self.touch_routing_endpoint(from);
-                let now_ms = now_epoch_ms();
-                if let Some(pending) = self.pending_pings.remove(&ping_id) {
-                    let from_ok = if pending.allow_ip_match {
-                        pending.dest.ip() == from.ip()
-                    } else {
-                        pending.dest == from
-                    };
-                    if from_ok {
-                        let rtt = (now_ms.saturating_sub(pending.sent_at_ms)) as i64;
-                        let owner_ep_hint = self.owner_send_endpoint();
-                        let vip_rtt_updated =
-                            self.routing
-                                .write()
-                                .note_rtt(from, rtt.max(1), owner_ep_hint);
-                        self.refresh_fec_loss_ewma_cache(from);
-                        if vip_rtt_updated {
-                            self.publish_cc_sample_for_endpoint(from);
-                        }
-                        match pending.kind {
-                            PendingPingKind::User { reply } => {
-                                let _ = reply.send(rtt.max(1));
-                            }
-                            PendingPingKind::Heal { vip, endpoint } => {
-                                self.handle_heal_success(vip, endpoint, rtt.max(1));
-                            }
-                            PendingPingKind::Probe => {}
-                        }
-                    } else {
-                        self.pending_pings.insert(ping_id, pending);
-                    }
-                }
-            }
-            return;
-        }
-
         if tag == *PKT_HPCH {
             self.learn_route_from_hole_punch_body(body, from, false, authenticated);
             self.try_stop_ice_checks_for_join_peer(from, body);
@@ -4523,6 +4495,89 @@ impl P2PEngine {
         self.control_scratch.split().freeze()
     }
 
+    fn frame_compact_reuse(&mut self, ty: CompactPacketType, body: &[u8]) -> Bytes {
+        self.control_scratch.clear();
+        self.control_scratch.reserve(1 + body.len());
+        self.control_scratch.extend_from_slice(&[ty.to_byte()]);
+        self.control_scratch.extend_from_slice(body);
+        self.control_scratch.split().freeze()
+    }
+
+    async fn send_compact_to(
+        &mut self,
+        dest: SocketAddr,
+        ty: CompactPacketType,
+        body: &[u8],
+    ) -> bool {
+        let pkt = self.frame_compact_reuse(ty, body);
+        self.socket.send_to(&pkt, dest).await.is_ok()
+    }
+
+    async fn handle_ping_body(&mut self, body: &[u8], from: SocketAddr) {
+        self.touch_routing_endpoint(from);
+        if let Some((ping_id, sender_ts)) = decode_ping_payload(body) {
+            let owd = (now_epoch_ms() as i64).saturating_sub(sender_ts as i64);
+            let owd_i32 = owd.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            let pong = encode_pong_payload(ping_id, sender_ts, owd_i32);
+            self.send_compact_to(from, CompactPacketType::Pong, &pong)
+                .await;
+        }
+    }
+
+    async fn handle_pong_body(&mut self, body: &[u8], from: SocketAddr) {
+        let Some((ping_id, _fallback_ts, fwd_owd_sample_ms)) = decode_pong_payload(body) else {
+            return;
+        };
+        self.touch_routing_endpoint(from);
+        let now_ms = now_epoch_ms();
+        let Some(pending) = self.pending_pings.remove(&ping_id) else {
+            return;
+        };
+        let from_ok = if pending.allow_ip_match {
+            pending.dest.ip() == from.ip()
+        } else {
+            pending.dest == from
+        };
+        if !from_ok {
+            self.pending_pings.insert(ping_id, pending);
+            return;
+        }
+        let rtt = (now_ms.saturating_sub(pending.sent_at_ms)) as i64;
+        let owner_ep_hint = self.owner_send_endpoint();
+        let (vip_rtt_updated, owd_outcome) = {
+            let mut rt = self.routing.write();
+            let vip_rtt_updated = rt.note_rtt(from, rtt.max(1), owner_ep_hint);
+            let owd_outcome = if vip_rtt_updated {
+                rt.note_fwd_owd(from, fwd_owd_sample_ms as f64, owner_ep_hint)
+            } else {
+                crate::routing::OwdSampleOutcome::Ignored
+            };
+            (vip_rtt_updated, owd_outcome)
+        };
+        match owd_outcome {
+            crate::routing::OwdSampleOutcome::Applied => {
+                self.metrics.inc_owd_samples_applied();
+            }
+            crate::routing::OwdSampleOutcome::Rejected => {
+                self.metrics.inc_owd_samples_rejected();
+            }
+            crate::routing::OwdSampleOutcome::Ignored => {}
+        }
+        self.refresh_fec_loss_ewma_cache(from);
+        if vip_rtt_updated {
+            self.publish_cc_sample_for_endpoint(from);
+        }
+        match pending.kind {
+            PendingPingKind::User { reply } => {
+                let _ = reply.send(rtt.max(1));
+            }
+            PendingPingKind::Heal { vip, endpoint } => {
+                self.handle_heal_success(vip, endpoint, rtt.max(1));
+            }
+            PendingPingKind::Probe => {}
+        }
+    }
+
     fn build_signed_or_plain_reuse(
         &mut self,
         crypto_key: Option<Arc<AeadKey>>,
@@ -4658,8 +4713,8 @@ impl P2PEngine {
             rt.ep_to_vip
                 .get(&ep)
                 .and_then(|vip| rt.table.get(vip))
-                .map(|e| (e.loss_ewma, e.queuing_delay_ms))
-                .unwrap_or((0.0, 0.0))
+                .map(|e| (e.loss_ewma, crate::routing::effective_queuing_delay_ms(e)))
+                .unwrap_or((0.0, -1.0))
         };
         let st = self.fec_send_by_dest.entry(ep).or_default();
         st.loss_ewma_cached = Some(loss);
@@ -4679,7 +4734,7 @@ impl P2PEngine {
             rt.ep_to_vip
                 .get(&ep)
                 .and_then(|vip| rt.table.get(vip))
-                .map(|e| (e.queuing_delay_ms, e.loss_ewma))
+                .map(|e| (crate::routing::effective_queuing_delay_ms(e), e.loss_ewma))
                 .unwrap_or((-1.0, 0.0))
         };
         self.pacing.on_cc_sample(ep, qd, loss);
@@ -4761,8 +4816,8 @@ impl P2PEngine {
                     rt.ep_to_vip
                         .get(&dest)
                         .and_then(|vip| rt.table.get(vip))
-                        .map(|e| e.queuing_delay_ms)
-                        .unwrap_or(0.0)
+                        .map(|e| crate::routing::effective_queuing_delay_ms(e))
+                        .unwrap_or(-1.0)
                 };
                 st.queuing_delay_ms_cached = Some(val);
                 val
@@ -5171,7 +5226,10 @@ impl P2PEngine {
                     kind: PendingPingKind::Probe,
                 },
             );
-            if !self.send_ctrl_signed_to(ep, PKT_PING, &payload).await {
+            if !self
+                .send_compact_to(ep, CompactPacketType::Ping, &payload)
+                .await
+            {
                 self.pending_pings.remove(&ping_id);
             }
         }
@@ -6093,8 +6151,6 @@ fn allow_unauth_control_tag_with_crypto(tag: [u8; 4]) -> bool {
         t if t == *PKT_JOIN
             || t == *PKT_JACK
             || t == *PKT_MERR
-            || t == *PKT_PING
-            || t == *PKT_PONG
             || t == *PKT_PMTU
             || t == *PKT_PMAR
             || t == *PKT_BREK
@@ -6116,8 +6172,6 @@ fn is_signaling_tag(tag: [u8; 4]) -> bool {
         t if t == *PKT_JOIN
             || t == *PKT_JACK
             || t == *PKT_MERR
-            || t == *PKT_PING
-            || t == *PKT_PONG
             || t == *PKT_PARA_HELLO
             || t == *PKT_PARA_REPLY
             || t == *PKT_PARA_OK
@@ -6165,6 +6219,31 @@ fn decode_ping_payload(body: &[u8]) -> Option<(u64, u64)> {
     let mut ts_bytes = [0u8; 8];
     ts_bytes.copy_from_slice(&body[8..16]);
     Some((u64::from_le_bytes(id_bytes), u64::from_le_bytes(ts_bytes)))
+}
+
+fn encode_pong_payload(ping_id: u64, sender_ts: u64, fwd_owd_sample_ms: i32) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out[..8].copy_from_slice(&ping_id.to_le_bytes());
+    out[8..16].copy_from_slice(&sender_ts.to_le_bytes());
+    out[16..20].copy_from_slice(&fwd_owd_sample_ms.to_le_bytes());
+    out
+}
+
+fn decode_pong_payload(body: &[u8]) -> Option<(u64, u64, i32)> {
+    if body.len() < 20 {
+        return None;
+    }
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&body[..8]);
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes.copy_from_slice(&body[8..16]);
+    let mut owd_bytes = [0u8; 4];
+    owd_bytes.copy_from_slice(&body[16..20]);
+    Some((
+        u64::from_le_bytes(id_bytes),
+        u64::from_le_bytes(ts_bytes),
+        i32::from_le_bytes(owd_bytes),
+    ))
 }
 
 fn prune_reliable_seen_cache(
@@ -6354,6 +6433,24 @@ mod tests {
     }
 
     #[test]
+    fn pong_payload_round_trip_and_short_rejected() {
+        let enc = encode_pong_payload(7, 1_700_000_000_000, -42);
+        assert_eq!(decode_pong_payload(&enc), Some((7, 1_700_000_000_000, -42)));
+        assert_eq!(decode_pong_payload(&enc[..16]), None);
+        assert_eq!(decode_pong_payload(&enc[..19]), None);
+    }
+
+    #[test]
+    fn pong_owd_field_matches_recv_minus_sender_ts() {
+        let sender_ts = 1_000u64;
+        let recv_ts = 1_035u64;
+        let owd = (recv_ts as i64).saturating_sub(sender_ts as i64) as i32;
+        let enc = encode_pong_payload(99, sender_ts, owd);
+        let decoded = decode_pong_payload(&enc).unwrap();
+        assert_eq!(decoded.2, 35);
+    }
+
+    #[test]
     fn first_free_vip_slash24_skips_network_owner_and_broadcast() {
         let my = u32::from(Ipv4Addr::new(10, 0, 0, 88));
         let got = first_free_vip_u32_in_subnet(my, 24, |_| false).unwrap();
@@ -6383,8 +6480,6 @@ mod tests {
         assert!(allow_unauth_control_tag_with_crypto(*PKT_KPAL));
         assert!(allow_unauth_control_tag_with_crypto(*PKT_HPCH));
         assert!(allow_unauth_control_tag_with_crypto(*PKT_HACK));
-        assert!(allow_unauth_control_tag_with_crypto(*PKT_PING));
-        assert!(allow_unauth_control_tag_with_crypto(*PKT_PONG));
     }
 
     #[tokio::test]

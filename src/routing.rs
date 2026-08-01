@@ -367,6 +367,14 @@ pub struct RouteEntry {
     pub rtt_base_window_start: Instant,
     pub rtt_base_stale_count: u8,
     pub queuing_delay_ms: f64,
+
+    /// Windowed min forward one-way delay; `None` = cold (allows negative base under clock skew).
+    pub owd_base_ms: Option<f64>,
+    pub owd_base_window_min: f64,
+    pub owd_base_window_start: Instant,
+    pub owd_base_stale_count: u8,
+    /// `max(0, owd_sample − owd_base)` when warm; meaningful only if `owd_base_ms.is_some()`.
+    pub fwd_queuing_delay_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -534,6 +542,11 @@ impl RoutingTable {
             rtt_base_window_start: now,
             rtt_base_stale_count: 0,
             queuing_delay_ms: 0.0,
+            owd_base_ms: None,
+            owd_base_window_min: f64::INFINITY,
+            owd_base_window_start: now,
+            owd_base_stale_count: 0,
+            fwd_queuing_delay_ms: 0.0,
         });
         let ep_changed = old
             .as_ref()
@@ -802,6 +815,34 @@ impl RoutingTable {
             ps.reselect_active(false);
         }
         is_active_path
+    }
+
+    /// Apply a forward OWD sample on the active path VIP (caller already gated on active path).
+    /// Returns whether the sample was applied or rejected by the clock-jump guard.
+    pub fn note_fwd_owd(
+        &mut self,
+        from: SocketAddr,
+        owd_sample_ms: f64,
+        ignore_relay_ep: Option<SocketAddr>,
+    ) -> OwdSampleOutcome {
+        let Some(vip) = self.vip_for_data_endpoint(from, ignore_relay_ep) else {
+            return OwdSampleOutcome::Ignored;
+        };
+        let Some(entry) = self.table.get_mut(&vip) else {
+            return OwdSampleOutcome::Ignored;
+        };
+        let is_active_path = entry
+            .path_set
+            .as_ref()
+            .and_then(|ps| ps.active_endpoint_kind())
+            .map(|(ep, _)| ep == from)
+            .unwrap_or(true);
+        if !is_active_path {
+            return OwdSampleOutcome::Ignored;
+        }
+        let now = Instant::now();
+        let congestion = self.congestion;
+        update_owd_base_on_sample(entry, owd_sample_ms, now, &congestion)
     }
 
     /// Control-race destinations for a known endpoint (or `[ep]` if unmapped / no PathSet).
@@ -1290,6 +1331,90 @@ pub fn update_rtt_base_on_sample(
 
     if entry.smoothed_rtt_ms >= 0.0 && entry.rtt_base_ms >= 0.0 {
         entry.queuing_delay_ms = (entry.smoothed_rtt_ms - entry.rtt_base_ms).max(0.0);
+    }
+}
+
+/// Absolute clock-jump guard default for forward OWD samples (ms).
+pub const DEFAULT_OWD_CLOCK_JUMP_REJECT_MS: u64 = 30_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwdSampleOutcome {
+    Ignored,
+    Applied,
+    Rejected,
+}
+
+fn reset_owd_base_cold(entry: &mut RouteEntry, now: Instant) {
+    entry.owd_base_ms = None;
+    entry.owd_base_window_min = f64::INFINITY;
+    entry.owd_base_window_start = now;
+    entry.owd_base_stale_count = 0;
+}
+
+/// LEDBAT-style min forward-OWD window. No-op when `rtt_base_tracking` is false.
+/// On clock jump (`|sample − base| > `cfg `owd_clock_jump_reject_ms`), invalidates base (cold).
+pub fn update_owd_base_on_sample(
+    entry: &mut RouteEntry,
+    owd_sample_ms: f64,
+    now: Instant,
+    cg: &crate::advanced_tuning::CongestionTuning,
+) -> OwdSampleOutcome {
+    if !cg.rtt_base_tracking {
+        return OwdSampleOutcome::Ignored;
+    }
+    let jump_ms = cg.owd_clock_jump_reject_ms as f64;
+    if let Some(base) = entry.owd_base_ms {
+        if (owd_sample_ms - base).abs() > jump_ms {
+            reset_owd_base_cold(entry, now);
+            return OwdSampleOutcome::Rejected;
+        }
+    }
+
+    if entry.owd_base_ms.is_none() {
+        entry.owd_base_ms = Some(owd_sample_ms);
+        entry.owd_base_window_min = owd_sample_ms;
+        entry.owd_base_window_start = now;
+        entry.owd_base_stale_count = 0;
+        entry.fwd_queuing_delay_ms = 0.0;
+        return OwdSampleOutcome::Applied;
+    }
+
+    let mut base = entry.owd_base_ms.unwrap_or(owd_sample_ms);
+    entry.owd_base_window_min = entry.owd_base_window_min.min(owd_sample_ms);
+
+    let window = Duration::from_secs(cg.base_rtt_window_secs);
+    if now.duration_since(entry.owd_base_window_start) >= window {
+        let window_min = entry.owd_base_window_min;
+        if window_min < base {
+            entry.owd_base_ms = Some(window_min);
+            base = window_min;
+            entry.owd_base_stale_count = 0;
+        } else if window_min > base {
+            entry.owd_base_stale_count = entry.owd_base_stale_count.saturating_add(1);
+            if entry.owd_base_stale_count >= cg.base_rtt_stale_windows {
+                entry.owd_base_ms = Some(window_min);
+                base = window_min;
+                entry.owd_base_stale_count = 0;
+            }
+        } else {
+            entry.owd_base_stale_count = 0;
+        }
+        entry.owd_base_window_min = f64::INFINITY;
+        entry.owd_base_window_start = now;
+    }
+
+    entry.fwd_queuing_delay_ms = (owd_sample_ms - base).max(0.0);
+    OwdSampleOutcome::Applied
+}
+
+/// QD for CC/FEC: forward OWD when warm, else RTT-QD, else cold (`-1`).
+pub fn effective_queuing_delay_ms(entry: &RouteEntry) -> f64 {
+    if entry.owd_base_ms.is_some() {
+        entry.fwd_queuing_delay_ms
+    } else if entry.rtt_base_ms >= 0.0 {
+        entry.queuing_delay_ms
+    } else {
+        -1.0
     }
 }
 
@@ -1864,6 +1989,11 @@ mod tests {
             rtt_base_window_start: now - Duration::from_secs(11),
             rtt_base_stale_count: 0,
             queuing_delay_ms: 0.0,
+            owd_base_ms: None,
+            owd_base_window_min: f64::INFINITY,
+            owd_base_window_start: now,
+            owd_base_stale_count: 0,
+            fwd_queuing_delay_ms: 0.0,
         };
         update_rtt_base_on_sample(&mut entry, 60.0, now, &cg);
         assert_eq!(entry.rtt_base_ms, 60.0);
@@ -1906,6 +2036,11 @@ mod tests {
             rtt_base_window_start: now - Duration::from_secs(2),
             rtt_base_stale_count: 0,
             queuing_delay_ms: 0.0,
+            owd_base_ms: None,
+            owd_base_window_min: f64::INFINITY,
+            owd_base_window_start: now,
+            owd_base_stale_count: 0,
+            fwd_queuing_delay_ms: 0.0,
         };
         update_rtt_base_on_sample(&mut entry, 80.0, now, &cg);
         assert_eq!(entry.rtt_base_ms, 50.0);
@@ -1914,6 +2049,156 @@ mod tests {
         entry.rtt_base_window_start = now - Duration::from_secs(2);
         update_rtt_base_on_sample(&mut entry, 80.0, now, &cg);
         assert_eq!(entry.rtt_base_ms, 80.0);
+    }
+
+    fn blank_route_entry(now: Instant) -> RouteEntry {
+        RouteEntry {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
+            node_id: Arc::from("n"),
+            state: RouteState::Active,
+            last_seen: now,
+            smoothed_rtt_ms: 50.0,
+            jitter_ms: 0.0,
+            last_rtt_ms: 50,
+            loss_ewma: 0.0,
+            quality_score: 80,
+            success_streak: 5,
+            fail_streak: 0,
+            hold_down_until: None,
+            last_modified_revision: 0,
+            path_set: None,
+            rx_bytes_since_last_bw_calc: 0,
+            rx_bw_calc_at: now,
+            dual_write_until: None,
+            dual_write_old_ep: None,
+            dual_write_old_kind: None,
+            rtt_base_ms: -1.0,
+            rtt_base_window_min: f64::INFINITY,
+            rtt_base_window_start: now,
+            rtt_base_stale_count: 0,
+            queuing_delay_ms: 0.0,
+            owd_base_ms: None,
+            owd_base_window_min: f64::INFINITY,
+            owd_base_window_start: now,
+            owd_base_stale_count: 0,
+            fwd_queuing_delay_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn owd_base_tracks_min_and_fwd_queuing_delay() {
+        use crate::advanced_tuning::CongestionTuning;
+        let cg = CongestionTuning {
+            base_rtt_window_secs: 10,
+            ..CongestionTuning::default()
+        };
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 100.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert_eq!(entry.owd_base_ms, Some(100.0));
+        assert_eq!(entry.fwd_queuing_delay_ms, 0.0);
+
+        entry.owd_base_window_start = now - Duration::from_secs(11);
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 60.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert_eq!(entry.owd_base_ms, Some(60.0));
+
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 90.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert!((entry.fwd_queuing_delay_ms - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn owd_base_stale_windows_before_increase() {
+        use crate::advanced_tuning::CongestionTuning;
+        let cg = CongestionTuning {
+            base_rtt_stale_windows: 2,
+            base_rtt_window_secs: 1,
+            ..CongestionTuning::default()
+        };
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        entry.owd_base_ms = Some(50.0);
+        entry.owd_base_window_min = 80.0;
+        entry.owd_base_window_start = now - Duration::from_secs(2);
+        entry.owd_base_stale_count = 0;
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 80.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert_eq!(entry.owd_base_ms, Some(50.0));
+        assert_eq!(entry.owd_base_stale_count, 1);
+        entry.owd_base_window_min = 80.0;
+        entry.owd_base_window_start = now - Duration::from_secs(2);
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 80.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert_eq!(entry.owd_base_ms, Some(80.0));
+    }
+
+    #[test]
+    fn owd_clock_jump_rejects_and_resets_cold() {
+        use crate::advanced_tuning::CongestionTuning;
+        let cg = CongestionTuning::default();
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, -5000.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert_eq!(entry.owd_base_ms, Some(-5000.0));
+        assert_eq!(
+            update_owd_base_on_sample(
+                &mut entry,
+                -5000.0 + DEFAULT_OWD_CLOCK_JUMP_REJECT_MS as f64 + 1.0,
+                now,
+                &cg
+            ),
+            OwdSampleOutcome::Rejected
+        );
+        assert!(entry.owd_base_ms.is_none());
+        assert_eq!(effective_queuing_delay_ms(&entry), -1.0);
+    }
+
+    #[test]
+    fn owd_negative_base_stays_warm_for_effective_qd() {
+        use crate::advanced_tuning::CongestionTuning;
+        let cg = CongestionTuning::default();
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, -2000.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, -1950.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert!((entry.fwd_queuing_delay_ms - 50.0).abs() < 0.01);
+        assert!((effective_queuing_delay_ms(&entry) - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn effective_queuing_delay_precedence_fwd_rtt_cold() {
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        assert_eq!(effective_queuing_delay_ms(&entry), -1.0);
+
+        entry.rtt_base_ms = 40.0;
+        entry.queuing_delay_ms = 12.0;
+        assert!((effective_queuing_delay_ms(&entry) - 12.0).abs() < 0.01);
+
+        entry.owd_base_ms = Some(-100.0);
+        entry.fwd_queuing_delay_ms = 7.0;
+        assert!((effective_queuing_delay_ms(&entry) - 7.0).abs() < 0.01);
     }
 
     fn healthy_route(rt: &mut RoutingTable, vip: &str, ep: SocketAddr) {
@@ -2111,6 +2396,11 @@ mod tests {
             rtt_base_window_start: now,
             rtt_base_stale_count: 0,
             queuing_delay_ms: 0.0,
+            owd_base_ms: None,
+            owd_base_window_min: f64::INFINITY,
+            owd_base_window_start: now,
+            owd_base_stale_count: 0,
+            fwd_queuing_delay_ms: 0.0,
         };
         let mut ewma = RoutingEwmaTuning::default();
         ewma.rtt_ewma_old = 0.5;

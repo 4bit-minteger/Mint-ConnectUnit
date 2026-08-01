@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 
 /// Join handshake / wire framing version (independent of MSYN `proto_ver` schema).
-pub const WIRE_PROTOCOL_VERSION: u64 = 5;
+pub const WIRE_PROTOCOL_VERSION: u64 = 6;
 
 pub const COMPACT_HEADER_LEN: usize = 1;
 pub const CONTROL_TAG_LEN: usize = 4;
@@ -10,8 +10,6 @@ pub const CONTROL_TAG_LEN: usize = 4;
 pub const FEC_COMPACT_HEADER_LEN: usize = 12;
 
 pub const PKT_KPAL: &[u8; 4] = b"MKPL";
-pub const PKT_PING: &[u8; 4] = b"MPNG";
-pub const PKT_PONG: &[u8; 4] = b"MPON";
 pub const PKT_JOIN: &[u8; 4] = b"MPJN";
 pub const PKT_JACK: &[u8; 4] = b"MPJA";
 pub const PKT_PRXY: &[u8; 4] = b"MPRX";
@@ -50,6 +48,10 @@ pub enum CompactPacketType {
     Reliable = 0x04,
     Ack = 0x05,
     JoinAck = 0x06,
+    /// RTT / forward-OWD probe request (`ping_id` + `sender_ts`, 16 B body).
+    Ping = 0x07,
+    /// Probe reply (echo 16 B + `fwd_owd_sample_ms` i32, 20 B body).
+    Pong = 0x08,
 }
 
 impl CompactPacketType {
@@ -65,6 +67,8 @@ impl CompactPacketType {
             0x04 => Ok(Self::Reliable),
             0x05 => Ok(Self::Ack),
             0x06 => Ok(Self::JoinAck),
+            0x07 => Ok(Self::Ping),
+            0x08 => Ok(Self::Pong),
             0x00 | 0xFF => Err(InvalidCompactType),
             0xFA..=0xFE => Err(InvalidCompactType),
             _ => Err(InvalidCompactType),
@@ -141,9 +145,19 @@ mod tests {
         assert_eq!(CompactPacketType::Reliable.to_byte(), 0x04);
         assert_eq!(CompactPacketType::Ack.to_byte(), 0x05);
         assert_eq!(CompactPacketType::JoinAck.to_byte(), 0x06);
+        assert_eq!(CompactPacketType::Ping.to_byte(), 0x07);
+        assert_eq!(CompactPacketType::Pong.to_byte(), 0x08);
         assert_eq!(
             CompactPacketType::try_from_byte(0x01).unwrap(),
             CompactPacketType::Data
+        );
+        assert_eq!(
+            CompactPacketType::try_from_byte(0x07).unwrap(),
+            CompactPacketType::Ping
+        );
+        assert_eq!(
+            CompactPacketType::try_from_byte(0x08).unwrap(),
+            CompactPacketType::Pong
         );
     }
 
@@ -152,7 +166,7 @@ mod tests {
         assert!(CompactPacketType::try_from_byte(0x00).is_err());
         assert!(CompactPacketType::try_from_byte(0xFF).is_err());
         assert!(CompactPacketType::try_from_byte(0xFA).is_err());
-        assert!(CompactPacketType::try_from_byte(0x07).is_err());
+        assert!(CompactPacketType::try_from_byte(0x09).is_err());
     }
 
     #[test]
@@ -183,5 +197,25 @@ mod tests {
             }
             DatagramKind::Control(..) => panic!("expected compact"),
         }
+    }
+
+    #[test]
+    fn parse_datagram_compact_ping_pong() {
+        let ping = frame_compact(CompactPacketType::Ping, &[0u8; 16]);
+        match parse_datagram(&ping).unwrap() {
+            DatagramKind::Compact(CompactPacketType::Ping, body) => {
+                assert_eq!(body.len(), 16);
+            }
+            other => panic!("expected compact ping, got {other:?}"),
+        }
+        let pong = frame_compact(CompactPacketType::Pong, &[0u8; 20]);
+        match parse_datagram(&pong).unwrap() {
+            DatagramKind::Compact(CompactPacketType::Pong, body) => {
+                assert_eq!(body.len(), 20);
+            }
+            other => panic!("expected compact pong, got {other:?}"),
+        }
+        assert_eq!(ping[0], 0x07);
+        assert_eq!(pong[0], 0x08);
     }
 }

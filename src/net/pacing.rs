@@ -786,6 +786,10 @@ impl PacingEngine {
         self.background_cc.rate_distribution()
     }
 
+    pub fn cc_delivery_metrics_snapshot(&self) -> (f64, f64, f64) {
+        self.background_cc.delivery_rate_distribution()
+    }
+
     pub fn cc_counters(&self) -> CcUpdateCounters {
         self.background_cc.counters()
     }

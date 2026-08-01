@@ -52,7 +52,7 @@ const PORT_MAX: u16 = 65535;
 const MAX_PEERS: usize = 253;
 
 /// Fixed line count for `paint_runtime_frame` (header + flags + traffic + metrics).
-const RUNTIME_DISPLAY_LINE_COUNT: usize = 53;
+const RUNTIME_DISPLAY_LINE_COUNT: usize = 70;
 
 const DEFAULT_UDP_SOCKBUF: i32 = 256 * 1024;
 const DEFAULT_UDP_RCVBUF: i32 = 2 * 1024 * 1024;
@@ -4703,7 +4703,7 @@ impl Cli {
         crate::cli_println!("  │|  Listen Port : {}", s.listen_port);
         crate::cli_println!("  │|  Peers       : {}/{}", s.peers.len(), MAX_PEERS);
         if !s.public_invite_code.is_empty() {
-            crate::cli_println!("  │|> Invite ID <  {}", s.public_invite_code);
+            crate::cli_println!("  │|> Invite ID <-  {}", s.public_invite_code);
         }
 
         let routes = self.routing.read().snapshot();
@@ -4921,7 +4921,7 @@ impl Cli {
             a.pmtud.stable_downgrade_batches
         );
         crate::cli_println!(
-            "  congestion: congestion_enabled={} gain={:.2} hol_escape_ms={} initial_rate_bps={:.0} add_inc_bps={:.0} min_dec={:.2} rate_smooth={:.2} min_rate_bps={:.0} max_rate_bps={:.0} loss_md={:.2} burst_cap_bytes={} rtt_base_tracking={} loss_classifier={} target_q_delay_ms={} loss_thr={:.2} base_rtt_window_s={} stale_windows={} probe_interval_ms={} fec_recovery_recency_ms={}",
+            "  congestion: congestion_enabled={} gain={:.2} hol_escape_ms={} initial_rate_bps={:.0} add_inc_bps={:.0} min_dec={:.2} rate_smooth={:.2} min_rate_bps={:.0} max_rate_bps={:.0} loss_md={:.2} burst_cap_bytes={} delivery_window_ms={} delivery_ewma_a={:.2} delivery_anchor={:.2} delivery_decouple={:.2} rtt_base_tracking={} loss_classifier={} target_q_delay_ms={} loss_thr={:.2} base_rtt_window_s={} stale_windows={} owd_jump_ms={} probe_interval_ms={} fec_recovery_recency_ms={}",
             a.congestion.enabled,
             a.congestion.gain,
             a.congestion.hol_escape_ms,
@@ -4933,12 +4933,17 @@ impl Cli {
             a.congestion.max_rate_bps,
             a.congestion.loss_multiplicative_decrease,
             a.congestion.burst_cap_bytes,
+            a.congestion.delivery_rate_window_ms,
+            a.congestion.delivery_rate_ewma_alpha,
+            a.congestion.delivery_anchor_factor,
+            a.congestion.delivery_decouple_ratio,
             a.congestion.rtt_base_tracking,
             a.congestion.loss_classifier_enabled,
             a.congestion.target_queue_delay_ms,
             a.congestion.congestion_loss_threshold,
             a.congestion.base_rtt_window_secs,
             a.congestion.base_rtt_stale_windows,
+            a.congestion.owd_clock_jump_reject_ms,
             a.congestion.probe_interval_ms,
             a.congestion.fec_recovery_recency_ms
         );
@@ -5386,6 +5391,18 @@ impl Cli {
                     m.cc_rate_bps_max.load(Ordering::Relaxed)
                 ));
                 lines.push(format!(
+                    "  cc_delivery_bps_min    : {}",
+                    m.cc_delivery_bps_min.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  cc_delivery_bps_avg    : {}",
+                    m.cc_delivery_bps_avg.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  cc_delivery_bps_max    : {}",
+                    m.cc_delivery_bps_max.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
                     "  cc_increase_events     : {}",
                     m.cc_increase_events_total.load(Ordering::Relaxed)
                 ));
@@ -5396,6 +5413,20 @@ impl Cli {
                 lines.push(format!(
                     "  cc_loss_decrease_events: {}",
                     m.cc_loss_decrease_events_total.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  cc_loss_ignored_random : {}",
+                    m.cc_loss_ignored_random_events_total
+                        .load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  owd_samples (app/rej)  : {} / {}",
+                    m.owd_samples_applied_total.load(Ordering::Relaxed),
+                    m.owd_samples_rejected_total.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  cc_delivery_anchor_events: {}",
+                    m.cc_delivery_anchor_events_total.load(Ordering::Relaxed)
                 ));
                 lines.push(format!(
                     "  drr_small_priority_pops: {}",
@@ -5521,6 +5552,18 @@ impl Cli {
                 lines.push(na("apd_max_sojourn_ms"));
                 lines.push(na("apd_cc_headroom_suppressions"));
                 lines.push(na("cc_rate_limited"));
+                lines.push(na("cc_rate_bps_min"));
+                lines.push(na("cc_rate_bps_avg"));
+                lines.push(na("cc_rate_bps_max"));
+                lines.push(na("cc_delivery_bps_min"));
+                lines.push(na("cc_delivery_bps_avg"));
+                lines.push(na("cc_delivery_bps_max"));
+                lines.push(na("cc_increase_events"));
+                lines.push(na("cc_decrease_events"));
+                lines.push(na("cc_loss_decrease_events"));
+                lines.push(na("cc_loss_ignored_random"));
+                lines.push(na("owd_samples (app/rej)"));
+                lines.push(na("cc_delivery_anchor_events"));
                 lines.push(na("drr_small_priority_pops"));
                 lines.push(na("drr_bulk_force_pops"));
                 lines.push(na("drr_rtt_scale_applied"));

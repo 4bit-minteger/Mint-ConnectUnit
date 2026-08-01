@@ -73,9 +73,16 @@ pub struct EngineMetrics {
     pub cc_rate_bps_min: AtomicU64,
     pub cc_rate_bps_avg: AtomicU64,
     pub cc_rate_bps_max: AtomicU64,
+    pub cc_delivery_bps_min: AtomicU64,
+    pub cc_delivery_bps_avg: AtomicU64,
+    pub cc_delivery_bps_max: AtomicU64,
     pub cc_increase_events_total: AtomicU64,
     pub cc_decrease_events_total: AtomicU64,
     pub cc_loss_decrease_events_total: AtomicU64,
+    pub cc_delivery_anchor_events_total: AtomicU64,
+    pub cc_loss_ignored_random_events_total: AtomicU64,
+    pub owd_samples_applied_total: AtomicU64,
+    pub owd_samples_rejected_total: AtomicU64,
     pub drr_small_priority_pops: AtomicU64,
     pub drr_bulk_force_pops: AtomicU64,
     pub drr_rtt_scale_applied: AtomicU64,
@@ -399,13 +406,43 @@ impl EngineMetrics {
             .store(max_bps.round() as u64, Ordering::Relaxed);
     }
 
-    pub fn set_cc_event_counters(&self, increase: u64, decrease: u64, loss_decrease: u64) {
+    pub fn set_background_cc_delivery_rates(&self, min_bps: f64, avg_bps: f64, max_bps: f64) {
+        self.cc_delivery_bps_min
+            .store(min_bps.round() as u64, Ordering::Relaxed);
+        self.cc_delivery_bps_avg
+            .store(avg_bps.round() as u64, Ordering::Relaxed);
+        self.cc_delivery_bps_max
+            .store(max_bps.round() as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_cc_event_counters(
+        &self,
+        increase: u64,
+        decrease: u64,
+        loss_decrease: u64,
+        delivery_anchor: u64,
+        loss_ignored_random: u64,
+    ) {
         self.cc_increase_events_total
             .store(increase, Ordering::Relaxed);
         self.cc_decrease_events_total
             .store(decrease, Ordering::Relaxed);
         self.cc_loss_decrease_events_total
             .store(loss_decrease, Ordering::Relaxed);
+        self.cc_delivery_anchor_events_total
+            .store(delivery_anchor, Ordering::Relaxed);
+        self.cc_loss_ignored_random_events_total
+            .store(loss_ignored_random, Ordering::Relaxed);
+    }
+
+    pub fn inc_owd_samples_applied(&self) {
+        self.owd_samples_applied_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_owd_samples_rejected(&self) {
+        self.owd_samples_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_drr_small_priority_pops(&self, n: u64) {
