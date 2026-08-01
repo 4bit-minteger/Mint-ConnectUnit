@@ -10,7 +10,7 @@ This document is the **project orientation guide**. For locked wire behaviour, e
 
 ---
 
-NOTE: Please note that this is a first project created as a hobby by someone learning Rust programming and networking. It is highly algorithmic, AI-assisted, evaluated, audited, and debugged by a single person. While it features secure encryption, the project initially aimed not at high security but at optimizing latency and transmission stability, as well as catering to power users who want to learn more about network algorithms thanks to its deep configuration parameter adjustments and documentation. It is recommended that it not be used for transmitting sensitive information. I sincerely hope to receive feedback or genuine contributions from those with more experience than me in the future.
+NOTE: Please note that this is a very first project created as a hobby by someone learning Rust programming and networking. It is highly algorithmic, AI-assisted, evaluated, audited, and debugged by a single person. While it features secure encryption, the project initially aimed not at high security but at optimizing latency and transmission stability, as well as catering to power users who want to learn more about network algorithms thanks to its deep configuration parameter adjustments and documentation. It is recommended that it not be used for transmitting sensitive information. I sincerely hope to receive feedback or genuine contributions from those with more experience than me in the future.
 
 ---
 
