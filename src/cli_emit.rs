@@ -1,5 +1,6 @@
 //! Terminal output routing: local stdout or IPC capture for the CLI client.
 
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -11,6 +12,7 @@ pub const MARK_PROMPT: &str = "\x1bMINT_PROMPT\x1b";
 static CAPTURE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 static DAEMON_UI: OnceLock<std::sync::Arc<crate::ui_events::UiEventBus>> = OnceLock::new();
 static STDIN_READ_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RUNTIME_VIEW_ACTIVE: AtomicBool = AtomicBool::new(false);
 static DEFERRED_LIVE_OVERWRITE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn deferred_live_overwrite() -> &'static Mutex<Option<String>> {
@@ -22,8 +24,21 @@ pub fn set_stdin_read_active(active: bool) {
     STDIN_READ_ACTIVE.store(active, Ordering::Release);
 }
 
+/// While true, UI event stream must not write to the user terminal (runtime dashboard owns it).
+pub fn set_runtime_view_active(active: bool) {
+    RUNTIME_VIEW_ACTIVE.store(active, Ordering::Release);
+}
+
+pub fn is_runtime_view_active() -> bool {
+    RUNTIME_VIEW_ACTIVE.load(Ordering::Acquire)
+}
+
 /// Print the latest deferred punch status (after stdin read completes).
 pub fn flush_deferred_live_status() {
+    if is_runtime_view_active() {
+        let _ = deferred_live_overwrite().lock().unwrap().take();
+        return;
+    }
     let line = deferred_live_overwrite().lock().unwrap().take();
     if let Some(display) = line {
         println!("{display}");
@@ -31,6 +46,9 @@ pub fn flush_deferred_live_status() {
 }
 
 fn render_live_overwrite_row(display: &str) {
+    if is_runtime_view_active() {
+        return;
+    }
     if STDIN_READ_ACTIVE.load(Ordering::Acquire) {
         *deferred_live_overwrite().lock().unwrap() = Some(display.to_string());
         return;
@@ -173,6 +191,40 @@ pub fn clear_user_terminal() {
     render_to_user_terminal(MARK_CLEAR);
 }
 
+/// Enter alternate screen + hide cursor (runtime live view).
+pub fn enter_runtime_alt_screen() -> io::Result<()> {
+    print!("\x1B[?1049h\x1B[?25l\x1B[2J\x1B[H");
+    io::stdout().flush()
+}
+
+/// Leave alternate screen + show cursor.
+pub fn leave_runtime_alt_screen() -> io::Result<()> {
+    print!("\x1B[?25h\x1B[?1049l");
+    io::stdout().flush()
+}
+
+/// Paint a fixed dashboard frame inside the alternate screen.
+///
+/// `first`: full paint from home. Later frames move the cursor up and rewrite
+/// in place (no main-buffer scrollback pollution while alt-screen is active).
+pub fn paint_runtime_alt_frame(lines: &[String], footer: &str, first: bool) -> io::Result<()> {
+    if first {
+        print!("\x1B[H");
+        for l in lines {
+            println!("{l}");
+        }
+        println!("{footer}");
+    } else {
+        let n = lines.len() + 1;
+        print!("\x1B[{n}A");
+        for l in lines {
+            print!("\x1B[2K\r{l}\n");
+        }
+        print!("\x1B[2K\r{footer}\n");
+    }
+    io::stdout().flush()
+}
+
 /// Line-by-line pacing on the CLI client (list, ping, more, commands, create/join status).
 pub const DISPLAY_LINE_DELAY_MS: u64 = 10;
 pub const STATUS_LINE_DELAY_MS: u64 = 100;
@@ -216,6 +268,10 @@ pub async fn render_lines_to_user_terminal(lines: &[String]) {
 
 /// Render one IPC output line on the user's terminal (client process).
 pub fn render_to_user_terminal(line: &str) {
+    // Runtime dashboard owns the alternate screen; drop UI stream noise.
+    if is_runtime_view_active() {
+        return;
+    }
     if line == MARK_CLEAR {
         print!("\x1B[2J\x1B[H\x1B[3J");
         let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -234,4 +290,22 @@ pub fn render_to_user_terminal(line: &str) {
         return;
     }
     println!("{line}");
+}
+
+#[cfg(test)]
+mod runtime_view_mute_tests {
+    use super::{
+        is_runtime_view_active, render_to_user_terminal, set_runtime_view_active, MARK_CLEAR,
+    };
+
+    #[test]
+    fn runtime_view_flag_gates_terminal_render() {
+        set_runtime_view_active(true);
+        assert!(is_runtime_view_active());
+        // Must not panic / write; merely exercises the mute path.
+        render_to_user_terminal(MARK_CLEAR);
+        render_to_user_terminal("should be muted");
+        set_runtime_view_active(false);
+        assert!(!is_runtime_view_active());
+    }
 }

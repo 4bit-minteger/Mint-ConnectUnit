@@ -557,31 +557,8 @@ fn compact_apd_watermark_floats(root: &mut toml::map::Map<String, toml::Value>) 
     }
 }
 
-/// Collapse `key = [ … ]` onto one line (toml pretty-printer emits one item/line).
-fn inline_named_array(toml_text: &str, key: &str) -> String {
-    let needle = format!("{key} = [");
-    let Some(start) = toml_text.find(&needle) else {
-        return toml_text.to_string();
-    };
-    let values_start = start + needle.len();
-    let rest = &toml_text[values_start..];
-    let Some(end_rel) = rest.find(']') else {
-        return toml_text.to_string();
-    };
-    let items: Vec<&str> = rest[..end_rel]
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut out = String::with_capacity(toml_text.len());
-    out.push_str(&toml_text[..start]);
-    out.push_str(&format!("{key} = [{}]", items.join(", ")));
-    out.push_str(&rest[end_rel + 1..]);
-    out
-}
-
 /// Encode `NetworkConfig` for `NetInfo/config.toml`: sectioned tables, compact
-/// APD watermarks, inline `probe_sizes`.
+/// APD watermarks.
 pub(crate) fn encode_network_config_toml(cfg: &NetworkConfig) -> Result<String> {
     let file = NetworkConfigFile::from(cfg);
     let mut value =
@@ -591,7 +568,7 @@ pub(crate) fn encode_network_config_toml(cfg: &NetworkConfig) -> Result<String> 
     }
     let pretty =
         toml::to_string_pretty(&value).map_err(|e| anyhow::anyhow!("config toml pretty: {e}"))?;
-    Ok(inline_named_array(&pretty, "probe_sizes"))
+    Ok(pretty)
 }
 
 pub(crate) fn parse_network_config_toml(raw: &str) -> Result<NetworkConfig> {

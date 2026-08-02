@@ -112,7 +112,7 @@ flowchart TB
 | `src/net/fec.rs` | Reed–Solomon encode/decode, adaptive ratios |
 | `src/net/reliable.rs` | MREL / MACK state machine |
 | `src/net/retransmit.rs` | Direct retransmit bypass rate limiter (`rtrx-s`) |
-| `src/net/msyn_sync.rs` | Pure MSYN v3 body builders and sync advance rules |
+| `src/net/msyn_sync.rs` | Pure MSYN v4 body builders, sharding, assemble helpers, and sync advance rules |
 | `src/net/pmtud_probe.rs` | Separate socket for PMTUD probe traffic |
 | `src/net/punch_workflow.rs` | Canonical 3-stage hole-punch workflow |
 | `src/routing.rs` | Per-VIP routes, path candidates, failover, tombstones |
@@ -169,7 +169,7 @@ Largest behavioural surface: `cli.rs` and `net/engine.rs`. Trace bugs from CLI a
 - **Authority**: protocol behaviour is defined by this repository (`src/`, `tests/`) and this document. Any wire or behavioural change requires an update here and matching tests.
 - **Data plane crypto**: AEGIS-128L with wire frame `0x02 | ctr_le_6 | ciphertext | tag_16`; per-direction HKDF (`data|sender_vip_be|receiver_vip_be`) from the 32-byte network key; nonce is `salt_10 | ctr_le_6`.
 - **Control-plane crypto**: AEGIS-128L AEAD; HKDF info `ctrl` (no VIP) from the same network key and salt `mint-aegis-128l-v1`; wire after outer `MCTS` is `ctr_le_6 | ciphertext | tag_16` where plaintext is `inner_tag || body`; AAD is `mcts`; nonce is `salt_10 | ctr_le_6`. Global 48-bit send counter; per-source 128-bit counter replay (`CtrlReplayTable`, max 4096 sources).
-- **Wire protocol version**: join `MPJN` / `MPJA` JSON field `proto_ver` must equal **6** (`WIRE_PROTOCOL_VERSION`). Enforced on-wire only; config does not store a protocol version field. Mismatch ⇒ join fails.
+- **Wire protocol version**: join `MPJN` / `MPJA` JSON field `proto_ver` must equal **7** (`WIRE_PROTOCOL_VERSION`). Enforced on-wire only; config does not store a protocol version field. Mismatch ⇒ join fails.
 - **Packet tags — control plane**: 4-byte ASCII (`M…`): `MPJN`, `MPJA`, `MCTS`, signaling, PMTU, MSYN family, etc.
 - **Packet tags — data / reliable / probe plane**: 1-byte compact type (`0x01` data, `0x02` encrypted, `0x03` FEC, `0x04` reliable, `0x05` ack, `0x06` inner JoinAck inside reliable, `0x07` ping, `0x08` pong). Reserved: `0x00`, `0x09`–`0xF9` unassigned, `0xFA`–`0xFE` reserved, `0xFF` sentinel. First byte `b'M'` ⇒ 4-byte control tag; otherwise compact parse.
 - **Control-sign wrapper tag**: `MCTS`.
@@ -185,12 +185,13 @@ Legend for tuning notes below: **↑** = increase value in code/config; **↓** 
 
 ## Wire protocol (tags)
 
-Code tags: `src/net/packet.rs`. Join handshake requires `proto_ver: 6` in `MPJN` / `MPJA`.
+Code tags: `src/net/packet.rs`. Join handshake requires `proto_ver: 7` in `MPJN` / `MPJA`.
 
 | Tag | Role |
 |-----|------|
 | Compact `0x01` / `0x02` | IP payload (plain / encrypted) |
-| `MKPL` / `MHOL` / `MHAC` | Keepalive / hole-punch / hole-punch ack |
+| `MKPL` / `MHOL` / `MHAC` | Keepalive / hole-punch / hole-punch ack (standalone remain legal) |
+| `MCTL` | Compound control: HB/HOL and/or one MSYN v4 part (see Membership sync) |
 | Compact `0x07` / `0x08` | Ping / pong: ping body = `ping_id`+`sender_ts` (16 B); pong body = echo + `fwd_owd_sample_ms i32` (20 B). RTT at sender; forward OWD for CC/FEC |
 | `MPJN` / `MPJA` | Join request / ack |
 | `MPRX` | Proxy/relay wrapper |
@@ -249,7 +250,7 @@ Control messages update **`RoutingTable`**, **`CryptoPool`**, session identity, 
 - **TUN** ingress channel
 - **`EngineCmd`** from CLI
 - **STUN DNS resolve** completions
-- Periodic **intervals**: peer keepalive, MSYN, direct route retry, PMTUD batch, stale mark/evict, RX bandwidth flush, STUN poll/keepalive, ping watchdog, CC probe (periods from config — see [Performance parameters](#performance-parameters))
+- Periodic **intervals**: peer keepalive, MSYN, direct route retry, PMTUD tick/raise, stale mark/evict, RX bandwidth flush, STUN poll/keepalive, ping watchdog, CC probe (periods from config — see [Performance parameters](#performance-parameters))
 - **Pacing `TickDone`** events from the pacing worker (FEC flush, reliable tick, heal on socket-dead)
 
 Important internal state (non-exhaustive):
@@ -273,7 +274,7 @@ Important internal state (non-exhaustive):
 
 - Multiple **`PathCandidate`** records: `Direct`, `OwnerRelay`, `IceSrflx`
 - EWMA: RTT, loss, bandwidth; **`quality_score`**; state `Candidate` / `Active` / `Degraded` / `Stale`
-- Optional delay telemetry: **`rtt_base_ms`** (windowed min-RTT) and **`queuing_delay_ms`** (`max(0, smoothed_rtt − base)`) for path quality / DRR fairness — fed by periodic compact **ping** probes (`probe_interval_ms`, default **20**; **0** = off). VIP-level RTT updates only from the **active** multipath endpoint; secondary-path samples stay path-local.
+- Optional delay telemetry: **`rtt_base_ms`** (windowed min-RTT) and **`queuing_delay_ms`** (`max(0, smoothed_rtt − base)`) for path quality / DRR fairness — fed by periodic compact **ping** probes (`probe_interval_ms`, default **25**; **0** = off). VIP-level RTT updates only from the **active** multipath endpoint; secondary-path samples stay path-local.
 - **Forward OWD** (same probes): peer reports `fwd_owd_sample_ms` in compact **pong**; sender tracks windowed min **`owd_base_ms`** (`Option`; cold = `None`) and **`fwd_queuing_delay_ms`**. **Background CC** and the **FEC loss classifier** use **`effective_queuing_delay_ms`**: forward QD when OWD warm, else RTT-QD, else `-1` (cold → conservative loss MD). Clock jump (`|sample − base| > owd_clock_jump_reject_ms`, default **30000**) invalidates OWD base (fallback to RTT-QD).
 - **Control path race** (default on with multipath): recovery **`MHOL`** (`direct_retry`) and predictive **heal ping** fan out to up to **3** live `PathSet` endpoints in parallel. Periodic CC ping probes stay single-endpoint.
 - **Tombstones** when peers leave (revision counters for MSYN)
@@ -429,10 +430,16 @@ Full congestion / FEC field table: [Operational defaults](#operational-defaults-
 
 ## PMTUD
 
-- **`PathMtuDiscovery`** in engine + **`pmtud_probe`** socket.
-- Probe size ladder, stable downgrade batches (tunable via `probe_sizes` / `stable_downgrade_batches`), adapter MTU sync (floor **1220**, default adapter **1340**).
+- **`PathMtuDiscovery`** in engine + **`pmtud_probe`** socket (DF / don't-fragment).
+- Per-peer **search+confirm** PLPMTUD: exponential raise from ACK-proven `last_good`, then binary search until window ≤ `resolve_epsilon` (default **1** byte). Probe ladder sizes are **IPv4 IP totals**. `min_path_mtu` tracks ACK-proven `last_good` only (never in-flight probe size).
+- **Phases:** Plateau → Raise or Revalidate; Raise fail → Binary; Revalidate timeout fail → **Recheck** (or **anomaly** when size-bucketed RX shows large packets still alive); Recheck fail → **soft-down** `last_good = max(576, stable/2)` (later soft-downs halve `last_good`) then DownSearch. Local `EMSGSIZE`/`WSAEMSGSIZE` on Revalidate/Recheck soft-downs immediately (skips anomaly/Recheck). DownSearch that closes with **no ACK** resets `first_bad` to the raise sentinel so Raise can climb again.
+- **Probe timeout:** adaptive `clamp(max(probe_timeout_ms, 4×RTT_EWMA_ms), probe_timeout_ms, 5000)`; config `probe_timeout_ms` is the **floor**. After the final confirm timeout in Revalidate/Recheck, a one-timeout **late-ACK grace** can still recover to Plateau.
+- **Data-plane corroboration:** per-VIP size-bucketed RX rate/gap tracker (`SizeLossTable`); anomaly and early-wake require a warm tracker. Early-wake (Plateau/Frozen only, 10s cooldown) when large RX collapsed, small RX alive, recent large TX offer, and queuing delay is trusted non-congestive — no inflight abort, no Background CC change, `fec_mtu_bypass` is not used as proof.
+- Adapter MTU suggestion: `adapter = path_mtu − 28 − enc_overhead`, clamped to **`MIN_ADAPTER_PAYLOAD_MTU` (280)**..=1500. Default config adapter **1340**; live netsh apply accepts the same floor.
+- Data-plane **TX guard**: UDP payload must fit `last_good − 28` (fallback global min). Oversized drops (`pmtud_tx_oversize_drop`) re-apply adapter MTU and, on Plateau/Frozen, early-wake via `pmtud_revalidate_hints` (5s cooldown). Control / reliable / PMTUD probes / FEC shards are not gated this way.
+- Tunables: `probe_timeout_ms` (floor), `confirm_count`, `resolve_epsilon`, `raise_step`, `max_probes_per_search`, `max_concurrent_peers`, `stable_downgrade_batches`; timers `pmtud_tick_ms` / `pmtud_raise_secs`. Budget exceed → Frozen at `last_good`.
 - When `min_path_mtu` changes, the engine retunes/flushes FEC encoders to the path-derived shard ceiling (config `shard_payload_size` is not rewritten).
-- CLI `config reload` may apply saved MTU/metric via netsh when a profile is active.
+- CLI `config reload` may apply saved MTU/metric via netsh when a profile is active. Runtime report includes PMTUD peer snapshot and probe/anomaly/softdown counters.
 
 ---
 
@@ -474,9 +481,14 @@ Canonical punch stages and `PARA_*` constants: [Performance parameters](#perform
 
 ## Membership sync (MSYN)
 
-- Periodic and event-driven **route/membership** sync using **`MSYN`** (v3 delta/full bodies built in `msyn_sync.rs`).
+- Periodic and event-driven **route/membership** sync using **`MSYN`** / **`MCTL`+MSYN** (v4 sharded JSON bodies built in `msyn_sync.rs`).
 - Owner increments **`membership_version`**; peers track **`msyn_applied_to_rev`** and **`peer_sync_state`**.
 - Removals use **tombstone revisions**; **`peer_pending_removals`** ensures peers learn departures before sync cursor advances.
+- **v4 sharding:** each part carries `sync_id`, `part_idx`, `parts_total`, `from_rev`, `to_rev`, `routes`, `removed`. Owner uses a global monotonic `sync_id` per peer-epoch; parts are sent sequentially via direct UDP (`send_to`). Advance + pending clear only when **every** part of that epoch got `Ok`. Owner **refuses** epochs with `parts_total > 64` or more than **1024** routes / **1024** removed (same caps as joiner apply); joiner ignores oversized assembled epochs without advancing `msyn_applied_to_rev`.
+- **Assemble-then-apply:** joiner buffers by `(from, sync_id)` (caps: 8 buffers/from, 64 parts, 30s TTL). On complete set, apply **all removed then all routes**, then phantom-evict only if `from_rev==0` using the **union of route VIPs**. Incomplete buffers never bump `msyn_applied_to_rev`.
+- **Shard budget:** `[engine_limits].msyn_shard_budget_bytes` (default 1200) is a **wire-oriented** ceiling; packing uses `effective_msyn_json_budget` = configured − `MSYN_SHARD_WRAP_RESERVE` (52 B for sealed `MCTL`+MSYN+HB vip) so JSON+compound+MCTS fit under the configured size.
+- **Coverage keepalive:** shared last-outbound UDP clock (engine direct sends + pacing `try_send` Ok + `SetPeerKeepalive` / ICE check sends). Periodic keepalive skips destinations refreshed within `keepalive_secs`; otherwise sends `MCTL` HB (and HB+HOL for untracked owner_extra). Compact Ping/Pong / CC probes unchanged.
+- **`MCTL` scope:** opportunistic compound only for keepalive HB(+HOL) and MSYN-part(+HB when uncovered). `direct_retry` / control-path race / punch stay standalone `MKPL`/`MHOL`. No cross-`select!` coalesce guarantee (keepalive / sync / direct_retry are separate timer arms).
 - Related: **`MSMD`** dedup, **`MSSP` / `MSSR`** snapshots (limits in [Performance parameters](#performance-parameters)).
 
 ---
@@ -573,7 +585,7 @@ Factory defaults below match `NetworkConfig::default` / `pacing_defaults` / `Adv
 
 ### Advanced tuning (sectioned tables in config.toml)
 
-Failover thresholds, engine timers, reliable RTO/retry bounds, FEC shard size + flush + adaptive thresholds + max total shards, PMTUD probe ladder, congestion telemetry / FEC loss classifier, routing EWMA / quality scoring, engine per-tick / STUN / MSYN limits, and canonical hole-punch stage knobs live in dedicated TOML tables (`[failover]`, `[timers]`, `[reliable]`, `[fec]`, `[congestion]`, `[pmtud]`, `[routing_ewma]`, `[engine_limits]`, `[hole_punch]`, `[buffers]`) — see [Performance parameters](#performance-parameters) for the full schema, clamps, and semantics. Defaults match the engine constants; omitting keys preserves today's behavior. Apply live with **`config reload`** (performance merge includes these fields); **`config reset`** also clears them. In-flight hole-punch workflows keep the snapshot from spawn; the next punch uses reloaded values.
+Failover thresholds, engine timers, reliable RTO/retry bounds, FEC shard size + flush + adaptive thresholds + max total shards, PMTUD search+confirm knobs, congestion telemetry / FEC loss classifier, routing EWMA / quality scoring, engine per-tick / STUN / MSYN limits, and canonical hole-punch stage knobs live in dedicated TOML tables (`[failover]`, `[timers]`, `[reliable]`, `[fec]`, `[congestion]`, `[pmtud]`, `[routing_ewma]`, `[engine_limits]`, `[hole_punch]`, `[buffers]`) — see [Performance parameters](#performance-parameters) for the full schema, clamps, and semantics. Defaults match the engine constants; omitting keys preserves today's behavior. Apply live with **`config reload`** (performance merge includes these fields); **`config reset`** also clears them. In-flight hole-punch workflows keep the snapshot from spawn; the next punch uses reloaded values.
 
 ### UDP and Wintun (`buffer`)
 
@@ -678,27 +690,27 @@ Tracks base RTT and queuing delay on each `RouteEntry`. Optional gate on adaptiv
 | Field | Default | Meaning | If ↑ / on | If ↓ / off |
 |-------|--------:|---------|-----------|------------|
 | `congestion_enabled` | **true** | LEDBAT background CC (token bucket + delay gradient) | On: per-peer rate limits from queuing delay | Off: telemetry/FEC only; no pacing CC actuation |
-| `gain` | 0.35 | Multiplicative decrease when `queuing_delay / target > 1` (**0.1–4.0**) | Drops peer rate faster under delay | Gentler decrease |
-| `hol_escape_ms` | 5 | Send despite empty tokens when peer HOL sojourn ≥ this (**4–100**); recommend ≤ `apd_max_sojourn_ms` when `apd_require_cc_headroom` is on | Escape starvation sooner | Longer throttle under backlog |
-| `initial_rate_bps` | 8M | New peer starting rate (**≤ max_rate_bps**) | Higher cold-start send cap | Lower initial cap |
-| `additive_increase_bps` | 48000 | Linear increase per probe when delay ≤ target (**4000–1e6**) | Faster headroom use | Slower ramp |
-| `min_decrease_factor` | 0.85 | Floor on one multiplicative decrease step (**0.1–0.9**) | Shallower single-step cuts | Deeper cuts |
-| `rate_smoothing_alpha` | 0.8 | EWMA on applied rate (**0–0.95**) | Smoother rates | Faster response |
-| `min_rate_bps` / `max_rate_bps` | 1.5M / 20M | Absolute per-peer rate clamps | Wider/narrower range | Tighter caps |
-| `loss_multiplicative_decrease` | 0.85 | On rising `loss_ewma` past failover threshold (**0.3–0.9**) | Stronger loss reaction | Weaker loss reaction |
-| `burst_cap_bytes` | 16000 | Per-peer token burst cap (**512–262144**) | Larger micro-bursts | Tighter pacing |
-| `delivery_rate_window_ms` | **500** | Accumulate TX bytes before one delivery-rate EWMA sample (**100–5000**) | Smoother delivery estimate | Faster delivery samples |
+| `gain` | 0.1 | Multiplicative decrease when `queuing_delay / target > 1` (**0.1–4.0**) | Drops peer rate faster under delay | Gentler decrease |
+| `hol_escape_ms` | 12 | Send despite empty tokens when peer HOL sojourn ≥ this (**4–100**); recommend ≤ `apd_max_sojourn_ms` when `apd_require_cc_headroom` is on | Escape starvation sooner | Longer throttle under backlog |
+| `initial_rate_bps` | 1.5M | New peer starting rate (**≤ max_rate_bps**) | Higher cold-start send cap | Lower initial cap |
+| `additive_increase_bps` | 8000 | Linear increase per probe when delay ≤ target (**4000–1e6**) | Faster headroom use | Slower ramp |
+| `min_decrease_factor` | 0.9 | Floor on one multiplicative decrease step (**0.1–0.9**) | Shallower single-step cuts | Deeper cuts |
+| `rate_smoothing_alpha` | 0.9 | EWMA on applied rate (**0–0.95**) | Smoother rates | Faster response |
+| `min_rate_bps` / `max_rate_bps` | 1M / 12M | Absolute per-peer rate clamps | Wider/narrower range | Tighter caps |
+| `loss_multiplicative_decrease` | 0.9 | On rising `loss_ewma` past failover threshold (**0.3–0.9**) | Stronger loss reaction | Weaker loss reaction |
+| `burst_cap_bytes` | 12000 | Per-peer token burst cap (**512–262144**) | Larger micro-bursts | Tighter pacing |
+| `delivery_rate_window_ms` | **750** | Accumulate TX bytes before one delivery-rate EWMA sample (**100–5000**) | Smoother delivery estimate | Faster delivery samples |
 | `delivery_rate_ewma_alpha` | **0.25** | Weight of each delivery window sample (**0.05–1.0**) | Tracks recent TX faster | More inertia |
-| `delivery_anchor_factor` | **0.9** | On hard-anchored decrease, set rate to `delivery_ewma ×` this (**0.5–0.99**) | Softer floor under delivery | Deeper cut toward delivery |
-| `delivery_decouple_ratio` | **1.25** | Hard-anchor when `rate_bps > delivery_ewma ×` this (**1.05–3.0**); else classic MD | Needs larger ceiling/delivery gap | Anchors sooner when slightly above delivery |
+| `delivery_anchor_factor` | **0.95** | On hard-anchored decrease, set rate to `delivery_ewma ×` this (**0.5–0.99**) | Softer floor under delivery | Deeper cut toward delivery |
+| `delivery_decouple_ratio` | **1.5** | Hard-anchor when `rate_bps > delivery_ewma ×` this (**1.05–3.0**); else classic MD | Needs larger ceiling/delivery gap | Anchors sooner when slightly above delivery |
 | `rtt_base_tracking` | true | Update RTT base / OWD base and queuing-delay telemetry | On: delay telemetry available | Off: skip base updates (effective QD stays cold/`-1`) |
 | `loss_classifier_enabled` | **true** | Gate adaptive FEC increases by delay ratio; gate Background CC loss-MD / loss-driven delivery anchor; enable post-congestion FEC recovery step-down | On: hold FEC parity up under congestion; CC ignores non-congestive loss edges; FEC step-down after QD recovers (see `fec_recovery_recency_ms`) | Off: loss-only adaptive FEC; CC always applies loss MD on rising edge |
-| `target_queue_delay_ms` | 10 | Denominator for `delay_ratio` (**10–150**) | Higher → less likely to classify as congestive | Lower → hold FEC increases sooner |
+| `target_queue_delay_ms` | 15 | Denominator for `delay_ratio` (**10–150**) | Higher → less likely to classify as congestive | Lower → hold FEC increases sooner |
 | `congestion_loss_threshold` | 0.7 | Hold increase / mark congestive when `effective_qd / target >` this (**0.3–0.95**); recovery uses the same threshold for “delay recovered” | More tolerant of delay before hold | Holds sooner |
-| `base_rtt_window_secs` | 3 | Min-RTT / min-OWD window length (**1–60**) | Slower base adaptation | Faster base churn |
+| `base_rtt_window_secs` | 6 | Min-RTT / min-OWD window length (**1–60**) | Slower base adaptation | Faster base churn |
 | `base_rtt_stale_windows` | 2 | Consecutive windows before base may **rise** (**1–10**) | Base rises only after more confirmation | Base rises sooner when path worsens |
 | `owd_clock_jump_reject_ms` | **30000** | Invalidate forward OWD base when `|sample − base|` exceeds this (**1000–600000**) | More tolerant of clock steps | Rejects / resets OWD sooner |
-| `probe_interval_ms` | 20 | Periodic compact ping/pong for RTT + forward OWD samples (**0** = off, else **20–1000**) | Fresher queuing-delay telemetry | Less control traffic; sparser samples |
+| `probe_interval_ms` | 25 | Periodic compact ping/pong for RTT + forward OWD samples (**0** = off, else **20–1000**) | Fresher queuing-delay telemetry | Less control traffic; sparser samples |
 | `fec_recovery_recency_ms` | **3000** | After last congestive sample, how long recovery may step parity down one ladder rung (**0** = off; else **100–60000**) | Longer sticky post-bloat shed window | Shorter / disable step-down (hold-increase only) |
 
 With defaults, `congestion_enabled = true` applies a per-peer token bucket (initial rate `initial_rate_bps`, burst `burst_cap_bytes`) in addition to the global pacing budget. Queuing-delay / loss-edge decreases use classic AIMD/MD when the permission rate is near measured TX delivery; when the ceiling sits clearly above the delivery EWMA (`delivery_decouple_ratio`), the first decrease hard-anchors to `delivery_ewma × delivery_anchor_factor` and snaps the smoothed bucket rate in the same update. When `loss_classifier_enabled` is on and QD telemetry is trusted (`rtt_base_tracking`), a rising loss edge only participates in that decrease path if delay is congestive (`queuing_delay / target > congestion_loss_threshold`); otherwise the edge is ignored for CC (`cc_loss_ignored_random` metric) and FEC remains the recovery tool. Delivery EWMA is send-side (successful data TX only); if true path rate is below `min_rate_bps`, the floor still applies (same as classic MD). APD is a local latency valve on top (see cascade hierarchy), gated by `apd_require_cc_headroom` so CC-induced backlog does not false-trigger Drain spin. Under-target paths may slowly increase rate via `additive_increase_bps`.
@@ -798,8 +810,8 @@ stale_evict_secs = 90
 [buffers]
 ```
 
-Full key sets for each advanced table use the current field names (`d2r_*`, `keepalive_secs`, `shard_payload_size`, `congestion_enabled`, `probe_sizes`, `rtt_ewma_*`, `max_direct_retry_per_tick`, `punch_stage*`, …).
-Clamps (enforced before apply): `stale_tick < stale_mark < stale_evict`; `rto_min ≤ rto_max`; `shard_payload_size` ∈ `512..=1279` (v3 wire max — larger needs a protocol bump); `probe_sizes` unique, strictly decreasing, each `576..=1500`, ≥2 entries; `adaptive_off_below ≤ adaptive_on_above`; congestion: `gain` ∈ `0.1..=4.0`, `hol_escape_ms` ∈ `4..=100`, `target_queue_delay_ms` ∈ `10..=150`, `congestion_loss_threshold` ∈ `0.3..=0.95`, `base_rtt_window_secs` ∈ `1..=60`, `base_rtt_stale_windows` ∈ `1..=10`, `owd_clock_jump_reject_ms` ∈ `1000..=600000`, `probe_interval_ms` **0** or **20–1000**, `fec_recovery_recency_ms` **0** or **100–60000**, `min_decrease_factor` ∈ `0.1..=0.9`, `additive_increase_bps` ∈ `4000..=1_000_000`, `rate_smoothing_alpha` ∈ `0..=0.95`, `min_rate_bps` ≥ `1000`, `max_rate_bps` ≤ `50_000_000`, `initial_rate_bps` ∈ `[min_rate_bps, max_rate_bps]`, `loss_multiplicative_decrease` ∈ `0.3..=0.9`, `burst_cap_bytes` ∈ `512..=262144`, `delivery_rate_window_ms` ∈ `100..=5000`, `delivery_rate_ewma_alpha` ∈ `0.05..=1.0`, `delivery_anchor_factor` ∈ `0.5..=0.99`, `delivery_decouple_ratio` ∈ `1.05..=3.0`; `pace_rate_mode` must be `pps` or `bytes`.
+Full key sets for each advanced table use the current field names (`d2r_*`, `keepalive_secs`, `shard_payload_size`, `congestion_enabled`, `probe_timeout_ms`, `rtt_ewma_*`, `max_direct_retry_per_tick`, `punch_stage*`, …).
+Clamps (enforced before apply): `stale_tick < stale_mark < stale_evict`; `rto_min ≤ rto_max`; `shard_payload_size` ∈ `512..=1279` (v3 wire max — larger needs a protocol bump); PMTUD: `probe_timeout_ms` ∈ `50..=10000` (adaptive timeout floor; effective timeout also capped at 5s), `confirm_count` ∈ `1..=8`, `resolve_epsilon` ∈ `1..=8`, `raise_step` ∈ `1..=512`, `max_probes_per_search` ∈ `8..=256`, `max_concurrent_peers` ∈ `1..=64`, `pmtud_tick_ms` ∈ `10..=1000`; `adaptive_off_below ≤ adaptive_on_above`; congestion: `gain` ∈ `0.1..=4.0`, `hol_escape_ms` ∈ `4..=100`, `target_queue_delay_ms` ∈ `10..=150`, `congestion_loss_threshold` ∈ `0.3..=0.95`, `base_rtt_window_secs` ∈ `1..=60`, `base_rtt_stale_windows` ∈ `1..=10`, `owd_clock_jump_reject_ms` ∈ `1000..=600000`, `probe_interval_ms` **0** or **20–1000**, `fec_recovery_recency_ms` **0** or **100–60000**, `min_decrease_factor` ∈ `0.1..=0.9`, `additive_increase_bps` ∈ `4000..=1_000_000`, `rate_smoothing_alpha` ∈ `0..=0.95`, `min_rate_bps` ≥ `1000`, `max_rate_bps` ≤ `50_000_000`, `initial_rate_bps` ∈ `[min_rate_bps, max_rate_bps]`, `loss_multiplicative_decrease` ∈ `0.3..=0.9`, `burst_cap_bytes` ∈ `512..=262144`, `delivery_rate_window_ms` ∈ `100..=5000`, `delivery_rate_ewma_alpha` ∈ `0.05..=1.0`, `delivery_anchor_factor` ∈ `0.5..=0.99`, `delivery_decouple_ratio` ∈ `1.05..=3.0`; `pace_rate_mode` must be `pps` or `bytes`.
 
 **FEC `shard_payload_size`** is a *local send ceiling*. Reducing it is valid for all peers on this wire version (they decode smaller shards fine); values above `1279` are rejected because the FEC header cannot carry larger shards without a wire-version change. Changing it flushes in-flight FEC groups. At send time the engine also derives an **effective** ceiling `min(configured, min_path_mtu − 28 − 12)` so FEC UDP datagrams fit the PMTUD path; if that value is below `512`, FEC bypasses. While APD is in Drain, FEC *timer* flush is passthrough-only (no Reed–Solomon parity).
 
@@ -824,11 +836,11 @@ Beyond [Failover defaults](#failover-defaults) and the `[routing_ewma]` / `quali
 
 | Timer | Period | Meaning | If ↑ | If ↓ |
 |-------|--------|---------|------|------|
-| Peer keepalive | 5 s | `MKPL`/`HPCH` to maintain NAT bindings | Less keepalive traffic; bindings may expire | More traffic; fresher mappings |
+| Peer keepalive | 5 s | Coverage-gated `MCTL` HB (or standalone `MKPL`); owner_extra may add HOL | Less keepalive traffic; bindings may expire | More traffic; fresher mappings |
 | MSYN sync | 15 s | Membership table broadcast period | Slower peer list convergence | Faster updates; more control traffic |
 | MSYN coalesce (owner) | 50 ms | Batches owner MSYN churn | Fewer packets; slower fan-out | More frequent sync |
 | Direct route retry | 5 s | Retries direct path after relay | Slower rediscovery | More aggressive direct retry |
-| PMTUD batch | 60 s | New probe cycle per path | Slower MTU adaptation | More probe traffic |
+| PMTUD tick / raise | 50 ms active / 60 s raise | Search tick while probing; periodic raise/revalidate | Slower MTU adaptation | More probe traffic |
 | Stale tick / mark / evict | 30 / 45 / 120 s | Route aging and removal | Keeps dead routes longer | Faster cleanup; risk drop valid slow peers |
 | RX BW flush | 250 ms | Updates bandwidth EWMA | Coarser stats | Finer stats; slightly more CPU |
 | STUN poll | 200 ms | Checks STUN query completion | — | — |
@@ -848,7 +860,8 @@ Beyond [Failover defaults](#failover-defaults) and the `[routing_ewma]` / `quali
 |-----------|------:|---------|------|------|
 | `stun_cache_ttl_secs` | 30 | Reuse mapped address without query (config) | Fewer STUN requests | Staler public endpoint |
 | `STUN_QUERY_DEADLINE_SLACK` | 2 s | Extra wait beyond user timeout | More likely late STUN answer | Stricter timeout |
-| `msyn_body_max` | 524288 | Max MSYN payload size (config; hard ceiling 524288) | Allows huge peer lists | Reject large sync |
+| `msyn_body_max` | 524288 | Max MSYN/MCTL payload size (config; hard ceiling 524288) | Allows huge peer lists | Reject large sync |
+| `msyn_shard_budget_bytes` | 1200 | Wire-oriented max for one MSYN part after `MCTL`+`MCTS` wrap; JSON packed under budget−52 (512..=min(4096, msyn_body_max)) | Fewer/larger parts | More parts; safer UDP fit |
 | `MAX_MSSP_ROUTES` | 1024 | Routes in MSSP snapshot | Larger networks | Truncate route ads |
 | `MAX_MSMD_CACHE` | 4096 | Dedup MSMD events | More memory | Earlier dedup eviction |
 | DNS timeout | 800 ms | STUN hostname resolve wait | Slower fail on bad DNS | Faster fail |
@@ -919,10 +932,14 @@ Owned exclusively by the **`mint-pacing`** OS thread (`src/net/pacing_worker.rs`
 
 | Parameter | Value | Meaning | If ↑ | If ↓ |
 |-----------|------:|---------|------|------|
-| `PROBE_SIZES` | ladder to 1500 | Sizes attempted on path | Finer steps: slower discovery | Coarser: may miss optimal MTU |
-| `STABLE_DOWNGRADE_BATCHES` | 3 | Confirmed lower MTU before stable drop | Slower to reduce MTU | Faster downgrade on loss |
-| `MIN_ADAPTER_PAYLOAD_MTU` | 280 | Hard floor | — | — |
-| Engine interval 60 s | see timers | How often new probe batch starts | — | — |
+| `raise_step` | 32 | Initial exponential raise increment | Coarser early steps | Finer early steps |
+| `resolve_epsilon` | 1 | Stop binary when `first_bad - last_good ≤ ε` | Less precise ceiling | Byte-accurate (ε=1) |
+| `confirm_count` | 3 | Timeouts at same size before confirmed fail | More loss-tolerant | Faster fail on loss |
+| `probe_timeout_ms` | 1000 | Floor for adaptive probe timeout (cap 5s) | Longer minimum wait | Faster retries when RTT is low |
+| `max_probes_per_search` | 64 | Campaign budget → Frozen (not applied to Recheck) | Longer search | Freeze sooner |
+| `stable_downgrade_batches` | 3 | Lower campaigns before `stable` drop | Slower to reduce MTU | Faster downgrade |
+| `MIN_ADAPTER_PAYLOAD_MTU` | 280 | Hard floor for suggested/applied adapter MTU | — | — |
+| `pmtud_tick_ms` / `pmtud_raise_secs` | 50 / 60 | Active tick vs raise/revalidate period | — | — |
 
 ### NAT / punch / parasitic (`src/cli.rs`)
 

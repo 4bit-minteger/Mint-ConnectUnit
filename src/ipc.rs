@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 pub const IPC_ADDR: &str = "127.0.0.1:48787";
 pub const IPC_UI_ADDR: &str = "127.0.0.1:48788";
-pub const IPC_PROTOCOL: u32 = 2;
+pub const IPC_PROTOCOL: u32 = 3;
 
 /// First frame on UI socket must be this; daemon replies with replay then streams live lines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +61,10 @@ pub enum IpcRequest {
     ReloadConfigFromDisk,
     /// Metrics + trace snapshot for client-side `runtime` view.
     RuntimeSnapshot,
+    /// Enable + reset runtime dashboard counters for a live view session.
+    RuntimeViewBegin,
+    /// Disable + reset runtime dashboard counters when leaving the view.
+    RuntimeViewEnd,
     CreateNetwork {
         name: String,
         listen_port: u16,
@@ -259,6 +263,22 @@ impl IpcClient {
             IpcResponse::RuntimeSnapshot { payload } => {
                 Ok(bincode::deserialize(&payload).unwrap_or_default())
             }
+            other => Err(anyhow!("unexpected ipc response: {other:?}")),
+        }
+    }
+
+    pub async fn runtime_view_begin(&self) -> Result<()> {
+        match self.call(IpcRequest::RuntimeViewBegin).await? {
+            IpcResponse::Ok { .. } => Ok(()),
+            IpcResponse::Err { message } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected ipc response: {other:?}")),
+        }
+    }
+
+    pub async fn runtime_view_end(&self) -> Result<()> {
+        match self.call(IpcRequest::RuntimeViewEnd).await? {
+            IpcResponse::Ok { .. } => Ok(()),
+            IpcResponse::Err { message } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected ipc response: {other:?}")),
         }
     }

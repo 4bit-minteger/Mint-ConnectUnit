@@ -347,40 +347,59 @@ async fn run_join_parasitic_lan_wizard(ipc: &IpcClient) -> Result<()> {
 async fn run_runtime_view(ipc: &IpcClient) -> Result<()> {
     const FOOTER: &str = "  Press Enter to stop…";
 
-    async fn paint_frame(ipc: &IpcClient, footer: &str) {
-        let lines = ipc.runtime_snapshot_lines().await.unwrap_or_default();
-        print!("\x1B[2J\x1B[H");
-        for l in lines {
-            println!("{l}");
-        }
-        println!("{footer}");
-    }
-
-    paint_frame(ipc, FOOTER).await;
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
-
-    let mut enter_wait = tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)
-    });
-
-    loop {
-        tokio::select! {
-            res = &mut enter_wait => {
-                let _ = res;
-                break;
-            }
-            _ = interval.tick() => {
-                paint_frame(ipc, FOOTER).await;
-            }
+    struct RuntimeViewUiGuard;
+    impl Drop for RuntimeViewUiGuard {
+        fn drop(&mut self) {
+            crate::cli_emit::set_runtime_view_active(false);
+            let _ = crate::cli_emit::leave_runtime_alt_screen();
         }
     }
 
-    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    crate::cli_emit::set_runtime_view_active(true);
+    crate::cli_emit::enter_runtime_alt_screen()
+        .map_err(|e| anyhow::anyhow!("enter runtime screen: {e}"))?;
+    ipc.runtime_view_begin()
+        .await
+        .map_err(|e| anyhow::anyhow!("runtime view begin: {e}"))?;
+    let _ui_guard = RuntimeViewUiGuard;
+
+    let view_result = async {
+        let mut first = true;
+        paint_runtime_once(ipc, FOOTER, &mut first).await?;
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+
+        let mut enter_wait = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)
+        });
+
+        loop {
+            tokio::select! {
+                res = &mut enter_wait => {
+                    let _ = res;
+                    break;
+                }
+                _ = interval.tick() => {
+                    paint_runtime_once(ipc, FOOTER, &mut first).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = ipc.runtime_view_end().await;
+    view_result
+}
+
+async fn paint_runtime_once(ipc: &IpcClient, footer: &str, first: &mut bool) -> Result<()> {
+    let lines = ipc.runtime_snapshot_lines().await.unwrap_or_default();
+    crate::cli_emit::paint_runtime_alt_frame(&lines, footer, *first)
+        .map_err(|e| anyhow::anyhow!("paint runtime frame: {e}"))?;
+    *first = false;
     Ok(())
 }
 

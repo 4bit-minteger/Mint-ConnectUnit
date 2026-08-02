@@ -52,7 +52,7 @@ const PORT_MAX: u16 = 65535;
 const MAX_PEERS: usize = 253;
 
 /// Fixed line count for `paint_runtime_frame` (header + flags + traffic + metrics).
-const RUNTIME_DISPLAY_LINE_COUNT: usize = 70;
+const RUNTIME_DISPLAY_LINE_COUNT: usize = 82;
 
 const DEFAULT_UDP_SOCKBUF: i32 = 256 * 1024;
 const DEFAULT_UDP_RCVBUF: i32 = 2 * 1024 * 1024;
@@ -229,6 +229,7 @@ pub struct Cli {
     fec_enabled: bool,
     autoclear: bool,
     low_latency_timer: bool,
+    last_timer_status: Option<TimerResolutionStatus>,
     #[cfg(windows)]
     timer_guard: Option<LowLatencyTimerGuard>,
     rawperf_enabled: bool,
@@ -287,6 +288,7 @@ impl Cli {
             fec_enabled: snap.fec_enabled,
             autoclear: true,
             low_latency_timer: snap.low_latency_timer_enabled,
+            last_timer_status: None,
             #[cfg(windows)]
             timer_guard: None,
             rawperf_enabled: snap.rawperf_enabled,
@@ -312,7 +314,8 @@ impl Cli {
         cli
     }
 
-    fn report_timer_resolution(&self, status: TimerResolutionStatus) {
+    fn report_timer_resolution(&mut self, status: TimerResolutionStatus) {
+        self.last_timer_status = Some(status);
         if let Some(metrics) = &self.engine_metrics {
             metrics.set_timer_resolution(
                 status.requested_us,
@@ -334,6 +337,50 @@ impl Cli {
                 status.requested_us, status.fallback_count
             );
         }
+    }
+
+    fn reapply_timer_metrics_after_view_begin(&self) {
+        if let (Some(metrics), Some(status)) = (&self.engine_metrics, self.last_timer_status) {
+            metrics.set_timer_resolution(
+                status.requested_us,
+                status.applied_us,
+                status.fallback_count,
+            );
+        }
+    }
+
+    pub async fn runtime_view_begin(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCmd::RuntimeViewBegin { reply: tx })
+            .await
+            .map_err(|_| anyhow!("engine command channel closed"))?;
+        match tokio::time::timeout(Duration::from_millis(500), rx).await {
+            Ok(Ok(())) => {
+                self.reapply_timer_metrics_after_view_begin();
+                Ok(())
+            }
+            _ => Err(anyhow!("runtime view begin timed out")),
+        }
+    }
+
+    pub async fn runtime_view_end(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCmd::RuntimeViewEnd { reply: tx })
+            .await
+            .map_err(|_| anyhow!("engine command channel closed"))?;
+        match tokio::time::timeout(Duration::from_millis(500), rx).await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(anyhow!("runtime view end timed out")),
+        }
+    }
+
+    pub fn runtime_view_end_best_effort(&self) {
+        let (tx, _rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .try_send(EngineCmd::RuntimeViewEnd { reply: tx });
     }
 
     fn apply_low_latency_timer_state(&mut self) {
@@ -4904,8 +4951,8 @@ impl Cli {
     fn print_advanced_block(a: &crate::advanced_tuning::AdvancedTuning) {
         crate::cli_println!("  failover: d2r_quality_min={} d2r_loss_max={:.3} d2r_jitter_max={:.1} r2d_quality_min={} r2d_success_min={} hold_down_secs={}",
             a.failover.d2r_quality_min, a.failover.d2r_loss_max, a.failover.d2r_jitter_max, a.failover.r2d_quality_min, a.failover.r2d_success_min, a.failover.hold_down_secs);
-        crate::cli_println!("  timers: keepalive={}s msyn={}s pmtud_batch={}s ping_watchdog={}ms stale_tick={}s stale_mark={}s stale_evict={}s",
-            a.timers.keepalive_secs, a.timers.msyn_secs, a.timers.pmtud_batch_secs, a.timers.ping_watchdog_ms, a.timers.stale_tick_secs, a.timers.stale_mark_secs, a.timers.stale_evict_secs);
+        crate::cli_println!("  timers: keepalive={}s msyn={}s pmtud_tick={}ms pmtud_raise={}s ping_watchdog={}ms stale_tick={}s stale_mark={}s stale_evict={}s",
+            a.timers.keepalive_secs, a.timers.msyn_secs, a.timers.pmtud_tick_ms, a.timers.pmtud_raise_secs, a.timers.ping_watchdog_ms, a.timers.stale_tick_secs, a.timers.stale_mark_secs, a.timers.stale_evict_secs);
         crate::cli_println!(
             "  reliable: rto_min={}ms rto_max={}ms max_pending={} retries_left={}",
             a.reliable.rto_min_ms,
@@ -4916,8 +4963,13 @@ impl Cli {
         crate::cli_println!("  fec: shard_payload_size={} flush={}ms flush_aggressive={}ms adaptive_off_below={:.3} adaptive_on_above={:.3} fec_max_total_shards={}",
             a.fec.shard_payload_size, a.fec.flush_ms, a.fec.flush_aggressive_ms, a.fec.adaptive_off_below, a.fec.adaptive_on_above, a.fec.fec_max_total_shards);
         crate::cli_println!(
-            "  pmtud: probe_sizes={:?} stable_downgrade_batches={}",
-            a.pmtud.probe_sizes,
+            "  pmtud: timeout={}ms confirm={} epsilon={} raise_step={} max_probes={} max_peers={} stable_downgrade_batches={}",
+            a.pmtud.probe_timeout_ms,
+            a.pmtud.confirm_count,
+            a.pmtud.resolve_epsilon,
+            a.pmtud.raise_step,
+            a.pmtud.max_probes_per_search,
+            a.pmtud.max_concurrent_peers,
             a.pmtud.stable_downgrade_batches
         );
         crate::cli_println!(
@@ -4966,7 +5018,7 @@ impl Cli {
             a.routing_ewma.rtt_score_clamp_ms
         );
         crate::cli_println!(
-            "  engine_limits: direct_retry/tick={} heal_pending={} stun_pending={} cc_probes/tick={} secondary_retry/tick={} stun_ttl={}s msyn_body_max={} heal_cooldown_ms={}",
+            "  engine_limits: direct_retry/tick={} heal_pending={} stun_pending={} cc_probes/tick={} secondary_retry/tick={} stun_ttl={}s msyn_body_max={} msyn_shard_budget={} heal_cooldown_ms={}",
             a.engine_limits.max_direct_retry_per_tick,
             a.engine_limits.max_pending_heal_probes,
             a.engine_limits.max_pending_stun_queries,
@@ -4974,6 +5026,7 @@ impl Cli {
             a.engine_limits.max_secondary_retry_per_tick,
             a.engine_limits.stun_cache_ttl_secs,
             a.engine_limits.msyn_body_max,
+            a.engine_limits.msyn_shard_budget_bytes,
             a.engine_limits.heal_cooldown_ms
         );
         crate::cli_println!(
@@ -5039,11 +5092,20 @@ impl Cli {
     }
 
     /// Apply saved performance settings to the live engine (after config snapshot is updated).
-    async fn apply_persisted_performance_live(&mut self, factory_defaults: bool) -> Result<()> {
+    ///
+    /// `previous` is the pre-change snapshot used to skip disruptive adapter work (Wintun
+    /// recreate / netsh / sockbuf) when those knobs did not change. Soft knobs (pacing,
+    /// advanced tuning, CPU affinity, process priority) always apply.
+    async fn apply_persisted_performance_live(
+        &mut self,
+        factory_defaults: bool,
+        previous: Option<&crate::config::NetworkConfig>,
+    ) -> Result<()> {
         self.rebuild_pacing_from_snapshot();
         self.sync_runtime_flags_from_config_snapshot();
 
         let snap = self.config.snapshot();
+        let plan = adapter_live_apply_plan(previous, snap.as_ref());
         let apply = PaceClockApply::from_network_config(snap.as_ref());
 
         if self
@@ -5147,44 +5209,50 @@ impl Cli {
         }
 
         if self.has_active_profile() {
-            if factory_defaults {
-                if let Err(e) = self.apply_netsh_settings(1340, Some(1)).await {
-                    crate::cli_println!(
-                        "{}",
-                        term_style::fmt_bang_line(format_args!(
-                            " Could not apply netsh defaults: {e}"
-                        ))
-                    );
-                }
-            } else {
-                let snap = self.config.snapshot();
-                let mtu = if (576..=1500).contains(&snap.adapter_mtu) {
-                    snap.adapter_mtu
+            if plan.apply_netsh {
+                if factory_defaults {
+                    if let Err(e) = self.apply_netsh_settings(1340, Some(1)).await {
+                        crate::cli_println!(
+                            "{}",
+                            term_style::fmt_bang_line(format_args!(
+                                " Could not apply netsh defaults: {e}"
+                            ))
+                        );
+                    }
                 } else {
-                    1340
-                };
-                let raw_metric = snap.wintun_ipv4_interface_metric;
-                let ipv4_metric_arg = if raw_metric == 0 {
-                    Some(0u32)
-                } else {
-                    Some(effective_wintun_ipv4_interface_metric(raw_metric))
-                };
-                if let Err(e) = self.apply_netsh_settings(mtu, ipv4_metric_arg).await {
-                    crate::cli_println!(
-                        "{}",
-                        term_style::fmt_bang_line(format_args!(
-                            " Could not apply saved netsh settings: {e}"
-                        ))
-                    );
+                    let snap = self.config.snapshot();
+                    let mtu = effective_adapter_mtu(snap.adapter_mtu);
+                    let raw_metric = snap.wintun_ipv4_interface_metric;
+                    let ipv4_metric_arg = if raw_metric == 0 {
+                        Some(0u32)
+                    } else {
+                        Some(effective_wintun_ipv4_interface_metric(raw_metric))
+                    };
+                    if let Err(e) = self.apply_netsh_settings(mtu, ipv4_metric_arg).await {
+                        crate::cli_println!(
+                            "{}",
+                            term_style::fmt_bang_line(format_args!(
+                                " Could not apply saved netsh settings: {e}"
+                            ))
+                        );
+                    }
                 }
             }
-            if let Err(e) = self.apply_performance_buffers_live().await {
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_bang_line(format_args!(
-                        " Could not apply buffer settings: {e}"
-                    ))
-                );
+            if plan.apply_socket_buffers || plan.recreate_wintun_ring {
+                if let Err(e) = self
+                    .apply_performance_buffers_live(
+                        plan.apply_socket_buffers,
+                        plan.recreate_wintun_ring,
+                    )
+                    .await
+                {
+                    crate::cli_println!(
+                        "{}",
+                        term_style::fmt_bang_line(format_args!(
+                            " Could not apply buffer settings: {e}"
+                        ))
+                    );
+                }
             }
         }
 
@@ -5192,16 +5260,22 @@ impl Cli {
     }
 
     pub async fn apply_config_reload(&mut self) -> Result<()> {
+        let before = (*self.config.snapshot()).clone();
         self.config
             .reload_performance_from_disk()
             .map_err(|e| anyhow::anyhow!("config reload failed: {e}"))?;
-        self.apply_persisted_performance_live(false).await?;
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_info_line(format_args!(
-                " TUN ring / inject queue changes may need reconnect or restart to take full effect."
-            ))
-        );
+        let after = self.config.snapshot();
+        let needs_reconnect_hint = restart_sensitive_perf_changed(&before, after.as_ref());
+        self.apply_persisted_performance_live(false, Some(&before))
+            .await?;
+        if needs_reconnect_hint {
+            crate::cli_println!(
+                "{}",
+                term_style::fmt_info_line(format_args!(
+                    " TUN ring / inject queue changes may need reconnect or restart to take full effect."
+                ))
+            );
+        }
         crate::cli_println!(
             "  ✓ Performance settings reloaded from NetInfo/config.toml (applied live)."
         );
@@ -5280,12 +5354,26 @@ impl Cli {
                 s.udp_sndbuf / 1024,
                 s.udp_rcvbuf / 1024
             ));
+            if s.pmtud_peers.is_empty() {
+                lines.push("  pmtud_peers             : (none)".to_string());
+            } else {
+                let p0 = &s.pmtud_peers[0];
+                lines.push(format!(
+                    "  pmtud_peers             : {} {} lg={} st={} ({} peer(s))",
+                    p0.endpoint,
+                    p0.phase,
+                    p0.last_good,
+                    p0.stable,
+                    s.pmtud_peers.len()
+                ));
+            }
         } else {
             lines.push("  pacing data queue      : —".to_string());
             lines.push("  pacing ctrl / retx     : —".to_string());
             lines.push("  pacing fill (aggregate): —".to_string());
             lines.push("  tun inject broadcast   : —".to_string());
             lines.push("  udp sndbuf / rcvbuf    : —".to_string());
+            lines.push("  pmtud_peers             : —".to_string());
         }
         let ring = effective_wintun_ring_bytes(self.config.snapshot().wintun_ring_bytes);
         lines.push(format!(
@@ -5477,6 +5565,50 @@ impl Cli {
                     m.fec_mtu_bypass_count.load(Ordering::Relaxed)
                 ));
                 lines.push(format!(
+                    "  pmtud_tx_oversize_drop : {}",
+                    m.pmtud_tx_oversize_drop.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_revalidate_hints : {}",
+                    m.pmtud_revalidate_hints.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_probes_sent      : {}",
+                    m.pmtud_probes_sent.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_probe_acks       : {}",
+                    m.pmtud_probe_acks.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_probe_timeouts   : {}",
+                    m.pmtud_probe_timeouts.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_revalidate_fails : {}",
+                    m.pmtud_revalidate_fail_events.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_recheck_recovered: {}",
+                    m.pmtud_recheck_recovered_events.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_softdown_events  : {}",
+                    m.pmtud_softdown_events.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_probe_anomaly    : {}",
+                    m.pmtud_probe_anomaly_events.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_late_ack_events  : {}",
+                    m.pmtud_late_ack_events.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
+                    "  pmtud_early_wake       : {}",
+                    m.pmtud_early_wake_events.load(Ordering::Relaxed)
+                ));
+                lines.push(format!(
                     "  fec_drain_passthrough  : {}",
                     m.fec_drain_passthrough_count.load(Ordering::Relaxed)
                 ));
@@ -5576,6 +5708,17 @@ impl Cli {
                 lines.push(na("tun_inject_drops"));
                 lines.push(na("fec_oversize_bypass"));
                 lines.push(na("fec_mtu_bypass"));
+                lines.push(na("pmtud_tx_oversize_drop"));
+                lines.push(na("pmtud_revalidate_hints"));
+                lines.push(na("pmtud_probes_sent"));
+                lines.push(na("pmtud_probe_acks"));
+                lines.push(na("pmtud_probe_timeouts"));
+                lines.push(na("pmtud_revalidate_fails"));
+                lines.push(na("pmtud_recheck_recovered"));
+                lines.push(na("pmtud_softdown_events"));
+                lines.push(na("pmtud_probe_anomaly"));
+                lines.push(na("pmtud_late_ack_events"));
+                lines.push(na("pmtud_early_wake"));
                 lines.push(na("fec_drain_passthrough"));
                 lines.push(na("fec_group_invalid"));
                 lines.push(na("fec_flush_passthrough"));
@@ -5635,7 +5778,8 @@ impl Cli {
         const FOOTER: &str = "  Press Enter to stop…";
 
         enter_runtime_terminal()?;
-        let _trace_session = RuntimeTraceSession::enter(self.runtime_trace.clone());
+        let _view_session = RuntimeViewSession::enter(self.cmd_tx.clone()).await;
+        self.reapply_timer_metrics_after_view_begin();
         let mut rate_tracker = RuntimeRateTracker::new();
 
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -6211,52 +6355,68 @@ impl Cli {
     }
 
     pub async fn apply_performance_defaults(&mut self) -> Result<()> {
+        let before = (*self.config.snapshot()).clone();
         self.config.update(|c| c.reset_performance_fields());
-        self.apply_persisted_performance_live(true).await?;
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_info_line(format_args!(
-                " TUN inject queue default saved; applies on next reconnect/restart."
-            ))
-        );
+        let needs_reconnect_hint =
+            restart_sensitive_perf_changed(&before, self.config.snapshot().as_ref());
+        self.apply_persisted_performance_live(true, Some(&before))
+            .await?;
+        if needs_reconnect_hint {
+            crate::cli_println!(
+                "{}",
+                term_style::fmt_info_line(format_args!(
+                    " TUN inject queue default saved; applies on next reconnect/restart."
+                ))
+            );
+        }
         crate::cli_println!(
             "  ✓ Performance settings reset to factory defaults (saved to config)."
         );
         Ok(())
     }
 
-    async fn apply_performance_buffers_live(&mut self) -> Result<()> {
+    /// Apply UDP socket buffers and/or recreate Wintun for a new ring size.
+    ///
+    /// Wintun recreate briefly drops the adapter — only call with
+    /// `recreate_wintun_ring = true` when the effective ring size changed.
+    async fn apply_performance_buffers_live(
+        &mut self,
+        apply_socket_buffers: bool,
+        recreate_wintun_ring: bool,
+    ) -> Result<()> {
         let snap = self.config.snapshot();
-        let snd = effective_udp_sndbuf(snap.udp_sndbuf);
-        let rcv = effective_udp_rcvbuf(snap.udp_rcvbuf);
         let ring = effective_wintun_ring_bytes(snap.wintun_ring_bytes);
 
-        let (actual_snd, actual_rcv) = {
-            let (tx, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(EngineCmd::SetSocketBuffers {
-                    sndbuf: snd,
-                    rcvbuf: rcv,
-                    reply: tx,
-                })
-                .await
-                .map_err(|_| {
-                    anyhow!("engine unavailable: cannot apply socket buffer immediately")
-                })?;
-            match tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
-                Ok(Ok(v)) => v,
-                _ => {
-                    return Err(anyhow!("timeout applying socket buffers to runtime engine"));
+        if apply_socket_buffers {
+            let snd = effective_udp_sndbuf(snap.udp_sndbuf);
+            let rcv = effective_udp_rcvbuf(snap.udp_rcvbuf);
+            let (actual_snd, actual_rcv) = {
+                let (tx, rx) = oneshot::channel();
+                self.cmd_tx
+                    .send(EngineCmd::SetSocketBuffers {
+                        sndbuf: snd,
+                        rcvbuf: rcv,
+                        reply: tx,
+                    })
+                    .await
+                    .map_err(|_| {
+                        anyhow!("engine unavailable: cannot apply socket buffer immediately")
+                    })?;
+                match tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+                    Ok(Ok(v)) => v,
+                    _ => {
+                        return Err(anyhow!("timeout applying socket buffers to runtime engine"));
+                    }
                 }
-            }
-        };
-        self.config.update(|cfg| {
-            cfg.udp_sndbuf = actual_snd;
-            cfg.udp_rcvbuf = actual_rcv;
-        });
+            };
+            self.config.update(|cfg| {
+                cfg.udp_sndbuf = actual_snd;
+                cfg.udp_rcvbuf = actual_rcv;
+            });
+        }
 
         #[cfg(windows)]
-        {
+        if recreate_wintun_ring {
             if let Some(ref old_adapter) = self.vni {
                 let snap = self.config.snapshot();
                 let vip = snap.virtual_ip.clone();
@@ -6297,6 +6457,11 @@ impl Cli {
                     self.vni = Some(new_adapter);
                 }
             }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = (recreate_wintun_ring, ring);
         }
 
         Ok(())
@@ -7201,21 +7366,25 @@ impl RuntimeRateTracker {
     }
 }
 
-struct RuntimeTraceSession {
-    trace: Arc<RuntimeTrace>,
+struct RuntimeViewSession {
+    cmd_tx: mpsc::Sender<EngineCmd>,
 }
 
-impl RuntimeTraceSession {
-    fn enter(trace: Arc<RuntimeTrace>) -> Self {
-        trace.set_enabled(true);
-        trace.reset();
-        Self { trace }
+impl RuntimeViewSession {
+    async fn enter(cmd_tx: mpsc::Sender<EngineCmd>) -> Self {
+        let (tx, rx) = oneshot::channel();
+        let _ = cmd_tx.send(EngineCmd::RuntimeViewBegin { reply: tx }).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), rx).await;
+        Self { cmd_tx }
     }
 }
 
-impl Drop for RuntimeTraceSession {
+impl Drop for RuntimeViewSession {
     fn drop(&mut self) {
-        self.trace.set_enabled(false);
+        let (tx, _rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .try_send(EngineCmd::RuntimeViewEnd { reply: tx });
     }
 }
 
@@ -7337,6 +7506,57 @@ fn effective_wintun_ipv4_interface_metric(v: u32) -> u32 {
     }
 }
 
+fn effective_adapter_mtu(v: i32) -> i32 {
+    if (576..=1500).contains(&v) {
+        v
+    } else {
+        1340
+    }
+}
+
+/// Which disruptive adapter-side applies are needed when moving from `previous` → `next`.
+/// Soft knobs (pacing / FEC / advanced) are always applied by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdapterLiveApplyPlan {
+    apply_socket_buffers: bool,
+    recreate_wintun_ring: bool,
+    apply_netsh: bool,
+}
+
+fn adapter_live_apply_plan(
+    previous: Option<&crate::config::NetworkConfig>,
+    next: &crate::config::NetworkConfig,
+) -> AdapterLiveApplyPlan {
+    let Some(prev) = previous else {
+        return AdapterLiveApplyPlan {
+            apply_socket_buffers: true,
+            recreate_wintun_ring: true,
+            apply_netsh: true,
+        };
+    };
+    AdapterLiveApplyPlan {
+        apply_socket_buffers: effective_udp_sndbuf(prev.udp_sndbuf)
+            != effective_udp_sndbuf(next.udp_sndbuf)
+            || effective_udp_rcvbuf(prev.udp_rcvbuf) != effective_udp_rcvbuf(next.udp_rcvbuf),
+        recreate_wintun_ring: effective_wintun_ring_bytes(prev.wintun_ring_bytes)
+            != effective_wintun_ring_bytes(next.wintun_ring_bytes),
+        apply_netsh: effective_adapter_mtu(prev.adapter_mtu)
+            != effective_adapter_mtu(next.adapter_mtu)
+            || effective_wintun_ipv4_interface_metric(prev.wintun_ipv4_interface_metric)
+                != effective_wintun_ipv4_interface_metric(next.wintun_ipv4_interface_metric),
+    }
+}
+
+fn restart_sensitive_perf_changed(
+    previous: &crate::config::NetworkConfig,
+    next: &crate::config::NetworkConfig,
+) -> bool {
+    effective_wintun_ring_bytes(previous.wintun_ring_bytes)
+        != effective_wintun_ring_bytes(next.wintun_ring_bytes)
+        || previous.tun_inject_queue_packets != next.tun_inject_queue_packets
+        || previous.tun_from_adapter_queue_packets != next.tun_from_adapter_queue_packets
+}
+
 fn pace_spin_style_hint(tick_us: u64, spin_window_us: u64) -> &'static str {
     if spin_window_us == 0 {
         "HR/sleep only"
@@ -7433,5 +7653,84 @@ mod parasitic_lan_helpers_tests {
             8, 8, 8, 8
         ))));
         let _: SocketAddr = filtered[0];
+    }
+}
+
+#[cfg(test)]
+mod adapter_live_apply_plan_tests {
+    use super::{
+        adapter_live_apply_plan, restart_sensitive_perf_changed, AdapterLiveApplyPlan,
+        DEFAULT_WINTUN_RING_BYTES,
+    };
+    use crate::config::NetworkConfig;
+
+    #[test]
+    fn unchanged_perf_skips_all_disruptive_applies() {
+        let cfg = NetworkConfig::default();
+        let plan = adapter_live_apply_plan(Some(&cfg), &cfg);
+        assert_eq!(
+            plan,
+            AdapterLiveApplyPlan {
+                apply_socket_buffers: false,
+                recreate_wintun_ring: false,
+                apply_netsh: false,
+            }
+        );
+        assert!(!restart_sensitive_perf_changed(&cfg, &cfg));
+    }
+
+    #[test]
+    fn soft_knob_only_change_skips_adapter_work() {
+        let prev = NetworkConfig::default();
+        let mut next = prev.clone();
+        next.pace_tick_us = 999;
+        next.fec_enabled = !prev.fec_enabled;
+        next.advanced.timers.keepalive_secs = 42;
+        let plan = adapter_live_apply_plan(Some(&prev), &next);
+        assert_eq!(
+            plan,
+            AdapterLiveApplyPlan {
+                apply_socket_buffers: false,
+                recreate_wintun_ring: false,
+                apply_netsh: false,
+            }
+        );
+        assert!(!restart_sensitive_perf_changed(&prev, &next));
+    }
+
+    #[test]
+    fn ring_change_only_requests_wintun_recreate() {
+        let prev = NetworkConfig::default();
+        let mut next = prev.clone();
+        next.wintun_ring_bytes = DEFAULT_WINTUN_RING_BYTES * 2;
+        let plan = adapter_live_apply_plan(Some(&prev), &next);
+        assert!(plan.recreate_wintun_ring);
+        assert!(!plan.apply_socket_buffers);
+        assert!(!plan.apply_netsh);
+        assert!(restart_sensitive_perf_changed(&prev, &next));
+    }
+
+    #[test]
+    fn sockbuf_change_does_not_recreate_wintun() {
+        let prev = NetworkConfig::default();
+        let mut next = prev.clone();
+        next.udp_sndbuf = prev.udp_sndbuf + 64 * 1024;
+        let plan = adapter_live_apply_plan(Some(&prev), &next);
+        assert!(plan.apply_socket_buffers);
+        assert!(!plan.recreate_wintun_ring);
+        assert!(!plan.apply_netsh);
+    }
+
+    #[test]
+    fn missing_previous_forces_full_adapter_apply() {
+        let next = NetworkConfig::default();
+        assert_eq!(
+            adapter_live_apply_plan(None, &next),
+            AdapterLiveApplyPlan {
+                apply_socket_buffers: true,
+                recreate_wintun_ring: true,
+                apply_netsh: true,
+            }
+        );
     }
 }

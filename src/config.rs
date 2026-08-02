@@ -564,6 +564,10 @@ pub struct ConfigManager {
     inner: Mutex<NetworkConfig>,
     snapshot: ArcSwap<NetworkConfig>,
     save_tx: mpsc::Sender<NetworkConfig>,
+    /// Fingerprint of the last on-disk bytes we loaded or wrote.
+    /// Used to detect external edits and absorb their performance fields
+    /// before identity/peer saves can stomp them.
+    disk_fp: Arc<Mutex<Option<u64>>>,
 }
 
 #[derive(Default)]
@@ -689,6 +693,8 @@ impl ConfigManager {
     pub fn new(path: PathBuf) -> Arc<Self> {
         let (save_tx, save_rx) = mpsc::channel::<NetworkConfig>();
         let save_path = path.clone();
+        let disk_fp = Arc::new(Mutex::new(None));
+        let save_fp = disk_fp.clone();
         let _ = std::thread::Builder::new()
             .name("mint-config-save".to_string())
             .spawn(move || {
@@ -696,8 +702,9 @@ impl ConfigManager {
                     while let Ok(next) = save_rx.try_recv() {
                         pending = next;
                     }
-                    if let Err(err) = save_atomic(save_path.clone(), &pending) {
-                        eprintln!("config save failed: {err}");
+                    match prepare_and_save_atomic(&save_path, &mut pending, &save_fp) {
+                        Ok(()) => {}
+                        Err(err) => eprintln!("config save failed: {err}"),
                     }
                 }
             });
@@ -706,6 +713,7 @@ impl ConfigManager {
             inner: Mutex::new(NetworkConfig::default()),
             snapshot: ArcSwap::from_pointee(NetworkConfig::default()),
             save_tx,
+            disk_fp,
         })
     }
 
@@ -715,6 +723,9 @@ impl ConfigManager {
 
     pub fn update<F: FnOnce(&mut NetworkConfig)>(&self, updater: F) {
         let mut guard = self.inner.lock();
+        // Absorb external performance edits before mutating/saving so peer/session
+        // updates cannot rewrite NetInfo/config.toml back to stale perf defaults.
+        let _ = absorb_external_performance(&self.path, &self.disk_fp, &mut guard);
         updater(&mut guard);
         let snapshot = Arc::new(guard.clone());
         self.snapshot.store(snapshot.clone());
@@ -727,11 +738,13 @@ impl ConfigManager {
         }
         let raw = std::fs::read_to_string(&self.path)?;
         let cfg = parse_network_config_toml(&raw)?;
+        let fp = content_fingerprint(&raw);
         {
             let mut g = self.inner.lock();
             *g = cfg.clone();
         }
         self.snapshot.store(Arc::new(cfg));
+        *self.disk_fp.lock() = Some(fp);
         Ok(())
     }
 
@@ -742,6 +755,10 @@ impl ConfigManager {
         }
         let raw = std::fs::read_to_string(&self.path)?;
         let disk = parse_network_config_toml(&raw)?;
+        let fp = content_fingerprint(&raw);
+        // Mark disk as known before update so absorb is a no-op; we already hold
+        // the parsed performance fields we intend to apply.
+        *self.disk_fp.lock() = Some(fp);
         self.update(|live| live.merge_performance_from(&disk));
         Ok(())
     }
@@ -898,15 +915,63 @@ fn promote_tmp_to_path(tmp: &PathBuf, dest: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn save_atomic(path: PathBuf, cfg: &NetworkConfig) -> Result<()> {
+fn content_fingerprint(raw: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    raw.as_bytes().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// If on-disk bytes differ from our last known fingerprint, merge performance
+/// fields from disk into `live`. Returns `Err` when disk changed but is unparseable
+/// (caller must not overwrite that file).
+fn absorb_external_performance(
+    path: &PathBuf,
+    disk_fp: &Mutex<Option<u64>>,
+    live: &mut NetworkConfig,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    let fp = content_fingerprint(&raw);
+    {
+        let guard = disk_fp.lock();
+        if *guard == Some(fp) {
+            return Ok(());
+        }
+    }
+    let disk = parse_network_config_toml(&raw).map_err(|e| {
+        anyhow::anyhow!("on-disk config changed and is unparseable (refusing to overwrite): {e}")
+    })?;
+    live.merge_performance_from(&disk);
+    *disk_fp.lock() = Some(fp);
+    Ok(())
+}
+
+fn prepare_and_save_atomic(
+    path: &PathBuf,
+    cfg: &mut NetworkConfig,
+    disk_fp: &Mutex<Option<u64>>,
+) -> Result<()> {
+    absorb_external_performance(path, disk_fp, cfg)?;
+    save_atomic(path.clone(), cfg, disk_fp)
+}
+
+fn save_atomic(path: PathBuf, cfg: &NetworkConfig, disk_fp: &Mutex<Option<u64>>) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
+    let encoded = encode_network_config_toml(cfg)?;
     let tmp = unique_tmp_path(&path);
-    std::fs::write(&tmp, encode_network_config_toml(cfg)?)?;
+    std::fs::write(&tmp, &encoded)?;
     promote_tmp_to_path(&tmp, &path)?;
+    *disk_fp.lock() = Some(content_fingerprint(&encoded));
     Ok(())
 }
 
@@ -1161,10 +1226,16 @@ mod tests {
             "keepalive_secs must not be a root key: {raw}"
         );
         assert!(
-            raw.contains(
-                "probe_sizes = [1500, 1460, 1400, 1350, 1300, 1250, 1200, 1100, 1000, 576]"
-            ),
-            "probe_sizes must be a single inline line: {raw}"
+            raw.contains("probe_timeout_ms = 1000"),
+            "pmtud probe_timeout_ms default missing: {raw}"
+        );
+        assert!(
+            raw.contains("pmtud_tick_ms = 50"),
+            "timers pmtud_tick_ms default missing: {raw}"
+        );
+        assert!(
+            !raw.contains("probe_sizes"),
+            "probe_sizes must not appear in current config: {raw}"
         );
         assert!(
             raw.contains("apd_low_watermark = 0.1\n")
@@ -1409,6 +1480,56 @@ shard_payload_size = 9999
         assert_eq!(snap.membership_version, 99);
         assert_eq!(snap.udp_sndbuf, 222222);
         assert_eq!(snap.pace_tick_us, 12345);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn external_perf_edit_survives_identity_update_and_reload() {
+        let path = std::env::temp_dir().join(format!(
+            "mint-ext-perf-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let mgr = ConfigManager::new(path.clone());
+        mgr.update(|c| {
+            c.network_id = "live-net".into();
+            c.crypto_key = "secret".into();
+            c.udp_sndbuf = 131072;
+            c.pace_tick_us = 250;
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        // Simulate user editing NetInfo/config.toml while VPN is running.
+        let mut disk = mgr.snapshot().as_ref().clone();
+        disk.udp_sndbuf = 524288;
+        disk.pace_tick_us = 500;
+        std::fs::write(&path, encode_network_config_toml(&disk).unwrap()).unwrap();
+
+        // Concurrent identity/peer save must not stomp the external perf edit.
+        mgr.update(|c| c.membership_version = 7);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let on_disk = parse_network_config_toml(&raw).unwrap();
+        assert_eq!(on_disk.udp_sndbuf, 524288);
+        assert_eq!(on_disk.pace_tick_us, 500);
+        assert_eq!(on_disk.membership_version, 7);
+        assert_eq!(on_disk.network_id, "live-net");
+
+        // Live memory should have absorbed the external perf fields too.
+        let snap = mgr.snapshot();
+        assert_eq!(snap.udp_sndbuf, 524288);
+        assert_eq!(snap.pace_tick_us, 500);
+        assert_eq!(snap.membership_version, 7);
+
+        mgr.reload_performance_from_disk().unwrap();
+        let snap = mgr.snapshot();
+        assert_eq!(snap.udp_sndbuf, 524288);
+        assert_eq!(snap.pace_tick_us, 500);
+        assert_eq!(snap.network_id, "live-net");
         let _ = std::fs::remove_file(&path);
     }
 

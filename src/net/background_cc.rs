@@ -5,21 +5,21 @@ use std::net::SocketAddr;
 
 use crate::routing::failover;
 
-pub const DEFAULT_BURST_CAP_BYTES: u64 = 16_000;
-pub const DEFAULT_GAIN: f64 = 0.35;
-pub const DEFAULT_MIN_DECREASE_FACTOR: f64 = 0.85;
-pub const DEFAULT_ADDITIVE_INCREASE_BPS: f64 = 48_000.0;
-pub const DEFAULT_RATE_SMOOTHING_ALPHA: f64 = 0.8;
-pub const DEFAULT_MIN_RATE_BPS: f64 = 1_500_000.0;
-pub const DEFAULT_MAX_RATE_BPS: f64 = 20_000_000.0;
-pub const DEFAULT_INITIAL_RATE_BPS: f64 = 8_000_000.0;
-pub const DEFAULT_LOSS_MD: f64 = 0.85;
-pub const DEFAULT_HOL_ESCAPE_MS: u32 = 5;
-pub const DEFAULT_TARGET_QUEUE_DELAY_MS: u32 = 10;
-pub const DEFAULT_DELIVERY_RATE_WINDOW_MS: u32 = 500;
+pub const DEFAULT_BURST_CAP_BYTES: u64 = 12_000;
+pub const DEFAULT_GAIN: f64 = 0.1;
+pub const DEFAULT_MIN_DECREASE_FACTOR: f64 = 0.9;
+pub const DEFAULT_ADDITIVE_INCREASE_BPS: f64 = 8_000.0;
+pub const DEFAULT_RATE_SMOOTHING_ALPHA: f64 = 0.9;
+pub const DEFAULT_MIN_RATE_BPS: f64 = 1_000_000.0;
+pub const DEFAULT_MAX_RATE_BPS: f64 = 12_000_000.0;
+pub const DEFAULT_INITIAL_RATE_BPS: f64 = 1_500_000.0;
+pub const DEFAULT_LOSS_MD: f64 = 0.9;
+pub const DEFAULT_HOL_ESCAPE_MS: u32 = 12;
+pub const DEFAULT_TARGET_QUEUE_DELAY_MS: u32 = 15;
+pub const DEFAULT_DELIVERY_RATE_WINDOW_MS: u32 = 750;
 pub const DEFAULT_DELIVERY_RATE_EWMA_ALPHA: f64 = 0.25;
-pub const DEFAULT_DELIVERY_ANCHOR_FACTOR: f64 = 0.9;
-pub const DEFAULT_DELIVERY_DECOUPLE_RATIO: f64 = 1.25;
+pub const DEFAULT_DELIVERY_ANCHOR_FACTOR: f64 = 0.95;
+pub const DEFAULT_DELIVERY_DECOUPLE_RATIO: f64 = 1.5;
 pub const DEFAULT_CONGESTION_LOSS_THRESHOLD: f64 = 0.7;
 
 /// Runtime copy of user tuning (from `CongestionTuning`).
@@ -378,6 +378,8 @@ mod tests {
             enabled: true,
             target_queue_delay_ms: 20,
             min_rate_bps: 8_000.0,
+            // Pin gain so delay_ratio=2 hits min_decrease clamp (0.85), independent of prod default.
+            gain: 0.35,
             ..BackgroundCcConfig::default()
         }
     }
@@ -444,7 +446,7 @@ mod tests {
         let mut st = PeerCcState::new(100_000.0);
         let cfg = test_cfg();
         let mut c = CcUpdateCounters::default();
-        // qd=40, target=20 → delay_ratio=2 → raw = 1 - 0.35*1 = 0.65 → clamp to min_decrease 0.85
+        // qd=40, target=20 → delay_ratio=2 → raw = 1 - 0.35*1 = 0.65 → clamp to min_decrease
         apply_background_cc_rate_update(&mut st, &cfg, 40.0, 0.0, &mut c);
         assert!((st.rate_bps - 100_000.0 * cfg.min_decrease_factor).abs() < 1e-6);
         assert_eq!(c.delivery_anchor_events, 0);

@@ -16,7 +16,10 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::metrics::EngineMetrics;
+
 use super::background_cc::{BackgroundCcConfig, CcUpdateCounters};
+use super::outbound_udp::OutboundUdpClock;
 use super::pace_clock::PaceClockShared;
 use super::pacing::{ApdPhase, PacingConfig, PacingEngine, PacingQueueSnapshot, TickResult};
 
@@ -209,6 +212,7 @@ pub enum PacingCommand {
         config: BackgroundCcConfig,
     },
     ResetSession,
+    ResetObservabilityCounters,
     Stop,
 }
 
@@ -398,6 +402,17 @@ impl PacingWorkerHandle {
         let _ = self.cmd_tx.send(PacingCommand::ResetSession).await;
     }
 
+    pub fn reset_observability_counters(&self) {
+        let _ = self.send_cmd_spin(PacingCommand::ResetObservabilityCounters);
+    }
+
+    pub async fn reset_observability_counters_async(&self) {
+        let _ = self
+            .cmd_tx
+            .send(PacingCommand::ResetObservabilityCounters)
+            .await;
+    }
+
     pub fn request_stop(&mut self) -> Option<JoinHandle<()>> {
         self.stop.store(true, Ordering::Release);
         let _ = self.cmd_tx.try_send(PacingCommand::Stop);
@@ -422,6 +437,8 @@ pub fn start_pacing_worker(
     socket: Arc<UdpSocket>,
     clock_shared: Arc<PaceClockShared>,
     initial: PacingEngine,
+    outbound_udp: Arc<OutboundUdpClock>,
+    metrics: Arc<EngineMetrics>,
 ) -> PacingWorkerSpawn {
     let (cmd_tx, cmd_rx) = mpsc::channel(PACING_CMD_CHANNEL_CAP);
     let (tick_tx, tick_rx) = mpsc::channel(1);
@@ -442,6 +459,8 @@ pub fn start_pacing_worker(
                 event_tx,
                 obs_w,
                 stop_w,
+                outbound_udp,
+                metrics,
             );
         })
         .expect("mint-pacing thread");
@@ -527,6 +546,10 @@ fn handle_command(pacing: &mut PacingEngine, cmd: PacingCommand) -> (bool, bool)
             pacing.reset_session_runtime();
             (false, true)
         }
+        PacingCommand::ResetObservabilityCounters => {
+            pacing.reset_observability_counters();
+            (false, true)
+        }
         PacingCommand::Stop => (true, false),
     }
 }
@@ -540,6 +563,8 @@ fn pacing_worker_main(
     event_tx: mpsc::UnboundedSender<PacingEvent>,
     obs: Arc<ArcSwap<PacingObs>>,
     stop: Arc<AtomicBool>,
+    outbound_udp: Arc<OutboundUdpClock>,
+    metrics: Arc<EngineMetrics>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -586,7 +611,12 @@ fn pacing_worker_main(
                         return;
                     }
                     let started = Instant::now();
-                    let tick_result = pacing.tick(&socket);
+                    let outbound = outbound_udp.clone();
+                    let metrics_note = metrics.clone();
+                    let tick_result = pacing.tick_noting(&socket, move |dest| {
+                        outbound.note(dest);
+                        metrics_note.inc_outbound_note();
+                    });
                     publish_apd(&clock_shared, &pacing);
                     publish_obs(&obs, &pacing);
                     let tick_duration_us = started.elapsed().as_micros() as u64;
@@ -626,7 +656,13 @@ mod tests {
 
     fn spawn_worker(socket: Arc<UdpSocket>) -> PacingWorkerSpawn {
         let shared = Arc::new(PaceClockShared::new(PaceClockApply::default(), 1000));
-        start_pacing_worker(socket, shared, PacingEngine::new())
+        start_pacing_worker(
+            socket,
+            shared,
+            PacingEngine::new(),
+            crate::net::outbound_udp::OutboundUdpClock::shared(),
+            Arc::new(crate::metrics::EngineMetrics::new()),
+        )
     }
 
     #[tokio::test]

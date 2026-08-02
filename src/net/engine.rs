@@ -34,12 +34,16 @@ use crate::net::decentralized::{
     DecentralizedState, HttpAnnounceResult, TrackerDatagramEvent, DECENTRALIZED_RESOLVE_TIMEOUT,
 };
 use crate::net::fec::{
-    adaptive_fec_ratio_hyst_tuned, effective_shard_payload_size, FecDecoder, FecEncoder, FecOutput,
+    adaptive_fec_ratio_hyst_tuned, effective_shard_payload_size, fec_delay_is_congestive,
+    FecDecoder, FecEncoder, FecOutput,
 };
 use crate::net::msyn_sync::{
-    build_msyn_delta_body, clear_pending_delivered, collect_removed_vips, msyn_full_body_string,
-    peer_owes_removals, should_advance_peer_sync_after_send,
+    build_msyn_delta_shards, build_msyn_full_shards, clear_pending_delivered, collect_removed_vips,
+    effective_msyn_json_budget, ingest_msyn_part, peer_owes_removals,
+    routes_from_snapshot_non_stale, should_advance_peer_sync_after_send, sweep_msyn_assemble,
+    MsynAssembleMap, MsynIngestOutcome, ShardError, MSYN_APPLY_MAX_REMOVED, MSYN_APPLY_MAX_ROUTES,
 };
+use crate::net::outbound_udp::OutboundUdpClock;
 use crate::net::pacing::PacingQueueSnapshot;
 use crate::net::pacing::{ApdPhase, PacingConfig, PacingEngine};
 use crate::net::pacing_worker::{start_pacing_worker, PacingEvent, PacingWorkerHandle};
@@ -47,7 +51,10 @@ use crate::net::packet::*;
 use crate::net::punch_workflow;
 use crate::net::reliable::{ReliableChannel, SendResult};
 use crate::net::retransmit::RetransmitDirectSender;
-use crate::pmtud::PathMtuDiscovery;
+use crate::net::size_loss::{replay_gap, SizeLossTable};
+use crate::pmtud::{
+    PathMtuDiscovery, PeerMtuSnapshot, PeerTickInput, SizeHealth, MIN_ADAPTER_PAYLOAD_MTU,
+};
 use crate::routing::{
     owner_vip_with_prefix, same_subnet, should_relay, should_relay_snap, PathKind, RelaySelection,
     RouteState, RoutingTable,
@@ -225,6 +232,14 @@ pub enum EngineCmd {
     QueryRuntimeSnapshot {
         reply: oneshot::Sender<RuntimeSnapshot>,
     },
+    /// Enable + reset dashboard counters / traffic trace for a `runtime` view session.
+    RuntimeViewBegin {
+        reply: oneshot::Sender<()>,
+    },
+    /// Disable + reset dashboard counters / traffic trace when leaving `runtime`.
+    RuntimeViewEnd {
+        reply: oneshot::Sender<()>,
+    },
     StartDecentralized {
         room_id: [u8; 20],
         trackers: Vec<String>,
@@ -254,6 +269,7 @@ pub struct RuntimeSnapshot {
     pub udp_rcvbuf: i32,
     pub tun_inject_capacity: usize,
     pub tun_inject_receivers: usize,
+    pub pmtud_peers: Vec<PeerMtuSnapshot>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -534,6 +550,7 @@ pub struct P2PEngine {
     decrypt_scratch: BytesMut,
     rawperf_mode: bool,
     pub pmtud: PathMtuDiscovery,
+    size_loss: SizeLossTable,
     pub bcast_dedup: BroadcastDeduplicator,
     pub tun_rx: mpsc::Receiver<Bytes>,
     pub cmd_rx: mpsc::Receiver<EngineCmd>,
@@ -580,7 +597,6 @@ pub struct P2PEngine {
     ping_watchdog_interval: Interval,
     cc_probe_interval: Interval,
     cc_probe_cursor: usize,
-    pmtud_probe_stop: Option<Arc<AtomicBool>>,
     para_notify_txs: HashMap<u64, mpsc::Sender<ParaSignal>>,
     next_para_listener_id: u64,
     metrics: Arc<EngineMetrics>,
@@ -600,6 +616,8 @@ pub struct P2PEngine {
     peer_pending_removals: HashMap<String, HashSet<String>>,
 
     msyn_applied_to_rev: u64,
+    next_msyn_sync_id: u64,
+    msyn_assemble: MsynAssembleMap,
     rx_bytes_pending: HashMap<SocketAddr, u64>,
     last_seen_pending: HashMap<SocketAddr, Instant>,
     rx_bytes_pending_vip: HashMap<u32, u64>,
@@ -621,6 +639,7 @@ pub struct P2PEngine {
     reconnect_fastpath_last_ep: Option<SocketAddr>,
     reconnect_fastpath_last_at: Option<Instant>,
     peer_reconnect_cooldown_until: HashMap<String, Instant>,
+    outbound_udp: Arc<OutboundUdpClock>,
 }
 
 struct PendingPing {
@@ -667,6 +686,8 @@ fn new_pacing_stack(
     pace_clock_apply: PaceClockApply,
     initial_pace_tick_us: u64,
     initial_pacing: PacingEngine,
+    outbound_udp: Arc<OutboundUdpClock>,
+    metrics: Arc<EngineMetrics>,
 ) -> (PacingWorkerHandle, mpsc::Sender<()>, PacingThreadControl) {
     let tick = pace_clock::clamp_tick_us(initial_pace_tick_us);
     let tick_skips = Arc::new(AtomicU64::new(0));
@@ -679,7 +700,13 @@ fn new_pacing_stack(
         cfg.tick_us = tick;
         initial_pacing.set_config(cfg);
     }
-    let spawn = start_pacing_worker(socket, shared.clone(), initial_pacing);
+    let spawn = start_pacing_worker(
+        socket,
+        shared.clone(),
+        initial_pacing,
+        outbound_udp,
+        metrics,
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let join = pace_clock::start_pace_clock_thread(
@@ -828,11 +855,14 @@ impl P2PEngine {
         stale_evict_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut rx_bw_flush_interval = interval(Duration::from_millis(250));
         rx_bw_flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let outbound_udp = OutboundUdpClock::shared();
         let (pacing, pacing_tick_tx, pacing_thread) = new_pacing_stack(
             socket.clone(),
             pace_clock_apply,
             initial_pace_tick_us,
             PacingEngine::new(),
+            outbound_udp.clone(),
+            metrics.clone(),
         );
         let mut stun_poll_interval = interval(Duration::from_millis(200));
         stun_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -886,6 +916,7 @@ impl P2PEngine {
             decrypt_scratch: BytesMut::with_capacity(default_buffers.decrypt_scratch_bytes),
             rawperf_mode: false,
             pmtud: PathMtuDiscovery::new(),
+            size_loss: SizeLossTable::new(),
             bcast_dedup: BroadcastDeduplicator::new(),
             tun_rx,
             cmd_rx,
@@ -956,7 +987,6 @@ impl P2PEngine {
             ping_watchdog_interval,
             cc_probe_interval,
             cc_probe_cursor: 0,
-            pmtud_probe_stop: None,
             para_notify_txs: HashMap::new(),
             next_para_listener_id: 1,
             metrics,
@@ -972,6 +1002,8 @@ impl P2PEngine {
             peer_sync_state: HashMap::new(),
             peer_pending_removals: HashMap::new(),
             msyn_applied_to_rev: 0,
+            next_msyn_sync_id: 1,
+            msyn_assemble: HashMap::new(),
             rx_bytes_pending: HashMap::new(),
             last_seen_pending: HashMap::new(),
             rx_bytes_pending_vip: HashMap::new(),
@@ -992,6 +1024,7 @@ impl P2PEngine {
             reconnect_fastpath_last_ep: None,
             reconnect_fastpath_last_at: None,
             peer_reconnect_cooldown_until: HashMap::new(),
+            outbound_udp,
         }
     }
 
@@ -1624,11 +1657,13 @@ impl P2PEngine {
         self.state.control_ciphers.clear();
         self.state.data_send_ctr.clear();
         self.state.data_replay.clear();
+        self.size_loss.clear();
     }
 
     fn clear_data_crypto_for_vip(&mut self, vip_u32: u32) {
         self.state.data_send_ctr.remove(&vip_u32);
         self.state.data_replay.remove(&vip_u32);
+        self.size_loss.remove_vip(vip_u32);
         self.state
             .data_ciphers
             .retain(|(sender, receiver), _| *sender != vip_u32 && *receiver != vip_u32);
@@ -1692,9 +1727,6 @@ impl P2PEngine {
             stop.store(true, Ordering::Release);
         }
         for (_, stop) in self.peer_keepalive_stops.drain() {
-            stop.store(true, Ordering::Release);
-        }
-        if let Some(stop) = self.pmtud_probe_stop.take() {
             stop.store(true, Ordering::Release);
         }
     }
@@ -1772,6 +1804,8 @@ impl P2PEngine {
         self.peer_sync_state.clear();
         self.peer_pending_removals.clear();
         self.msyn_applied_to_rev = 0;
+        self.next_msyn_sync_id = 1;
+        self.msyn_assemble.clear();
         {
             let mut rt = self.routing.write();
             *rt = RoutingTable::new();
@@ -1799,6 +1833,7 @@ impl P2PEngine {
         self.rx_bytes_pending_vip.clear();
         self.last_seen_pending.clear();
         self.reliable.reset_session();
+        self.outbound_udp.clear();
         self.restart_pacing_after_session_reset().await;
     }
 
@@ -1810,14 +1845,23 @@ impl P2PEngine {
         engine.set_config(prev_cfg);
         engine.reset_session_runtime();
         let tick = pace_clock::clamp_tick_us(engine.config.tick_us);
-        let (pacing, pacing_tick_tx, pacing_thread) =
-            new_pacing_stack(self.socket.clone(), apply, tick, engine);
+        let (pacing, pacing_tick_tx, pacing_thread) = new_pacing_stack(
+            self.socket.clone(),
+            apply,
+            tick,
+            engine,
+            self.outbound_udp.clone(),
+            self.metrics.clone(),
+        );
         self.pacing = pacing;
         self.pacing_tick_tx = pacing_tick_tx;
         self.pacing_thread = pacing_thread;
     }
 
     fn refresh_pacing_thread_metrics(&self) {
+        if !self.metrics.is_enabled() {
+            return;
+        }
         self.metrics
             .set_pacing_tick_skips(self.pacing_thread.tick_skips.load(Ordering::Relaxed));
         self.metrics
@@ -1868,6 +1912,28 @@ impl P2PEngine {
             obs.cc_counters.delivery_anchor_events,
             obs.cc_counters.loss_ignored_random_events,
         );
+    }
+
+    async fn runtime_view_begin(&mut self) {
+        self.pacing.reset_observability_counters_async().await;
+        self.pacing_thread.tick_skips.store(0, Ordering::Relaxed);
+        self.pacing_thread.overshoots.store(0, Ordering::Relaxed);
+        self.pacing_thread
+            .adaptive_fallbacks
+            .store(0, Ordering::Relaxed);
+        self.retransmit_sender.sent_direct = 0;
+        self.retransmit_sender.sent_fallback = 0;
+        self.metrics.reset();
+        self.metrics.set_enabled(true);
+        self.runtime_trace.reset();
+        self.runtime_trace.set_enabled(true);
+    }
+
+    fn runtime_view_end(&self) {
+        self.metrics.set_enabled(false);
+        self.metrics.reset();
+        self.runtime_trace.set_enabled(false);
+        self.runtime_trace.reset();
     }
 
     pub async fn run(mut self) {
@@ -1929,7 +1995,7 @@ impl P2PEngine {
                     }
                 }
                 _ = self.keepalive_interval.tick() => {
-                    self.send_keepalives();
+                    self.send_keepalives().await;
                 }
                 _ = self.sync_interval.tick() => {
                     if self.state.is_owner {
@@ -1940,7 +2006,7 @@ impl P2PEngine {
                     self.direct_retry_tick();
                 }
                 _ = self.pmtud_interval.tick() => {
-                    self.send_pmtud_probes().await;
+                    self.drive_pmtud_tick().await;
                 }
                 _ = self.stale_evict_interval.tick() => {
                     let stale_age = Duration::from_secs(self.advanced_tuning.timers.stale_evict_secs);
@@ -1981,7 +2047,7 @@ impl P2PEngine {
                         self.invalidate_fec_loss_ewma_cache(ep);
                         self.state.crypto_keys.unbind_peer(ep);
                         self.reliable.flush_dest(ep);
-                        self.pacing.remove_peer(ep);
+                        self.remove_peer_endpoint(ep);
                         self.fec_decoders.remove(&ep);
                         self.fec_send_by_dest.remove(&ep);
                     }
@@ -2018,7 +2084,7 @@ impl P2PEngine {
                             }
                         }
                     }
-                    {
+                    if self.metrics.is_enabled() {
                         let obs = self.pacing.load_obs();
                         self.metrics.set_pacing_dropped(obs.dropped_packets);
                         self.metrics.set_pacing_drop_data_normal(obs.dropped_data);
@@ -2027,8 +2093,8 @@ impl P2PEngine {
                             .set_pacing_drop_control_normal(obs.dropped_control_normal);
                         self.metrics
                             .set_pacing_drop_control_retransmit(obs.dropped_control_retransmit);
+                        self.refresh_pacing_thread_metrics();
                     }
-                    self.refresh_pacing_thread_metrics();
                     self.flush_fec_encoders();
                     self.reliable.tick_into(
                         &mut self.reliable_tick_buf,
@@ -2118,7 +2184,13 @@ impl P2PEngine {
         let sz = u16::from_be_bytes([body[0], body[1]]) as usize;
         let session_id = u32::from_be_bytes([body[2], body[3], body[4], body[5]]);
         let probe_id = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
-        let (_, min_changed) = self.pmtud.record(from, sz, session_id, probe_id);
+        let (ok, min_changed, ev) =
+            self.pmtud
+                .on_ack(from, sz, probe_id, session_id, Instant::now());
+        if ok {
+            self.metrics.inc_pmtud_probe_acks();
+        }
+        self.metrics.add_pmtud_events(ev);
         if min_changed {
             let enc_overhead = if self.has_crypto() {
                 MENC_WIRE_OVERHEAD
@@ -2226,11 +2298,24 @@ impl P2PEngine {
                     )
                     .is_ok()
                 {
+                    let now = Instant::now();
+                    let frame_len = COMPACT_HEADER_LEN + body.len();
+                    let gap = {
+                        let top = self
+                            .state
+                            .data_replay
+                            .get(&peer_vip_u32)
+                            .map(|w| w.top())
+                            .unwrap_or(None);
+                        replay_gap(top, counter)
+                    };
                     self.state
                         .data_replay
                         .entry(peer_vip_u32)
                         .or_insert_with(DataReplayWindow::new)
                         .commit(counter);
+                    self.size_loss
+                        .note_encrypted_commit(peer_vip_u32, frame_len, gap, now);
                     let plain = self.decrypt_scratch.split().freeze();
                     self.handle_mdat_like(plain, from).await;
                 }
@@ -2248,6 +2333,10 @@ impl P2PEngine {
                 self.plain_data_scratch.reserve(body.len());
                 self.plain_data_scratch.extend_from_slice(body);
                 let plain = self.plain_data_scratch.split().freeze();
+                if let Some(vip) = self.endpoint_to_vip_u32(from) {
+                    let frame_len = COMPACT_HEADER_LEN + body.len();
+                    self.size_loss.note_rx(vip, frame_len, Instant::now());
+                }
                 self.handle_mdat_like(plain, from).await;
             }
             CompactPacketType::Ping => {
@@ -2850,7 +2939,7 @@ impl P2PEngine {
                     self.invalidate_fec_loss_ewma_cache(ep);
                     self.state.crypto_keys.unbind_peer(ep);
                     self.reliable.flush_dest(ep);
-                    self.pacing.remove_peer(ep);
+                    self.remove_peer_endpoint(ep);
                     self.fec_decoders.remove(&ep);
                     self.fec_send_by_dest.remove(&ep);
                 }
@@ -3012,6 +3101,7 @@ impl P2PEngine {
                 self.peer_keepalive_stops.insert(key, stop.clone());
                 let socket = self.socket.clone();
                 let state_view = self.state_view.clone();
+                let outbound = self.outbound_udp.clone();
                 let interval = Duration::from_millis(interval_ms.max(100));
                 tokio::spawn(async move {
                     loop {
@@ -3034,8 +3124,12 @@ impl P2PEngine {
                             &keepalive_body,
                         );
                         for target in &targets {
-                            let _ = socket.send_to(&hpch, target).await;
-                            let _ = socket.send_to(&kpal, target).await;
+                            if socket.send_to(&hpch, target).await.is_ok() {
+                                outbound.note(*target);
+                            }
+                            if socket.send_to(&kpal, target).await.is_ok() {
+                                outbound.note(*target);
+                            }
                         }
                         tokio::time::sleep(interval).await;
                     }
@@ -3106,8 +3200,19 @@ impl P2PEngine {
                     udp_rcvbuf: self.applied_udp_rcvbuf,
                     tun_inject_capacity: self.tun_inject_capacity,
                     tun_inject_receivers: self.state.tun_inject_tx.receiver_count(),
+                    pmtud_peers: self.pmtud.snapshot(),
                 };
                 let _ = reply.send(snap);
+                false
+            }
+            EngineCmd::RuntimeViewBegin { reply } => {
+                self.runtime_view_begin().await;
+                let _ = reply.send(());
+                false
+            }
+            EngineCmd::RuntimeViewEnd { reply } => {
+                self.runtime_view_end();
+                let _ = reply.send(());
                 false
             }
             EngineCmd::SetPaceClock(apply) => {
@@ -3517,8 +3622,100 @@ impl P2PEngine {
         }
     }
 
-    fn send_keepalives(&mut self) {
+    fn apply_hb_body(&mut self, body: &[u8], from: SocketAddr, authenticated: bool) {
+        self.touch_routing_endpoint(from);
+        if body.is_empty() {
+            return;
+        }
+        if let Ok(vip) = std::str::from_utf8(body).map(str::trim) {
+            if vip.parse::<Ipv4Addr>().is_ok() {
+                self.learn_route_from_hole_punch_body(body, from, true, authenticated);
+
+                if !self.state.is_owner
+                    && !self.state.owner_vip_cached.is_empty()
+                    && vip == self.state.owner_vip_cached.as_str()
+                    && (authenticated || !self.has_crypto())
+                {
+                    self.state.owner_ep = Some(from);
+                    self.state.owner_ep_trusted = true;
+                    let owner_vip_str = self.state.owner_vip_cached.clone();
+                    self.remember_endpoint(&owner_vip_str, from);
+                }
+            }
+        }
+    }
+
+    async fn apply_hol_body(&mut self, body: &[u8], from: SocketAddr, authenticated: bool) {
+        self.learn_route_from_hole_punch_body(body, from, false, authenticated);
+        self.try_stop_ice_checks_for_join_peer(from, body);
+        self.send_ctrl_signed_to(from, PKT_HACK, self.state.my_vip.as_bytes())
+            .await;
+    }
+
+    async fn handle_mctl(&mut self, body: &[u8], from: SocketAddr, authenticated: bool) {
+        let msyn_max = self.advanced_tuning.engine_limits.msyn_body_max;
+        let Some(parsed) = parse_mctl(body, msyn_max) else {
+            return;
+        };
+        if (parsed.flags & MCTL_FLAG_MSYN) != 0 && !authenticated {
+            return;
+        }
+        if parsed.signaling_ok {
+            if let Some(vip) = parsed.vip.as_deref() {
+                if (parsed.flags & MCTL_FLAG_HB) != 0 {
+                    self.apply_hb_body(vip, from, authenticated);
+                }
+                if (parsed.flags & MCTL_FLAG_HOL) != 0 {
+                    self.apply_hol_body(vip, from, authenticated).await;
+                }
+            }
+        }
+        if parsed.msyn_ok {
+            if let Some(msyn) = parsed.msyn.as_deref() {
+                self.handle_msyn_body(msyn, from).await;
+            }
+        }
+    }
+
+    async fn send_mctl(
+        &mut self,
+        dest: SocketAddr,
+        flags: u16,
+        vip: Option<&[u8]>,
+        msyn: Option<&[u8]>,
+    ) -> bool {
+        let Some(body) = encode_mctl(flags, vip, msyn) else {
+            return false;
+        };
+        if body.len() > self.advanced_tuning.engine_limits.msyn_body_max {
+            return false;
+        }
+        self.send_control_packet(dest, PKT_MCTL, &body).await
+    }
+
+    fn note_outbound_udp(&self, dest: SocketAddr) {
+        let poison_before = self.outbound_udp.poison_recover_total();
+        self.outbound_udp.note(dest);
+        self.metrics.inc_outbound_note();
+        if self.outbound_udp.poison_recover_total() > poison_before {
+            self.metrics.inc_outbound_note_poison_recover();
+        }
+    }
+
+    fn forget_outbound_udp(&self, dest: SocketAddr) {
+        self.outbound_udp.remove(dest);
+    }
+
+    fn remove_peer_endpoint(&mut self, ep: SocketAddr) {
+        self.pacing.remove_peer(ep);
+        self.forget_outbound_udp(ep);
+        self.pmtud.remove_peer(ep);
+    }
+
+    async fn send_keepalives(&mut self) {
         let body = self.state.my_vip.clone().into_bytes();
+        let now = Instant::now();
+        let keepalive = Duration::from_secs(self.advanced_tuning.timers.keepalive_secs);
 
         let (routes, owner_extra) = {
             let rt = self.routing.read();
@@ -3528,24 +3725,42 @@ impl P2PEngine {
                 .filter(|&ep| !rt.tracks_endpoint(ep));
             (routes, owner_extra)
         };
+
+        let mut retain_keys: HashSet<SocketAddr> = routes.iter().copied().collect();
+        if let Some(ep) = owner_extra {
+            retain_keys.insert(ep);
+        }
+        self.outbound_udp.retain_only(&retain_keys);
+        sweep_msyn_assemble(&mut self.msyn_assemble, now);
+
         for &ep in &routes {
-            let pkt =
-                self.build_signed_or_plain_reuse(self.outbound_crypto_key_for(ep), PKT_KPAL, &body);
-            self.pacing.enqueue_control(pkt, ep);
+            if !self.outbound_udp.needs_refresh(ep, now, keepalive) {
+                self.metrics.inc_keepalive_suppressed();
+                continue;
+            }
+            if self
+                .send_mctl(ep, MCTL_FLAG_HB, Some(body.as_slice()), None)
+                .await
+            {
+                self.metrics.inc_keepalive_sent();
+            }
         }
         if let Some(owner_ep) = owner_extra {
-            let kpal = self.build_signed_or_plain_reuse(
-                self.outbound_crypto_key_for(owner_ep),
-                PKT_KPAL,
-                &body,
-            );
-            self.pacing.enqueue_control(kpal, owner_ep);
-            let hpch = self.build_signed_or_plain_reuse(
-                self.outbound_crypto_key_for(owner_ep),
-                PKT_HPCH,
-                &body,
-            );
-            self.pacing.enqueue_control(hpch, owner_ep);
+            if !self.outbound_udp.needs_refresh(owner_ep, now, keepalive) {
+                self.metrics.inc_keepalive_suppressed();
+                return;
+            }
+            if self
+                .send_mctl(
+                    owner_ep,
+                    MCTL_FLAG_HB | MCTL_FLAG_HOL,
+                    Some(body.as_slice()),
+                    None,
+                )
+                .await
+            {
+                self.metrics.inc_keepalive_sent();
+            }
         }
     }
 
@@ -3556,7 +3771,11 @@ impl P2PEngine {
             tag,
             body,
         );
-        self.socket.send_to(&pkt, dest).await.is_ok()
+        let ok = self.socket.send_to(&pkt, dest).await.is_ok();
+        if ok {
+            self.note_outbound_udp(dest);
+        }
+        ok
     }
 
     fn control_race_dests(&self, primary: SocketAddr) -> Vec<SocketAddr> {
@@ -3688,6 +3907,7 @@ impl P2PEngine {
             t if t == *PKT_HPCH
                 || t == *PKT_HACK
                 || t == *PKT_KPAL
+                || t == *PKT_MCTL
                 || t == *PKT_JACK
         );
         if !authenticated {
@@ -3992,181 +4212,7 @@ impl P2PEngine {
             if self.state.is_owner {
                 return;
             }
-
-            if body.len() > self.advanced_tuning.engine_limits.msyn_body_max {
-                return;
-            }
-            let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-                return;
-            };
-            let Some(proto_ver) = v.get("proto_ver").and_then(|x| x.as_u64()) else {
-                return;
-            };
-            if proto_ver != 3 {
-                return;
-            }
-            let from_rev = v.get("from_rev").and_then(|x| x.as_u64()).unwrap_or(0);
-            let to_rev_opt = v.get("to_rev").and_then(|x| x.as_u64());
-            if let Some(tr) = to_rev_opt {
-                if tr <= self.msyn_applied_to_rev {
-                    return;
-                }
-            }
-            self.stop_all_peer_reconnect_workflows();
-            if let Some(removed) = v.get("removed").and_then(|x| x.as_array()) {
-                let (evicted_eps, removed_peers) = {
-                    let mut rt = self.routing.write();
-                    let mut evicted_eps = Vec::new();
-                    let mut removed_peers = Vec::new();
-                    for item in removed.iter().take(1024) {
-                        if let Some(vip) = item.as_str() {
-                            if is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix)
-                            {
-                                let node_id = rt.table.get(vip).and_then(|e| {
-                                    (!e.node_id.is_empty()).then(|| e.node_id.to_string())
-                                });
-                                if let Some(ep) = rt.lookup(vip) {
-                                    evicted_eps.push(ep);
-                                }
-                                rt.remove(vip);
-                                removed_peers.push((vip.to_string(), node_id));
-                            }
-                        }
-                    }
-                    (evicted_eps, removed_peers)
-                };
-                for (vip, node_id) in removed_peers {
-                    self.on_peer_route_removed(&vip, node_id.as_deref());
-                    if !self.state.is_owner {
-                        self.notify_roster_remove(&vip);
-                        self.stop_peer_reconnect_for_vip(&vip);
-                    }
-                }
-                for ep in evicted_eps {
-                    self.invalidate_fec_loss_ewma_cache(ep);
-                    self.state.crypto_keys.unbind_peer(ep);
-                    self.reliable.flush_dest(ep);
-                    self.pacing.remove_peer(ep);
-                    self.fec_decoders.remove(&ep);
-                    self.fec_send_by_dest.remove(&ep);
-                }
-            }
-            let Some(routes) = v.get("routes").and_then(|x| x.as_array()) else {
-                return;
-            };
-            self.touch_routing_endpoint(from);
-            let max_routes = 1024usize;
-            let mut updates: Vec<(String, SocketAddr, Option<String>)> = Vec::new();
-            for r in routes.iter().take(max_routes) {
-                let Some(vip) = r.get("vip").and_then(|x| x.as_str()) else {
-                    continue;
-                };
-                if !is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix) {
-                    continue;
-                }
-                let Some(ep) = r.get("ep").and_then(|x| x.as_str()) else {
-                    continue;
-                };
-                if let Ok(addr) = ep.parse::<SocketAddr>() {
-                    if !is_valid_sync_endpoint(addr) {
-                        continue;
-                    }
-                    let node_id = r.get("node_id").and_then(|x| x.as_str());
-                    updates.push((vip.to_string(), addr, node_id.map(|s| s.to_string())));
-                }
-            }
-            if !updates.is_empty() {
-                let mut sync_effects: Vec<(String, SocketAddr, Option<SocketAddr>, bool)> =
-                    Vec::with_capacity(updates.len());
-                let mut relay_stamp_vips: Vec<String> = Vec::new();
-                {
-                    let mut rt = self.routing.write();
-                    for (vip, ep, node_id) in &updates {
-                        if vip == &self.state.my_vip {
-                            continue;
-                        }
-                        let was_present = rt.table.contains_key(vip.as_str());
-                        let prev = rt.table.get(vip.as_str()).map(|e| e.endpoint);
-                        rt.update(vip, *ep, node_id.as_deref());
-                        if !self.state.is_owner {
-                            relay_stamp_vips.push(vip.clone());
-                        }
-                        sync_effects.push((vip.clone(), *ep, prev, was_present));
-                    }
-                }
-                for vip in relay_stamp_vips {
-                    self.sync_dest_relay_path_stamp(&vip);
-                }
-                let mut newly_added: Vec<SocketAddr> = Vec::with_capacity(sync_effects.len());
-                for (vip, ep, prev, was_present) in sync_effects {
-                    if !was_present {
-                        newly_added.push(ep);
-                    }
-                    self.apply_route_endpoint_change_side_effects(&vip, ep, prev);
-                }
-                for ep in newly_added {
-                    self.send_ctrl_signed_to(ep, PKT_HPCH, self.state.my_vip.as_bytes())
-                        .await;
-                }
-                if !self.state.is_owner {
-                    for (vip, ep, node_id) in &updates {
-                        if vip == &self.state.my_vip {
-                            continue;
-                        }
-                        self.notify_roster_upsert(vip, *ep, node_id.as_deref());
-                    }
-                }
-            }
-            if from_rev == 0 {
-                let mut allowed: HashSet<String> = HashSet::new();
-                allowed.insert(self.state.my_vip.clone());
-                for r in routes.iter().take(max_routes) {
-                    if let Some(vip) = r.get("vip").and_then(|x| x.as_str()) {
-                        if is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix) {
-                            allowed.insert(vip.to_string());
-                        }
-                    }
-                }
-                let phantoms: Vec<(String, SocketAddr, Option<String>)> = {
-                    let rt = self.routing.read();
-                    rt.table
-                        .iter()
-                        .filter(|(vip, _)| {
-                            vip.as_str() != self.state.my_vip.as_str()
-                                && is_valid_sync_vip(
-                                    &self.state.my_vip,
-                                    vip.as_str(),
-                                    self.state.subnet_prefix,
-                                )
-                                && !allowed.contains(vip.as_str())
-                        })
-                        .map(|(vip, e)| {
-                            let node_id = (!e.node_id.is_empty()).then(|| e.node_id.to_string());
-                            (vip.clone(), e.endpoint, node_id)
-                        })
-                        .collect()
-                };
-                for (vip, ep, node_id) in phantoms {
-                    {
-                        let mut rt = self.routing.write();
-                        rt.remove(&vip);
-                    }
-                    self.on_peer_route_removed(&vip, node_id.as_deref());
-                    if !self.state.is_owner {
-                        self.notify_roster_remove(&vip);
-                        self.stop_peer_reconnect_for_vip(&vip);
-                    }
-                    self.invalidate_fec_loss_ewma_cache(ep);
-                    self.state.crypto_keys.unbind_peer(ep);
-                    self.reliable.flush_dest(ep);
-                    self.pacing.remove_peer(ep);
-                    self.fec_decoders.remove(&ep);
-                    self.fec_send_by_dest.remove(&ep);
-                }
-            }
-            if let Some(tr) = to_rev_opt {
-                self.msyn_applied_to_rev = self.msyn_applied_to_rev.max(tr);
-            }
+            self.handle_msyn_body(body, from).await;
             return;
         }
 
@@ -4225,7 +4271,7 @@ impl P2PEngine {
                     self.invalidate_fec_loss_ewma_cache(ep);
                     self.state.crypto_keys.unbind_peer(ep);
                     self.reliable.flush_dest(ep);
-                    self.pacing.remove_peer(ep);
+                    self.remove_peer_endpoint(ep);
                     self.fec_decoders.remove(&ep);
                     self.fec_send_by_dest.remove(&ep);
                 }
@@ -4319,35 +4365,18 @@ impl P2PEngine {
             return;
         }
 
-        if tag == *PKT_KPAL {
-            self.touch_routing_endpoint(from);
-            if !body.is_empty() {
-                if let Ok(vip) = std::str::from_utf8(body).map(str::trim) {
-                    if vip.parse::<Ipv4Addr>().is_ok() {
-                        self.learn_route_from_hole_punch_body(body, from, true, authenticated);
+        if tag == *PKT_MCTL {
+            self.handle_mctl(body, from, authenticated).await;
+            return;
+        }
 
-                        if !self.state.is_owner
-                            && !self.state.owner_vip_cached.is_empty()
-                            && vip == self.state.owner_vip_cached.as_str()
-                            && (authenticated || !self.has_crypto())
-                        {
-                            self.state.owner_ep = Some(from);
-                            self.state.owner_ep_trusted = true;
-                            let owner_vip_str = self.state.owner_vip_cached.clone();
-                            self.remember_endpoint(&owner_vip_str, from);
-                        }
-                    }
-                }
-            }
+        if tag == *PKT_KPAL {
+            self.apply_hb_body(body, from, authenticated);
             return;
         }
 
         if tag == *PKT_HPCH {
-            self.learn_route_from_hole_punch_body(body, from, false, authenticated);
-            self.try_stop_ice_checks_for_join_peer(from, body);
-
-            self.send_ctrl_signed_to(from, PKT_HACK, self.state.my_vip.as_bytes())
-                .await;
+            self.apply_hol_body(body, from, authenticated).await;
             return;
         }
 
@@ -4510,7 +4539,11 @@ impl P2PEngine {
         body: &[u8],
     ) -> bool {
         let pkt = self.frame_compact_reuse(ty, body);
-        self.socket.send_to(&pkt, dest).await.is_ok()
+        let ok = self.socket.send_to(&pkt, dest).await.is_ok();
+        if ok {
+            self.note_outbound_udp(dest);
+        }
+        ok
     }
 
     async fn handle_ping_body(&mut self, body: &[u8], from: SocketAddr) {
@@ -4631,6 +4664,10 @@ impl P2PEngine {
         if !self.has_crypto() {
             let pkt = frame_compact(CompactPacketType::Data, payload);
             if self.rawperf_mode {
+                if !self.data_udp_fits_path(dest, pkt.len()) {
+                    self.note_pmtud_tx_oversize(dest);
+                    return Ok(());
+                }
                 match self.socket.try_send_to(&pkt, dest) {
                     Ok(_) => return Ok(()),
                     Err(e) => {
@@ -4655,6 +4692,10 @@ impl P2PEngine {
         };
         let pkt = self.encrypt_framed_packet_reuse(self.state.my_vip_u32, dest_vip_u32, payload)?;
         if self.rawperf_mode {
+            if !self.data_udp_fits_path(dest, pkt.len()) {
+                self.note_pmtud_tx_oversize(dest);
+                return Ok(());
+            }
             match self.socket.try_send_to(&pkt, dest) {
                 Ok(_) => return Ok(()),
                 Err(e) => {
@@ -4671,6 +4712,10 @@ impl P2PEngine {
         if !self.has_crypto() {
             let pkt = frame_compact(CompactPacketType::Data, payload);
             if self.rawperf_mode {
+                if !self.data_udp_fits_path(dest, pkt.len()) {
+                    self.note_pmtud_tx_oversize(dest);
+                    return Ok(());
+                }
                 match self.socket.try_send_to(&pkt, dest) {
                     Ok(_) => return Ok(()),
                     Err(e) => {
@@ -4695,6 +4740,10 @@ impl P2PEngine {
         }
         let pkt = self.encrypt_framed_packet_reuse(self.state.my_vip_u32, dest_vip_u32, payload)?;
         if self.rawperf_mode {
+            if !self.data_udp_fits_path(dest, pkt.len()) {
+                self.note_pmtud_tx_oversize(dest);
+                return Ok(());
+            }
             match self.socket.try_send_to(&pkt, dest) {
                 Ok(_) => return Ok(()),
                 Err(e) => {
@@ -5070,8 +5119,8 @@ impl P2PEngine {
         self.sync_interval
             .set_missed_tick_behavior(MissedTickBehavior::Delay);
         self.pmtud_interval = interval_at(
-            now + Duration::from_secs(t.timers.pmtud_batch_secs),
-            Duration::from_secs(t.timers.pmtud_batch_secs),
+            now + Duration::from_millis(t.timers.pmtud_tick_ms),
+            Duration::from_millis(t.timers.pmtud_tick_ms),
         );
         self.pmtud_interval
             .set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -5131,21 +5180,45 @@ impl P2PEngine {
             }
         }
 
-        // PMTUD: if probe ladder changed, stop any in-flight probe task so the
-        // new ladder takes effect on the next batch.
-        let ladder_changed = old.pmtud.probe_sizes != t.pmtud.probe_sizes;
+        // PMTUD: invalidate in-flight probes and apply new knobs.
+        self.pmtud.set_raise_period(t.timers.pmtud_raise_secs);
         self.pmtud.apply_tuning(&t.pmtud);
-        if ladder_changed {
-            if let Some(stop) = self.pmtud_probe_stop.take() {
-                stop.store(true, Ordering::Release);
-            }
-        }
+        self.reschedule_pmtud_interval();
 
         let cc_cfg = t.congestion.to_background_cc_config();
         self.pacing.set_background_cc(cc_cfg);
     }
 
+    fn data_udp_fits_path(&self, dest: SocketAddr, pkt_len: usize) -> bool {
+        pkt_len <= self.pmtud.udp_payload_budget(dest)
+    }
+
+    fn note_pmtud_tx_oversize(&mut self, dest: SocketAddr) {
+        self.metrics.inc_pmtud_tx_oversize_drop();
+        // Adapter suggestion is the primary cure; re-apply even when min_path_mtu
+        // is unchanged (config/formula lag vs live TUN MTU).
+        let enc_overhead = if self.has_crypto() {
+            MENC_WIRE_OVERHEAD
+        } else {
+            0
+        };
+        let suggested = self.pmtud.suggested_adapter_mtu(enc_overhead) as u16;
+        self.try_apply_adapter_mtu(suggested);
+        let now = Instant::now();
+        if self.pmtud.request_revalidate(dest, now) {
+            self.metrics.inc_pmtud_revalidate_hints();
+            self.reschedule_pmtud_interval();
+        }
+    }
+
     fn enqueue_normal_packet(&mut self, pkt: Bytes, dest: SocketAddr) {
+        if !self.data_udp_fits_path(dest, pkt.len()) {
+            self.note_pmtud_tx_oversize(dest);
+            return;
+        }
+        if let Some(vip) = self.endpoint_to_vip_u32(dest) {
+            self.size_loss.note_tx_offer(vip, pkt.len(), Instant::now());
+        }
         let (rtt, qd) = self.pacing_enqueue_hints(dest);
         if !self.pacing.try_enqueue_data(pkt, dest, rtt, qd) {
             self.metrics.inc_pacing_cmd_channel_full();
@@ -5155,6 +5228,10 @@ impl P2PEngine {
     async fn send_menc_direct(&mut self, dest: SocketAddr, payload: &[u8]) -> Result<()> {
         if !self.has_crypto() {
             let pkt = frame_compact(CompactPacketType::Data, payload);
+            if !self.data_udp_fits_path(dest, pkt.len()) {
+                self.note_pmtud_tx_oversize(dest);
+                return Ok(());
+            }
             self.socket.send_to(&pkt, dest).await?;
             return Ok(());
         }
@@ -5170,18 +5247,25 @@ impl P2PEngine {
             return Err(anyhow!("missing local vip"));
         }
         let pkt = self.encrypt_framed_packet_reuse(self.state.my_vip_u32, dest_vip_u32, payload)?;
+        if !self.data_udp_fits_path(dest, pkt.len()) {
+            self.note_pmtud_tx_oversize(dest);
+            return Ok(());
+        }
         self.socket.send_to(&pkt, dest).await?;
         Ok(())
     }
 
     async fn send_control_packet(&mut self, dest: SocketAddr, tag: &[u8; 4], body: &[u8]) -> bool {
+        let mctl_needs_msyn_seal = *tag == *PKT_MCTL
+            && body.len() >= 2
+            && (u16::from_le_bytes([body[0], body[1]]) & MCTL_FLAG_MSYN) != 0;
         let needs_sign = matches!(
             *tag,
             t if t == *PKT_SYNC
                 || t == *PKT_MSMD
                 || t == *PKT_KICK
                 || t == *PKT_PRXY
-        );
+        ) || mctl_needs_msyn_seal;
         if needs_sign {
             let key = self
                 .outbound_crypto_key_for(dest)
@@ -5189,7 +5273,11 @@ impl P2PEngine {
             if let Some(key) = key {
                 if let Some(sealed) = self.seal_control_body(key.as_ref(), tag, body) {
                     let pkt = self.frame_with_tag_reuse(PKT_CTSIG, &sealed);
-                    return self.socket.send_to(&pkt, dest).await.is_ok();
+                    let ok = self.socket.send_to(&pkt, dest).await.is_ok();
+                    if ok {
+                        self.note_outbound_udp(dest);
+                    }
+                    return ok;
                 }
                 return false;
             }
@@ -5202,7 +5290,11 @@ impl P2PEngine {
             }
         }
         let pkt = self.frame_with_tag_reuse(tag, body);
-        self.socket.send_to(&pkt, dest).await.is_ok()
+        let ok = self.socket.send_to(&pkt, dest).await.is_ok();
+        if ok {
+            self.note_outbound_udp(dest);
+        }
+        ok
     }
 
     async fn send_probe_pings_to(&mut self, endpoints: &[SocketAddr]) {
@@ -5347,49 +5439,104 @@ impl P2PEngine {
         }
     }
 
-    async fn send_pmtud_probes(&mut self) {
-        if let Some(stop) = self.pmtud_probe_stop.take() {
-            stop.store(true, Ordering::Release);
-        }
-        self.pmtud.start_new_batch();
-        let stop = Arc::new(AtomicBool::new(false));
-        self.pmtud_probe_stop = Some(stop.clone());
+    fn reschedule_pmtud_interval(&mut self) {
+        let tick_ms = self.advanced_tuning.timers.pmtud_tick_ms.max(10);
+        let raise_secs = self.advanced_tuning.timers.pmtud_raise_secs.max(1);
+        let now_tok = tokio::time::Instant::now();
+        let now = Instant::now();
+        let period = if self.pmtud.needs_fast_tick() {
+            Duration::from_millis(tick_ms)
+        } else {
+            let deadline = self.pmtud.next_deadline(now);
+            let wait = deadline.saturating_duration_since(now);
+            wait.max(Duration::from_millis(tick_ms))
+                .min(Duration::from_secs(raise_secs))
+        };
+        self.pmtud_interval = interval_at(now_tok + period, period);
+        self.pmtud_interval
+            .set_missed_tick_behavior(MissedTickBehavior::Delay);
+    }
+
+    async fn drive_pmtud_tick(&mut self) {
         let peers: Vec<SocketAddr> = {
             let rt = self.routing.read();
             let mut v = Vec::new();
             rt.push_endpoints_excluding_stale(&mut v);
             v
         };
-        if peers.is_empty() {
-            return;
-        }
-        let session_id = self.pmtud.session_id();
-        let probe_counter = self.pmtud.probe_counter();
-        let probe_sock = self.pmtud_probe_socket.clone();
-        let probe_sizes = self.pmtud.probe_sizes().to_vec();
-        tokio::spawn(async move {
-            for ep in peers {
-                if stop.load(Ordering::Acquire) {
-                    return;
+        let now = Instant::now();
+        let cong = &self.advanced_tuning.congestion;
+        let mut early_wake = crate::pmtud::PmtudEventCounts::default();
+        let mut inputs: Vec<PeerTickInput> = Vec::with_capacity(peers.len());
+        for &ep in &peers {
+            let (rtt_ms, qd_ms) = {
+                let rt = self.routing.read();
+                match rt.ep_to_vip.get(&ep).and_then(|vip| rt.table.get(vip)) {
+                    Some(e) => (
+                        e.smoothed_rtt_ms,
+                        crate::routing::effective_queuing_delay_ms(e),
+                    ),
+                    None => (-1.0, -1.0),
                 }
-                for &target_sz in probe_sizes.iter() {
-                    if stop.load(Ordering::Acquire) {
-                        return;
-                    }
-                    let probe_id = probe_counter.fetch_add(1, Ordering::Relaxed);
-                    let payload_len = target_sz.saturating_sub(44);
-                    let mut body = Vec::with_capacity(10 + payload_len);
-                    body.extend_from_slice(&(target_sz as u16).to_be_bytes());
-                    body.extend_from_slice(&session_id.to_be_bytes());
-                    body.extend_from_slice(&probe_id.to_be_bytes());
-                    body.resize(10 + payload_len, 0xAB);
-                    let _ = probe_sock
-                        .send_to(&frame_with_tag(PKT_PMTU, &body), ep)
-                        .await;
-                }
-                tokio::time::sleep(Duration::from_millis(8)).await;
+            };
+            let health = match self.endpoint_to_vip_u32(ep) {
+                Some(vip) => self.size_loss.health(vip, now),
+                None => SizeHealth::default(),
+            };
+            let qd_ok = qd_ms >= 0.0
+                && cong.rtt_base_tracking
+                && !fec_delay_is_congestive(
+                    qd_ms,
+                    cong.target_queue_delay_ms,
+                    cong.congestion_loss_threshold,
+                );
+            if health.large_collapsed && qd_ok && self.pmtud.request_early_wake(ep, now) {
+                early_wake.early_wake_events = early_wake.early_wake_events.saturating_add(1);
             }
-        });
+            inputs.push(PeerTickInput {
+                addr: ep,
+                health,
+                rtt_ms,
+            });
+        }
+        self.metrics.add_pmtud_events(early_wake);
+
+        let old_min = self.pmtud.min_mtu();
+        let (intents, events) = self.pmtud.on_tick(now, &inputs);
+        self.metrics.add_pmtud_events(events);
+        for intent in intents {
+            let payload_len = intent.size.saturating_sub(44);
+            let mut body = Vec::with_capacity(10 + payload_len);
+            body.extend_from_slice(&(intent.size as u16).to_be_bytes());
+            body.extend_from_slice(&intent.search_gen.to_be_bytes());
+            body.extend_from_slice(&intent.probe_id.to_be_bytes());
+            body.resize(10 + payload_len, 0xAB);
+            let frame = frame_with_tag(PKT_PMTU, &body);
+            self.metrics.inc_pmtud_probes_sent();
+            match self.pmtud_probe_socket.send_to(&frame, intent.peer).await {
+                Ok(_) => {}
+                Err(e) if is_udp_message_too_long(&e) => {
+                    let ev =
+                        self.pmtud
+                            .on_send_hard_fail(intent.peer, intent.probe_id, Instant::now());
+                    self.metrics.add_pmtud_events(ev);
+                }
+                Err(_) => {
+                    // Transient send errors: wait for probe timeout / confirm path.
+                }
+            }
+        }
+        if self.pmtud.min_mtu() != old_min {
+            let enc_overhead = if self.has_crypto() {
+                MENC_WIRE_OVERHEAD
+            } else {
+                0
+            };
+            let suggested = self.pmtud.suggested_adapter_mtu(enc_overhead) as u16;
+            self.try_apply_adapter_mtu(suggested);
+            self.sync_fec_shard_ceiling_to_path_mtu();
+        }
+        self.reschedule_pmtud_interval();
     }
 
     fn note_route_removed_for_sync(&mut self, removed_vip: &str) {
@@ -5411,6 +5558,210 @@ impl P2PEngine {
                 .or_default()
                 .insert(removed_vip.to_string());
         }
+    }
+
+    async fn handle_msyn_body(&mut self, body: &[u8], from: SocketAddr) {
+        if body.len() > self.advanced_tuning.engine_limits.msyn_body_max {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return;
+        };
+        let now = Instant::now();
+        let outcome = ingest_msyn_part(
+            &mut self.msyn_assemble,
+            from,
+            &v,
+            self.msyn_applied_to_rev,
+            now,
+        );
+        match outcome {
+            MsynIngestOutcome::Ignored => {}
+            MsynIngestOutcome::Buffered { first_part } => {
+                if first_part {
+                    self.stop_all_peer_reconnect_workflows();
+                }
+            }
+            MsynIngestOutcome::Complete(done) => {
+                self.stop_all_peer_reconnect_workflows();
+                let from_rev = done.from_rev;
+                let to_rev = done.to_rev;
+                let (removed, routes) = done.assemble_removed_then_routes();
+                self.apply_msyn_epoch(from, from_rev, to_rev, &removed, &routes)
+                    .await;
+            }
+        }
+    }
+
+    async fn apply_msyn_epoch(
+        &mut self,
+        from: SocketAddr,
+        from_rev: u64,
+        to_rev: u64,
+        removed: &[String],
+        routes: &[serde_json::Value],
+    ) {
+        if to_rev <= self.msyn_applied_to_rev {
+            return;
+        }
+        if removed.len() > MSYN_APPLY_MAX_REMOVED || routes.len() > MSYN_APPLY_MAX_ROUTES {
+            self.ui_err(format!(
+                "[MSYN] assembled epoch too large (routes={} removed={}, caps {}/{}); ignore to_rev={}",
+                routes.len(),
+                removed.len(),
+                MSYN_APPLY_MAX_ROUTES,
+                MSYN_APPLY_MAX_REMOVED,
+                to_rev
+            ));
+            return;
+        }
+        {
+            let (evicted_eps, removed_peers) = {
+                let mut rt = self.routing.write();
+                let mut evicted_eps = Vec::new();
+                let mut removed_peers = Vec::new();
+                for vip in removed.iter() {
+                    if is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix) {
+                        let node_id = rt
+                            .table
+                            .get(vip.as_str())
+                            .and_then(|e| (!e.node_id.is_empty()).then(|| e.node_id.to_string()));
+                        if let Some(ep) = rt.lookup(vip) {
+                            evicted_eps.push(ep);
+                        }
+                        rt.remove(vip);
+                        removed_peers.push((vip.clone(), node_id));
+                    }
+                }
+                (evicted_eps, removed_peers)
+            };
+            for (vip, node_id) in removed_peers {
+                self.on_peer_route_removed(&vip, node_id.as_deref());
+                if !self.state.is_owner {
+                    self.notify_roster_remove(&vip);
+                    self.stop_peer_reconnect_for_vip(&vip);
+                }
+            }
+            for ep in evicted_eps {
+                self.invalidate_fec_loss_ewma_cache(ep);
+                self.state.crypto_keys.unbind_peer(ep);
+                self.reliable.flush_dest(ep);
+                self.remove_peer_endpoint(ep);
+                self.fec_decoders.remove(&ep);
+                self.fec_send_by_dest.remove(&ep);
+            }
+        }
+
+        self.touch_routing_endpoint(from);
+        let mut updates: Vec<(String, SocketAddr, Option<String>)> = Vec::new();
+        for r in routes.iter() {
+            let Some(vip) = r.get("vip").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if !is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix) {
+                continue;
+            }
+            let Some(ep) = r.get("ep").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if let Ok(addr) = ep.parse::<SocketAddr>() {
+                if !is_valid_sync_endpoint(addr) {
+                    continue;
+                }
+                let node_id = r.get("node_id").and_then(|x| x.as_str());
+                updates.push((vip.to_string(), addr, node_id.map(|s| s.to_string())));
+            }
+        }
+        if !updates.is_empty() {
+            let mut sync_effects: Vec<(String, SocketAddr, Option<SocketAddr>, bool)> =
+                Vec::with_capacity(updates.len());
+            let mut relay_stamp_vips: Vec<String> = Vec::new();
+            {
+                let mut rt = self.routing.write();
+                for (vip, ep, node_id) in &updates {
+                    if vip == &self.state.my_vip {
+                        continue;
+                    }
+                    let was_present = rt.table.contains_key(vip.as_str());
+                    let prev = rt.table.get(vip.as_str()).map(|e| e.endpoint);
+                    rt.update(vip, *ep, node_id.as_deref());
+                    if !self.state.is_owner {
+                        relay_stamp_vips.push(vip.clone());
+                    }
+                    sync_effects.push((vip.clone(), *ep, prev, was_present));
+                }
+            }
+            for vip in relay_stamp_vips {
+                self.sync_dest_relay_path_stamp(&vip);
+            }
+            let mut newly_added: Vec<SocketAddr> = Vec::with_capacity(sync_effects.len());
+            for (vip, ep, prev, was_present) in sync_effects {
+                if !was_present {
+                    newly_added.push(ep);
+                }
+                self.apply_route_endpoint_change_side_effects(&vip, ep, prev);
+            }
+            for ep in newly_added {
+                self.send_ctrl_signed_to(ep, PKT_HPCH, self.state.my_vip.as_bytes())
+                    .await;
+            }
+            if !self.state.is_owner {
+                for (vip, ep, node_id) in &updates {
+                    if vip == &self.state.my_vip {
+                        continue;
+                    }
+                    self.notify_roster_upsert(vip, *ep, node_id.as_deref());
+                }
+            }
+        }
+        if from_rev == 0 {
+            let mut allowed: HashSet<String> = HashSet::new();
+            allowed.insert(self.state.my_vip.clone());
+            for r in routes.iter() {
+                if let Some(vip) = r.get("vip").and_then(|x| x.as_str()) {
+                    if is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix) {
+                        allowed.insert(vip.to_string());
+                    }
+                }
+            }
+            let phantoms: Vec<(String, SocketAddr, Option<String>)> = {
+                let rt = self.routing.read();
+                rt.table
+                    .iter()
+                    .filter(|(vip, _)| {
+                        vip.as_str() != self.state.my_vip.as_str()
+                            && is_valid_sync_vip(
+                                &self.state.my_vip,
+                                vip.as_str(),
+                                self.state.subnet_prefix,
+                            )
+                            && !allowed.contains(vip.as_str())
+                    })
+                    .map(|(vip, e)| {
+                        let node_id = (!e.node_id.is_empty()).then(|| e.node_id.to_string());
+                        (vip.clone(), e.endpoint, node_id)
+                    })
+                    .collect()
+            };
+            for (vip, ep, node_id) in phantoms {
+                {
+                    let mut rt = self.routing.write();
+                    rt.remove(&vip);
+                }
+                self.on_peer_route_removed(&vip, node_id.as_deref());
+                if !self.state.is_owner {
+                    self.notify_roster_remove(&vip);
+                    self.stop_peer_reconnect_for_vip(&vip);
+                }
+                self.invalidate_fec_loss_ewma_cache(ep);
+                self.state.crypto_keys.unbind_peer(ep);
+                self.reliable.flush_dest(ep);
+                self.remove_peer_endpoint(ep);
+                self.fec_decoders.remove(&ep);
+                self.fec_send_by_dest.remove(&ep);
+            }
+        }
+        self.msyn_applied_to_rev = self.msyn_applied_to_rev.max(to_rev);
     }
 
     async fn broadcast_msyn(&mut self) -> Result<()> {
@@ -5439,16 +5790,9 @@ impl P2PEngine {
             (rev, snap, tombs)
         };
 
-        let routes_full_json: String = {
-            let routes_full: Vec<serde_json::Value> = snapshot
-                .iter()
-                .filter(|r| !matches!(r.state, RouteState::Stale))
-                .map(|r| {
-                    json!({"vip": r.vip.as_ref(), "ep": r.endpoint.to_string(), "node_id": r.node_id.as_ref()})
-                })
-                .collect();
-            serde_json::to_string(&routes_full).unwrap_or_else(|_| "[]".into())
-        };
+        let routes_full = routes_from_snapshot_non_stale(&snapshot);
+        let budget =
+            effective_msyn_json_budget(self.advanced_tuning.engine_limits.msyn_shard_budget_bytes);
 
         for row in &snapshot {
             if matches!(row.state, RouteState::Stale) {
@@ -5462,59 +5806,98 @@ impl P2PEngine {
             }
 
             let pending = self.peer_pending_removals.get(peer_vip);
-            let msyn_body_max = self.advanced_tuning.engine_limits.msyn_body_max;
+            let sync_id = self.next_msyn_sync_id;
+            self.next_msyn_sync_id = self.next_msyn_sync_id.saturating_add(1).max(1);
 
-            let (sync_ok, delivered_removed) = if last == 0 {
+            let (parts_result, delivered_removed) = if last == 0 {
                 let removed = collect_removed_vips(0, &relevant_tombs, pending);
-                let removed_refs: Vec<&str> = removed.iter().map(|s| s.as_str()).collect();
-                let body = msyn_full_body_string(current_rev, &routes_full_json, &removed_refs);
-                let body_bytes = body.as_bytes();
-                let ok = if body_bytes.len() > msyn_body_max {
+                (
+                    build_msyn_full_shards(current_rev, sync_id, &routes_full, &removed, budget)
+                        .map(Some),
+                    removed,
+                )
+            } else {
+                let delivered = collect_removed_vips(last, &relevant_tombs, pending);
+                (
+                    build_msyn_delta_shards(
+                        last,
+                        current_rev,
+                        sync_id,
+                        &snapshot,
+                        &relevant_tombs,
+                        pending,
+                        budget,
+                    ),
+                    delivered,
+                )
+            };
+
+            let parts = match parts_result {
+                Ok(None) => {
+                    if peer_owes_removals(last, &relevant_tombs, pending) {
+                        self.ui_err(format!(
+                            "[MSYN] advance blocked: peer {} still owes removals (last={} rev={})",
+                            peer_vip, last, current_rev
+                        ));
+                    } else {
+                        self.peer_sync_state
+                            .insert(peer_vip.to_string(), current_rev);
+                    }
+                    continue;
+                }
+                Ok(Some(parts)) => parts,
+                Err(ShardError::EntryTooLarge { kind, bytes }) => {
                     self.ui_err(format!(
-                        "[MSYN] full sync body {} bytes exceeds limit {}; skip peer {}",
-                        body_bytes.len(),
-                        msyn_body_max,
+                        "[MSYN] {kind} entry {bytes} bytes exceeds shard budget {budget}; skip peer {}",
                         peer_vip
                     ));
-                    false
-                } else {
-                    self.send_control_packet(ep, PKT_SYNC, body_bytes).await
-                };
-                (ok, removed)
-            } else {
-                let body_opt =
-                    build_msyn_delta_body(last, current_rev, &snapshot, &relevant_tombs, pending);
-                match body_opt {
-                    None => {
-                        if peer_owes_removals(last, &relevant_tombs, pending) {
-                            self.ui_err(format!(
-                                "[MSYN] advance blocked: peer {} still owes removals (last={} rev={})",
-                                peer_vip, last, current_rev
-                            ));
-                        } else {
-                            self.peer_sync_state
-                                .insert(peer_vip.to_string(), current_rev);
-                        }
-                        continue;
-                    }
-                    Some(body) => {
-                        let delivered = collect_removed_vips(last, &relevant_tombs, pending);
-                        let body_bytes = body.as_bytes();
-                        let ok = if body_bytes.len() > msyn_body_max {
-                            self.ui_err(format!(
-                                "[MSYN] delta sync body {} bytes exceeds limit {}; skip peer {}",
-                                body_bytes.len(),
-                                msyn_body_max,
-                                peer_vip
-                            ));
-                            false
-                        } else {
-                            self.send_control_packet(ep, PKT_SYNC, body_bytes).await
-                        };
-                        (ok, delivered)
-                    }
+                    continue;
+                }
+                Err(ShardError::TooManyParts { parts }) => {
+                    self.ui_err(format!(
+                        "[MSYN] epoch needs {parts} parts (max {}); skip peer {}",
+                        crate::net::msyn_sync::MSYN_ASSEMBLE_MAX_PARTS_TOTAL,
+                        peer_vip
+                    ));
+                    continue;
+                }
+                Err(ShardError::EpochTooLarge { routes, removed }) => {
+                    self.ui_err(format!(
+                        "[MSYN] epoch too large (routes={routes} removed={removed}, caps {}/{}); skip peer {}",
+                        MSYN_APPLY_MAX_ROUTES,
+                        MSYN_APPLY_MAX_REMOVED,
+                        peer_vip
+                    ));
+                    continue;
                 }
             };
+
+            let mut sync_ok = true;
+            let vip_owned = self.state.my_vip.clone();
+            for part in &parts {
+                let body_bytes = part.as_bytes();
+                if body_bytes.len() > self.advanced_tuning.engine_limits.msyn_body_max {
+                    self.ui_err(format!(
+                        "[MSYN] part {} bytes exceeds msyn_body_max; skip peer {}",
+                        body_bytes.len(),
+                        peer_vip
+                    ));
+                    sync_ok = false;
+                    break;
+                }
+                let now = Instant::now();
+                let keepalive = Duration::from_secs(self.advanced_tuning.timers.keepalive_secs);
+                let uncovered = self.outbound_udp.needs_refresh(ep, now, keepalive);
+                let (flags, vip) = if uncovered {
+                    (MCTL_FLAG_MSYN | MCTL_FLAG_HB, Some(vip_owned.as_bytes()))
+                } else {
+                    (MCTL_FLAG_MSYN, None)
+                };
+                if !self.send_mctl(ep, flags, vip, Some(body_bytes)).await {
+                    sync_ok = false;
+                    break;
+                }
+            }
 
             if sync_ok {
                 if let Some(pending_set) = self.peer_pending_removals.get_mut(peer_vip) {
@@ -5557,6 +5940,7 @@ impl P2PEngine {
         }
         let socket = self.socket.clone();
         let state_view = self.state_view.clone();
+        let outbound = self.outbound_udp.clone();
         if let Some(stop) = self.ice_check_stops.remove(&src_node) {
             stop.store(true, Ordering::Release);
         }
@@ -5589,7 +5973,10 @@ impl P2PEngine {
                             return;
                         }
                         let idx = (next_idx + k) % targets.len();
-                        let _ = socket.send_to(&pkt, targets[idx]).await;
+                        let dest = targets[idx];
+                        if socket.send_to(&pkt, dest).await.is_ok() {
+                            outbound.note(dest);
+                        }
                     }
                     next_idx = (next_idx + take) % targets.len().max(1);
                     tokio::task::yield_now().await;
@@ -5613,7 +6000,7 @@ impl P2PEngine {
     }
 
     fn try_apply_adapter_mtu(&mut self, mtu: u16) {
-        if !(576..=1500).contains(&mtu) {
+        if !(MIN_ADAPTER_PAYLOAD_MTU as u16..=1500).contains(&mtu) {
             return;
         }
         if mtu == self.state.last_applied_adapter_mtu && self.state.last_applied_adapter_mtu != 0 {
@@ -5987,7 +6374,7 @@ impl P2PEngine {
                 self.invalidate_fec_loss_ewma_cache(ep);
                 self.peer_sync_state.remove(vip);
                 self.state.crypto_keys.unbind_peer(prev);
-                self.pacing.remove_peer(prev);
+                self.remove_peer_endpoint(prev);
                 self.fec_decoders.remove(&prev);
                 self.fec_send_by_dest.remove(&prev);
             }
@@ -6163,6 +6550,7 @@ fn allow_unauth_control_tag_with_crypto(tag: [u8; 4]) -> bool {
             || t == *PKT_KPAL
             || t == *PKT_HPCH
             || t == *PKT_HACK
+            || t == *PKT_MCTL
     )
 }
 
@@ -6388,6 +6776,11 @@ fn first_free_vip_u32_in_subnet(
     None
 }
 
+fn is_udp_message_too_long(err: &std::io::Error) -> bool {
+    // Windows WSAEMSGSIZE=10040; Linux/macOS EMSGSIZE typically 90.
+    matches!(err.raw_os_error(), Some(10040) | Some(90))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6480,6 +6873,15 @@ mod tests {
         assert!(allow_unauth_control_tag_with_crypto(*PKT_KPAL));
         assert!(allow_unauth_control_tag_with_crypto(*PKT_HPCH));
         assert!(allow_unauth_control_tag_with_crypto(*PKT_HACK));
+        assert!(allow_unauth_control_tag_with_crypto(*PKT_MCTL));
+    }
+
+    #[test]
+    fn encode_mctl_hb_hol_one_datagram_body() {
+        let body = encode_mctl(MCTL_FLAG_HB | MCTL_FLAG_HOL, Some(b"10.0.0.2"), None).unwrap();
+        let p = parse_mctl(&body, 4096).unwrap();
+        assert_eq!(p.flags, MCTL_FLAG_HB | MCTL_FLAG_HOL);
+        assert!(p.msyn.is_none());
     }
 
     #[tokio::test]
@@ -6698,12 +7100,14 @@ mod tests {
     }
 
     #[test]
-    fn msyn_full_body_string_uses_from_rev_zero() {
-        let s = crate::net::msyn_sync::msyn_full_body_string(9, "[]", &[]);
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v.get("proto_ver").and_then(|x| x.as_u64()), Some(3));
+    fn msyn_full_shards_use_from_rev_zero() {
+        let parts = crate::net::msyn_sync::build_msyn_full_shards(9, 1, &[], &[], 1200).unwrap();
+        assert_eq!(parts.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&parts[0]).unwrap();
+        assert_eq!(v.get("proto_ver").and_then(|x| x.as_u64()), Some(4));
         assert_eq!(v.get("from_rev").and_then(|x| x.as_u64()), Some(0));
         assert_eq!(v.get("to_rev").and_then(|x| x.as_u64()), Some(9));
+        assert_eq!(v.get("parts_total").and_then(|x| x.as_u64()), Some(1));
     }
 
     #[test]
@@ -6828,6 +7232,59 @@ mod tests {
             "prefix": 24
         });
         assert!(super::jack_mpja_body_valid(&v, from));
+    }
+
+    #[tokio::test]
+    async fn coverage_keepalive_suppresses_after_note_and_clears_on_reset() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rt = Arc::new(RwLock::new(RoutingTable::new()));
+        let (_tun_tx, tun_rx) = mpsc::channel(8);
+        let (inject_tx, _inject_rx) = broadcast::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let metrics = Arc::new(EngineMetrics::new());
+        metrics.set_enabled(true);
+        let mut eng = P2PEngine::new(
+            Arc::new(socket),
+            Arc::new(pmtud_socket),
+            rt.clone(),
+            tun_rx,
+            inject_tx,
+            cmd_rx,
+            false,
+            Ipv4Addr::new(10, 1, 1, 2),
+            "n".to_string(),
+            24,
+            metrics.clone(),
+            PaceClockApply::default(),
+            500,
+            Arc::new(RuntimeTrace::new()),
+            8,
+            crate::ui_events::UiEventBus::new(),
+        );
+        let ep: SocketAddr = "127.0.0.1:45000".parse().unwrap();
+        {
+            let mut w = rt.write();
+            w.update("10.1.1.5", ep, Some("peer-a"));
+            if let Some(entry) = w.table.get_mut("10.1.1.5") {
+                entry.state = RouteState::Active;
+            }
+        }
+        eng.send_keepalives().await;
+        assert!(metrics.keepalive_sent_total.load(Ordering::Relaxed) >= 1);
+        let sent_after_idle = metrics.keepalive_sent_total.load(Ordering::Relaxed);
+        eng.note_outbound_udp(ep);
+        eng.send_keepalives().await;
+        assert!(
+            metrics.keepalive_suppressed_total.load(Ordering::Relaxed) >= 1,
+            "recent note must suppress keepalive"
+        );
+        assert_eq!(
+            metrics.keepalive_sent_total.load(Ordering::Relaxed),
+            sent_after_idle
+        );
+        eng.reset_session_state().await;
+        assert!(eng.outbound_udp.last(ep).is_none());
     }
 
     #[tokio::test]

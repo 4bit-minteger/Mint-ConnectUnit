@@ -1272,6 +1272,20 @@ impl PacingEngine {
         self.tick_with(|pkt, dest| socket.try_send_to(pkt, dest).map(|_| ()).map_err(|e| e))
     }
 
+    /// Like [`tick`], but invokes `on_ok` after each successful `try_send_to`.
+    pub fn tick_noting<N>(&mut self, socket: &UdpSocket, mut on_ok: N) -> TickResult
+    where
+        N: FnMut(SocketAddr),
+    {
+        self.tick_with(|pkt, dest| match socket.try_send_to(pkt, dest) {
+            Ok(_) => {
+                on_ok(dest);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        })
+    }
+
     fn tick_with<F>(&mut self, mut try_send: F) -> TickResult
     where
         F: FnMut(&[u8], SocketAddr) -> Result<(), std::io::Error>,
@@ -1405,6 +1419,30 @@ impl PacingEngine {
         self.apd.last_max_sojourn_ms = 0;
         self.apd.cc_headroom_suppressions = 0;
         self.last_tick = Instant::now();
+    }
+
+    /// Zero dashboard observability counters only. Keeps queues, budget, APD phase, and CC rates.
+    pub fn reset_observability_counters(&mut self) {
+        self.dropped_packets = 0;
+        self.dropped_data = 0;
+        self.dropped_control_normal = 0;
+        self.dropped_control_retransmit = 0;
+        self.shed_sojourn = 0;
+        self.drr_small_priority_pops = 0;
+        self.drr_bulk_force_pops = 0;
+        self.drr_rtt_scale_applied = 0;
+        self.cc_rate_limited_events = 0;
+        self.background_cc.reset_counters();
+        self.apd.drain_episodes = 0;
+        self.apd.drain_ms_total = 0;
+        self.apd.packets_drained = 0;
+        self.apd.drain_budget_hits = 0;
+        self.apd.ramp_active_ticks = 0;
+        self.apd.ramp_pinned_ticks = 0;
+        self.apd.drain_arm_fill = 0;
+        self.apd.drain_arm_sojourn = 0;
+        self.apd.last_max_sojourn_ms = 0;
+        self.apd.cc_headroom_suppressions = 0;
     }
 
     fn reset_apd_runtime_state(&mut self) {
@@ -2718,6 +2756,25 @@ mod tests {
         assert_eq!(p.shed_sojourn(), 1);
         p.reset_session_runtime();
         assert_eq!(p.shed_sojourn(), 0);
+    }
+
+    #[test]
+    fn reset_observability_counters_preserves_queues() {
+        let mut p = PacingEngine::new();
+        let d = addr(98);
+        p.enqueue_peer(Bytes::from(vec![0u8; 64]), d);
+        p.enqueue_peer(Bytes::from(vec![0u8; 64]), d);
+        assert_eq!(p.queue_snapshot().data_queued, 2);
+        p.dropped_packets = 5;
+        p.drr_small_priority_pops = 3;
+        p.cc_rate_limited_events = 2;
+        p.apd.drain_episodes = 4;
+        p.reset_observability_counters();
+        assert_eq!(p.dropped_packets(), 0);
+        assert_eq!(p.drr_small_priority_pops(), 0);
+        assert_eq!(p.cc_rate_limited_events(), 0);
+        assert_eq!(p.apd_metrics().0, 0);
+        assert_eq!(p.queue_snapshot().data_queued, 2);
     }
 
     #[test]

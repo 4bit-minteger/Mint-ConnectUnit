@@ -46,7 +46,14 @@ pub async fn run_daemon() -> Result<()> {
     ensure_netinfo_dir()?;
     let config_path = netinfo::config_path()?;
     let config = ConfigManager::new(config_path);
-    let _ = config.load();
+    if let Err(e) = config.load() {
+        eprintln!(
+            "config load failed ({}): {e}",
+            netinfo::config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "NetInfo/config.toml".into())
+        );
+    }
 
     let snap = config.snapshot();
     process_priority::apply_startup_process_priority(snap.process_priority_level);
@@ -414,7 +421,35 @@ async fn handle_ipc(state: Arc<DaemonState>, req: IpcRequest) -> IpcResponse {
             let payload = bincode::serialize(&lines).unwrap_or_default();
             IpcResponse::RuntimeSnapshot { payload }
         }
+        IpcRequest::RuntimeViewBegin => {
+            let result = {
+                let cli = state.cli_lock();
+                cli.runtime_view_begin().await
+            };
+            match result {
+                Ok(()) => IpcResponse::Ok { lines: vec![] },
+                Err(e) => IpcResponse::Err {
+                    message: e.to_string(),
+                },
+            }
+        }
+        IpcRequest::RuntimeViewEnd => {
+            let result = {
+                let cli = state.cli_lock();
+                cli.runtime_view_end().await
+            };
+            match result {
+                Ok(()) => IpcResponse::Ok { lines: vec![] },
+                Err(e) => IpcResponse::Err {
+                    message: e.to_string(),
+                },
+            }
+        }
         IpcRequest::ClientDisconnect => {
+            {
+                let cli = state.cli_lock();
+                cli.runtime_view_end_best_effort();
+            }
             let Some(remaining) = ipc::on_client_disconnected() else {
                 return IpcResponse::Ok { lines: vec![] };
             };

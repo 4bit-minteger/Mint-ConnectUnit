@@ -237,6 +237,10 @@ impl DataReplayWindow {
         self.bits & mask == 0
     }
 
+    pub fn top(&self) -> Option<u64> {
+        self.top
+    }
+
     pub fn commit(&mut self, counter: u64) {
         let Some(top) = self.top else {
             self.top = Some(counter);

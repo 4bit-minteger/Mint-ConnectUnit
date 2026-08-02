@@ -39,7 +39,8 @@ impl Default for FailoverTuning {
 pub struct TimerTuning {
     pub keepalive_secs: u64,
     pub msyn_secs: u64,
-    pub pmtud_batch_secs: u64,
+    pub pmtud_tick_ms: u64,
+    pub pmtud_raise_secs: u64,
     pub ping_watchdog_ms: u64,
     pub stale_tick_secs: u64,
     pub stale_mark_secs: u64,
@@ -51,7 +52,8 @@ impl Default for TimerTuning {
         Self {
             keepalive_secs: 5,
             msyn_secs: 15,
-            pmtud_batch_secs: 60,
+            pmtud_tick_ms: 50,
+            pmtud_raise_secs: 60,
             ping_watchdog_ms: 100,
             stale_tick_secs: 30,
             stale_mark_secs: 35,
@@ -232,6 +234,8 @@ pub struct EngineLimitsTuning {
     pub max_secondary_retry_per_tick: usize,
     pub stun_cache_ttl_secs: u64,
     pub msyn_body_max: usize,
+    /// Max serialized MSYN v4 JSON part size before compound wrap.
+    pub msyn_shard_budget_bytes: usize,
     pub heal_cooldown_ms: u64,
 }
 
@@ -245,6 +249,7 @@ impl Default for EngineLimitsTuning {
             max_secondary_retry_per_tick: 16,
             stun_cache_ttl_secs: 30,
             msyn_body_max: 524_288,
+            msyn_shard_budget_bytes: 1200,
             heal_cooldown_ms: 1_000,
         }
     }
@@ -259,6 +264,8 @@ impl EngineLimitsTuning {
         self.max_secondary_retry_per_tick = self.max_secondary_retry_per_tick.clamp(1, 256);
         self.stun_cache_ttl_secs = self.stun_cache_ttl_secs.clamp(1, 600);
         self.msyn_body_max = self.msyn_body_max.clamp(4096, 524_288);
+        let shard_hi = 4096usize.min(self.msyn_body_max);
+        self.msyn_shard_budget_bytes = self.msyn_shard_budget_bytes.clamp(512, shard_hi);
         self.heal_cooldown_ms = self.heal_cooldown_ms.clamp(50, 60_000);
     }
 }
@@ -381,10 +388,10 @@ impl Default for CongestionTuning {
             loss_classifier_enabled: true,
             target_queue_delay_ms: crate::net::background_cc::DEFAULT_TARGET_QUEUE_DELAY_MS,
             congestion_loss_threshold: 0.7,
-            base_rtt_window_secs: 3,
+            base_rtt_window_secs: 6,
             base_rtt_stale_windows: 2,
             owd_clock_jump_reject_ms: crate::routing::DEFAULT_OWD_CLOCK_JUMP_REJECT_MS,
-            probe_interval_ms: 20,
+            probe_interval_ms: 25,
             fec_recovery_recency_ms: 3_000,
             enabled: true,
             gain: crate::net::background_cc::DEFAULT_GAIN,
@@ -460,17 +467,27 @@ pub fn cc_probe_timer_period_ms(probe_interval_ms: u64) -> u64 {
 }
 
 // ── PMTUD ───────────────────────────────────────────────────────────────────
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PmtudTuning {
-    pub probe_sizes: Vec<usize>,
+    pub probe_timeout_ms: u64,
+    pub confirm_count: u8,
+    pub resolve_epsilon: usize,
+    pub raise_step: usize,
+    pub max_probes_per_search: u32,
+    pub max_concurrent_peers: usize,
     pub stable_downgrade_batches: u8,
 }
 
 impl Default for PmtudTuning {
     fn default() -> Self {
         Self {
-            probe_sizes: crate::pmtud::PROBE_SIZES.to_vec(),
+            probe_timeout_ms: 1000,
+            confirm_count: 3,
+            resolve_epsilon: 1,
+            raise_step: 32,
+            max_probes_per_search: 64,
+            max_concurrent_peers: 4,
             stable_downgrade_batches: 3,
         }
     }
@@ -525,7 +542,8 @@ impl AdvancedTuning {
         // Timers
         self.timers.keepalive_secs = self.timers.keepalive_secs.max(1);
         self.timers.msyn_secs = self.timers.msyn_secs.max(1);
-        self.timers.pmtud_batch_secs = self.timers.pmtud_batch_secs.max(1);
+        self.timers.pmtud_tick_ms = self.timers.pmtud_tick_ms.clamp(10, 1000);
+        self.timers.pmtud_raise_secs = self.timers.pmtud_raise_secs.max(1);
         self.timers.ping_watchdog_ms = self.timers.ping_watchdog_ms.max(10);
         self.timers.stale_tick_secs = self.timers.stale_tick_secs.max(1);
         self.timers.stale_mark_secs = self.timers.stale_mark_secs.max(1);
@@ -591,20 +609,12 @@ impl AdvancedTuning {
 
         // PMTUD
         self.pmtud.stable_downgrade_batches = self.pmtud.stable_downgrade_batches.max(1);
-        // Sanitize probe ladder: unique, strictly decreasing, each in 576..=1500, ≥2 entries.
-        let mut ladder: Vec<usize> = self
-            .pmtud
-            .probe_sizes
-            .iter()
-            .copied()
-            .filter(|s| (576..=1500).contains(s))
-            .collect();
-        ladder.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        ladder.dedup();
-        if ladder.len() < 2 {
-            ladder = crate::pmtud::PROBE_SIZES.to_vec();
-        }
-        self.pmtud.probe_sizes = ladder;
+        self.pmtud.probe_timeout_ms = self.pmtud.probe_timeout_ms.clamp(50, 10_000);
+        self.pmtud.confirm_count = self.pmtud.confirm_count.clamp(1, 8);
+        self.pmtud.resolve_epsilon = self.pmtud.resolve_epsilon.clamp(1, 8);
+        self.pmtud.raise_step = self.pmtud.raise_step.clamp(1, 512);
+        self.pmtud.max_probes_per_search = self.pmtud.max_probes_per_search.clamp(8, 256);
+        self.pmtud.max_concurrent_peers = self.pmtud.max_concurrent_peers.clamp(1, 64);
     }
 }
 
@@ -659,12 +669,18 @@ mod tests {
             crate::net::fec::FEC_MAX_TOTAL_SHARDS
         );
 
-        assert_eq!(d.pmtud.probe_sizes, crate::pmtud::PROBE_SIZES.to_vec());
+        assert_eq!(d.pmtud.probe_timeout_ms, 1000);
+        assert_eq!(d.pmtud.confirm_count, 3);
+        assert_eq!(d.pmtud.resolve_epsilon, 1);
+        assert_eq!(d.pmtud.raise_step, 32);
+        assert_eq!(d.pmtud.max_probes_per_search, 64);
+        assert_eq!(d.pmtud.max_concurrent_peers, 4);
         assert_eq!(d.pmtud.stable_downgrade_batches, 3);
 
         assert_eq!(d.timers.keepalive_secs, 5);
         assert_eq!(d.timers.msyn_secs, 15);
-        assert_eq!(d.timers.pmtud_batch_secs, 60);
+        assert_eq!(d.timers.pmtud_tick_ms, 50);
+        assert_eq!(d.timers.pmtud_raise_secs, 60);
         assert_eq!(d.timers.ping_watchdog_ms, 100);
         assert_eq!(d.timers.stale_tick_secs, 30);
         assert_eq!(d.timers.stale_mark_secs, 35);
@@ -672,31 +688,31 @@ mod tests {
 
         assert!(d.congestion.rtt_base_tracking);
         assert!(d.congestion.loss_classifier_enabled);
-        assert_eq!(d.congestion.target_queue_delay_ms, 10);
+        assert_eq!(d.congestion.target_queue_delay_ms, 15);
         assert_eq!(d.congestion.congestion_loss_threshold, 0.7);
-        assert_eq!(d.congestion.base_rtt_window_secs, 3);
+        assert_eq!(d.congestion.base_rtt_window_secs, 6);
         assert_eq!(d.congestion.base_rtt_stale_windows, 2);
         assert_eq!(
             d.congestion.owd_clock_jump_reject_ms,
             crate::routing::DEFAULT_OWD_CLOCK_JUMP_REJECT_MS
         );
-        assert_eq!(d.congestion.probe_interval_ms, 20);
+        assert_eq!(d.congestion.probe_interval_ms, 25);
         assert_eq!(d.congestion.fec_recovery_recency_ms, 3_000);
         assert!(d.congestion.enabled);
-        assert_eq!(d.congestion.gain, 0.35);
-        assert_eq!(d.congestion.hol_escape_ms, 5);
-        assert_eq!(d.congestion.initial_rate_bps, 8_000_000.0);
-        assert_eq!(d.congestion.additive_increase_bps, 48_000.0);
-        assert_eq!(d.congestion.min_decrease_factor, 0.85);
-        assert_eq!(d.congestion.rate_smoothing_alpha, 0.8);
-        assert_eq!(d.congestion.loss_multiplicative_decrease, 0.85);
-        assert_eq!(d.congestion.min_rate_bps, 1_500_000.0);
-        assert_eq!(d.congestion.max_rate_bps, 20_000_000.0);
-        assert_eq!(d.congestion.burst_cap_bytes, 16_000);
-        assert_eq!(d.congestion.delivery_rate_window_ms, 500);
+        assert_eq!(d.congestion.gain, 0.1);
+        assert_eq!(d.congestion.hol_escape_ms, 12);
+        assert_eq!(d.congestion.initial_rate_bps, 1_500_000.0);
+        assert_eq!(d.congestion.additive_increase_bps, 8_000.0);
+        assert_eq!(d.congestion.min_decrease_factor, 0.9);
+        assert_eq!(d.congestion.rate_smoothing_alpha, 0.9);
+        assert_eq!(d.congestion.loss_multiplicative_decrease, 0.9);
+        assert_eq!(d.congestion.min_rate_bps, 1_000_000.0);
+        assert_eq!(d.congestion.max_rate_bps, 12_000_000.0);
+        assert_eq!(d.congestion.burst_cap_bytes, 12_000);
+        assert_eq!(d.congestion.delivery_rate_window_ms, 750);
         assert_eq!(d.congestion.delivery_rate_ewma_alpha, 0.25);
-        assert_eq!(d.congestion.delivery_anchor_factor, 0.9);
-        assert_eq!(d.congestion.delivery_decouple_ratio, 1.25);
+        assert_eq!(d.congestion.delivery_anchor_factor, 0.95);
+        assert_eq!(d.congestion.delivery_decouple_ratio, 1.5);
 
         assert_eq!(d.routing_ewma.rtt_ewma_old, 0.8);
         assert_eq!(d.routing_ewma.rtt_ewma_new, 0.2);
@@ -709,6 +725,7 @@ mod tests {
         assert_eq!(d.engine_limits.max_direct_retry_per_tick, 32);
         assert_eq!(d.engine_limits.max_pending_heal_probes, 96);
         assert_eq!(d.engine_limits.msyn_body_max, 524_288);
+        assert_eq!(d.engine_limits.msyn_shard_budget_bytes, 1200);
         assert_eq!(d.engine_limits.stun_cache_ttl_secs, 30);
 
         assert_eq!(d.hole_punch.punch_stage1_packets, 3);
@@ -943,28 +960,21 @@ delivery_decouple_ratio = 1.5
     }
 
     #[test]
-    fn clamp_probe_ladder_unique_descending() {
+    fn clamp_pmtud_knobs() {
         let mut t = AdvancedTuning::default();
-        t.pmtud.probe_sizes = vec![1000, 1000, 1400, 9999, 200, 1300];
+        t.pmtud.probe_timeout_ms = 1;
+        t.pmtud.confirm_count = 0;
+        t.pmtud.resolve_epsilon = 99;
+        t.pmtud.raise_step = 0;
+        t.pmtud.max_probes_per_search = 1;
+        t.pmtud.max_concurrent_peers = 0;
         t.clamp();
-        // 9999 and 200 filtered; remaining unique + strictly decreasing.
-        assert!(t.pmtud.probe_sizes.len() >= 2);
-        for w in t.pmtud.probe_sizes.windows(2) {
-            assert!(
-                w[0] > w[1],
-                "not strictly decreasing: {:?}",
-                t.pmtud.probe_sizes
-            );
-        }
-        assert!(t.pmtud.probe_sizes.iter().all(|s| (576..=1500).contains(s)));
-    }
-
-    #[test]
-    fn clamp_probe_ladder_falls_back_when_too_small() {
-        let mut t = AdvancedTuning::default();
-        t.pmtud.probe_sizes = vec![1500];
-        t.clamp();
-        assert_eq!(t.pmtud.probe_sizes, crate::pmtud::PROBE_SIZES.to_vec());
+        assert_eq!(t.pmtud.probe_timeout_ms, 50);
+        assert_eq!(t.pmtud.confirm_count, 1);
+        assert_eq!(t.pmtud.resolve_epsilon, 8);
+        assert_eq!(t.pmtud.raise_step, 1);
+        assert_eq!(t.pmtud.max_probes_per_search, 8);
+        assert_eq!(t.pmtud.max_concurrent_peers, 1);
     }
 
     #[test]
@@ -1000,10 +1010,12 @@ delivery_decouple_ratio = 1.5
     fn clamp_engine_limits_and_fec_max_shards() {
         let mut t = AdvancedTuning::default();
         t.engine_limits.msyn_body_max = 10_000_000;
+        t.engine_limits.msyn_shard_budget_bytes = 10_000;
         t.engine_limits.max_direct_retry_per_tick = 0;
         t.fec.fec_max_total_shards = 999;
         t.clamp();
         assert_eq!(t.engine_limits.msyn_body_max, 524_288);
+        assert_eq!(t.engine_limits.msyn_shard_budget_bytes, 4096);
         assert_eq!(t.engine_limits.max_direct_retry_per_tick, 1);
         assert_eq!(
             t.fec.fec_max_total_shards,

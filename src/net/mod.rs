@@ -3,6 +3,7 @@ pub mod decentralized;
 pub mod engine;
 pub mod fec;
 pub mod msyn_sync;
+pub mod outbound_udp;
 pub mod pace_clock;
 pub mod pacing;
 pub mod pacing_defaults;
@@ -13,5 +14,6 @@ pub mod packet;
 pub mod pmtud_probe;
 pub mod reliable;
 pub mod retransmit;
+pub mod size_loss;
 
 pub use engine::JoinAck;
