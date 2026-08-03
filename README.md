@@ -57,7 +57,7 @@ NOTE: Please note that this is a very first project created as a hobby by someon
 - **Adaptive FEC**: Reed-Solomon shards recover lost packets without waiting on retransmission + loss classifier
 - **Automatic failover**: quality-scored routing switches between direct and owner-relayed paths.
 - **NAT traversal**: STUN, UPnP, ICE-style candidates, canonical hole punching, plus a LAN "parasitic" mode that needs no invite ID
-- **Path MTU discovery**: adaptive shard/frame sizing to the live path MTU
+- **PPacketization Layer Path MTU Discovery**: adaptive shard/frame sizing to the live path MTU
 
 ---
 
