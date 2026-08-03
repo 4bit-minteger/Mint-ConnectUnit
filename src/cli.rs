@@ -5037,7 +5037,7 @@ impl Cli {
             a.routing_ewma.rtt_score_clamp_ms
         );
         crate::cli_println!(
-            "  engine_limits: direct_retry/tick={} heal_pending={} stun_pending={} cc_probes/tick={} secondary_retry/tick={} stun_ttl={}s msyn_body_max={} msyn_shard_budget={} heal_cooldown_ms={}",
+            "  engine_limits: direct_retry/tick={} heal_pending={} stun_pending={} cc_probes/tick={} secondary_retry/tick={} stun_ttl={}s msyn_body_max={} msyn_shard_budget={} heal_cooldown_ms={} probe_miss_fail_threshold={}",
             a.engine_limits.max_direct_retry_per_tick,
             a.engine_limits.max_pending_heal_probes,
             a.engine_limits.max_pending_stun_queries,
@@ -5046,7 +5046,8 @@ impl Cli {
             a.engine_limits.stun_cache_ttl_secs,
             a.engine_limits.msyn_body_max,
             a.engine_limits.msyn_shard_budget_bytes,
-            a.engine_limits.heal_cooldown_ms
+            a.engine_limits.heal_cooldown_ms,
+            a.engine_limits.probe_miss_fail_threshold
         );
         crate::cli_println!(
             "  hole_punch: s1_pkts={} s1_gap_ms={} s1_obs_ms={} s2_obs_s={} s2_pps={} s3_pps={} s3_max_s={} s3_gap_ms={} max_targets={} wide_w={}-{} rand_ports={}-{}",

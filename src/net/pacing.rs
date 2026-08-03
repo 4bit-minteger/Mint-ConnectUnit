@@ -479,6 +479,10 @@ pub struct PacingEngine {
     peer_queues: IndexMap<SocketAddr, PeerDataQueue>,
 
     non_empty_peers: usize,
+    /// Packets currently queued (data + control + retransmit); drives O(1) fill ratio.
+    queued_packets_total: usize,
+    /// Pace ticks accepted since last reset (for DRR-RTT refresh cadence).
+    tick_seq: u64,
     budget: f64,
     last_tick: Instant,
     dropped_packets: u64,
@@ -729,6 +733,8 @@ impl PacingEngine {
             retransmit_q: VecDeque::new(),
             peer_queues: IndexMap::new(),
             non_empty_peers: 0,
+            queued_packets_total: 0,
+            tick_seq: 0,
             budget: 0.0,
             last_tick: Instant::now(),
             dropped_packets: 0,
@@ -919,6 +925,9 @@ impl PacingEngine {
         if was_empty && !q.is_empty() {
             self.non_empty_peers = self.non_empty_peers.saturating_add(1);
         }
+        if kept {
+            self.queued_packets_total = self.queued_packets_total.saturating_add(1);
+        }
         if !kept {
             self.dropped_packets = self.dropped_packets.saturating_add(1);
             self.dropped_data = self.dropped_data.saturating_add(1);
@@ -962,6 +971,7 @@ impl PacingEngine {
         if was_empty && !q.is_empty() {
             self.non_empty_peers = self.non_empty_peers.saturating_add(1);
         }
+        self.queued_packets_total = self.queued_packets_total.saturating_add(pkts.len());
         true
     }
 
@@ -979,12 +989,12 @@ impl PacingEngine {
 
     pub fn remove_peer(&mut self, dest: SocketAddr) {
         if let Some(idx) = self.peer_queues.get_index_of(&dest) {
-            if self
-                .peer_queues
-                .get_index(idx)
-                .is_some_and(|(_, q)| !q.is_empty())
-            {
-                self.non_empty_peers = self.non_empty_peers.saturating_sub(1);
+            if let Some((_, q)) = self.peer_queues.get_index(idx) {
+                let n = q.len();
+                if n > 0 {
+                    self.non_empty_peers = self.non_empty_peers.saturating_sub(1);
+                    self.queued_packets_total = self.queued_packets_total.saturating_sub(n);
+                }
             }
             self.peer_queues.shift_remove_index(idx);
             if self.drr_cursor > 0 && idx < self.drr_cursor {
@@ -1019,6 +1029,7 @@ impl PacingEngine {
             let mut evicted = false;
             while self.retransmit_q.len() >= cap {
                 if self.retransmit_q.pop_front().is_some() {
+                    self.queued_packets_total = self.queued_packets_total.saturating_sub(1);
                     self.dropped_packets = self.dropped_packets.saturating_add(1);
                     self.dropped_control_retransmit =
                         self.dropped_control_retransmit.saturating_add(1);
@@ -1032,6 +1043,7 @@ impl PacingEngine {
                 dest,
                 enqueued_at: now,
             });
+            self.queued_packets_total = self.queued_packets_total.saturating_add(1);
             return evicted;
         }
         let cap = self.config.max_control_queue_packets.max(1);
@@ -1041,6 +1053,7 @@ impl PacingEngine {
         let mut evicted = false;
         while self.control_q.len() >= cap {
             if self.control_q.pop_front().is_some() {
+                self.queued_packets_total = self.queued_packets_total.saturating_sub(1);
                 self.dropped_packets = self.dropped_packets.saturating_add(1);
                 self.dropped_control_normal = self.dropped_control_normal.saturating_add(1);
                 evicted = true;
@@ -1053,6 +1066,7 @@ impl PacingEngine {
             dest,
             enqueued_at: now,
         });
+        self.queued_packets_total = self.queued_packets_total.saturating_add(1);
         evicted
     }
 
@@ -1122,6 +1136,7 @@ impl PacingEngine {
                     } else {
                         self.control_q.push_front(q);
                     }
+                    self.queued_packets_total = self.queued_packets_total.saturating_add(1);
                     Err(None)
                 } else {
                     if retransmit {
@@ -1129,6 +1144,7 @@ impl PacingEngine {
                     } else {
                         self.control_q.push_front(q);
                     }
+                    self.queued_packets_total = self.queued_packets_total.saturating_add(1);
                     self.consecutive_errors = self.consecutive_errors.saturating_add(1);
                     if self.consecutive_errors >= 5 {
                         Err(Some(TickResult::SocketDead {
@@ -1180,6 +1196,7 @@ impl PacingEngine {
                             enqueued_at,
                         } => self.requeue_data_at_front(dest, pkt, enqueued_at),
                     }
+                    self.queued_packets_total = self.queued_packets_total.saturating_add(1);
                     Err(None)
                 } else {
                     match item {
@@ -1190,6 +1207,7 @@ impl PacingEngine {
                             enqueued_at,
                         } => self.requeue_data_at_front(dest, pkt, enqueued_at),
                     }
+                    self.queued_packets_total = self.queued_packets_total.saturating_add(1);
                     self.consecutive_errors = self.consecutive_errors.saturating_add(1);
                     if self.consecutive_errors >= 5 {
                         Err(Some(TickResult::SocketDead {
@@ -1232,6 +1250,7 @@ impl PacingEngine {
                 break;
             }
             let q = self.retransmit_q.pop_front().expect("front checked");
+            self.queued_packets_total = self.queued_packets_total.saturating_sub(1);
             match self.try_send_queued_packet(try_send, q, true, sent) {
                 Ok(()) => {
                     self.reserved_rtx_sends = self.reserved_rtx_sends.saturating_add(1);
@@ -1255,6 +1274,7 @@ impl PacingEngine {
                 break;
             }
             let q = self.control_q.pop_front().expect("front checked");
+            self.queued_packets_total = self.queued_packets_total.saturating_sub(1);
             match self.try_send_queued_packet(try_send, q, false, sent) {
                 Ok(()) => {
                     self.reserved_ctrl_sends = self.reserved_ctrl_sends.saturating_add(1);
@@ -1304,14 +1324,17 @@ impl PacingEngine {
         }
         self.budget = self.budget.min(self.budget_cap_value());
         self.background_cc.refill_all_tokens(elapsed.as_secs_f64());
-        self.refresh_drr_rtt_ref();
+        self.tick_seq = self.tick_seq.wrapping_add(1);
+        if self.tick_seq % 32 == 0 {
+            self.refresh_drr_rtt_ref();
+        }
 
         // APD: compute decision once per tick (gated on enabled flag — zero cost when off).
         let (effective_burst, freeze_drr) = if self.apd.cfg.enabled {
             let fill = self.queue_fill_ratio();
-            let hol_sojourn_ms = self.max_hol_sojourn_ms(now);
+            let (hol_sojourn_ms, any_cc) = self.apd_pressure_scan(now);
             self.apd.last_max_sojourn_ms = hol_sojourn_ms.round() as u64;
-            let decision = self.apd_step(fill, now, hol_sojourn_ms);
+            let decision = self.apd_step(fill, now, hol_sojourn_ms, any_cc);
             (decision.effective_burst, decision.freeze_drr)
         } else {
             (self.config.base_max_burst, false)
@@ -1359,6 +1382,18 @@ impl PacingEngine {
     pub(crate) fn cached_rtt_ref_ms_for_test(&self) -> f32 {
         self.cached_rtt_ref_ms
     }
+
+    pub(crate) fn queued_packets_total_for_test(&self) -> usize {
+        self.queued_packets_total
+    }
+
+    pub(crate) fn queue_fill_ratio_for_test(&self) -> f32 {
+        self.queue_fill_ratio()
+    }
+
+    pub(crate) fn max_hol_sojourn_ms_for_test(&self, now: Instant) -> f32 {
+        self.apd_pressure_scan(now).0
+    }
 }
 
 impl PacingEngine {
@@ -1387,6 +1422,8 @@ impl PacingEngine {
         self.retransmit_q.clear();
         self.peer_queues.clear();
         self.non_empty_peers = 0;
+        self.queued_packets_total = 0;
+        self.tick_seq = 0;
         self.budget = 0.0;
         self.dropped_packets = 0;
         self.dropped_data = 0;
@@ -1456,10 +1493,10 @@ impl PacingEngine {
 
     /// Instant queue depths and aggregate fill for runtime dashboard / APD.
     pub fn queue_snapshot(&self) -> PacingQueueSnapshot {
-        let data_queued = self.peer_queues.values().map(|q| q.len()).sum::<usize>();
         let control_queued = self.control_q.len();
         let retransmit_queued = self.retransmit_q.len();
-        let total = data_queued + control_queued + retransmit_queued;
+        let total = self.queued_packets_total;
+        let data_queued = total.saturating_sub(control_queued.saturating_add(retransmit_queued));
         let cap = (self.non_empty_peers.max(1) * self.config.max_data_queue_packets)
             + self.config.max_control_queue_packets
             + self.config.max_retransmit_queue_packets;
@@ -1475,11 +1512,14 @@ impl PacingEngine {
 
     /// Fraction of queue capacity currently occupied, clamped to [0, 1].
     fn queue_fill_ratio(&self) -> f32 {
-        self.queue_snapshot().fill_ratio
+        let cap = (self.non_empty_peers.max(1) * self.config.max_data_queue_packets)
+            + self.config.max_control_queue_packets
+            + self.config.max_retransmit_queue_packets;
+        (self.queued_packets_total as f32 / cap.max(1) as f32).clamp(0.0, 1.0)
     }
 
-    /// Head-of-line sojourn across control, retransmit, and peer data queues (ms).
-    fn max_hol_sojourn_ms(&self, now: Instant) -> f32 {
+    /// One peer/control pass: max HOL sojourn (ms) and whether any data peer is CC-sendable.
+    fn apd_pressure_scan(&self, now: Instant) -> (f32, bool) {
         let mut max_ms = 0.0_f32;
         if let Some(q) = self.control_q.front() {
             max_ms = max_ms.max(now.duration_since(q.enqueued_at).as_secs_f32() * 1000.0);
@@ -1487,10 +1527,27 @@ impl PacingEngine {
         if let Some(q) = self.retransmit_q.front() {
             max_ms = max_ms.max(now.duration_since(q.enqueued_at).as_secs_f32() * 1000.0);
         }
-        for q in self.peer_queues.values() {
-            max_ms = max_ms.max(q.hol_sojourn_ms(now));
+
+        let cc_needed = self.apd.cfg.require_cc_headroom && self.config.background_cc.enabled;
+        let (priority_on, threshold) = self.peer_lane_config();
+        let mut scanned = 0usize;
+        let mut any_cc = !cc_needed;
+        for (dest, q) in self.peer_queues.iter() {
+            let hol = q.hol_sojourn_ms(now);
+            max_ms = max_ms.max(hol);
+            if !cc_needed || any_cc || q.is_empty() {
+                continue;
+            }
+            scanned = scanned.saturating_add(1);
+            let front_len = q.front_len(priority_on, threshold, now);
+            if self.background_cc_can_send(*dest, front_len, hol) {
+                any_cc = true;
+            }
         }
-        max_ms
+        if cc_needed && !any_cc {
+            any_cc = scanned == 0;
+        }
+        (max_ms, any_cc)
     }
 
     fn shed_stale_bulk_rr(&mut self, now: Instant, deadline: Instant) {
@@ -1526,6 +1583,7 @@ impl PacingEngine {
             if now_empty {
                 self.non_empty_peers = self.non_empty_peers.saturating_sub(1);
             }
+            self.queued_packets_total = self.queued_packets_total.saturating_sub(1);
             self.shed_sojourn = self.shed_sojourn.saturating_add(1);
             self.dropped_packets = self.dropped_packets.saturating_add(1);
             dropped = dropped.saturating_add(1);
@@ -1590,28 +1648,6 @@ impl PacingEngine {
     /// Ticks where CC headroom gate suppressed APD ramp-up, Drain arm, or mid-Drain spin.
     pub fn apd_cc_headroom_suppressions(&self) -> u64 {
         self.apd.cc_headroom_suppressions
-    }
-
-    /// True when background CC is off, no non-empty data peers exist (vacuous), or at least
-    /// one non-empty peer HOL passes `can_send_data` (including `hol_escape`).
-    fn any_peer_data_cc_sendable(&self, now: Instant) -> bool {
-        if !self.config.background_cc.enabled {
-            return true;
-        }
-        let (priority_on, threshold) = self.peer_lane_config();
-        let mut scanned = 0usize;
-        for (dest, q) in self.peer_queues.iter() {
-            if q.is_empty() {
-                continue;
-            }
-            scanned = scanned.saturating_add(1);
-            let front_len = q.front_len(priority_on, threshold, now);
-            let hol = q.hol_sojourn_ms(now);
-            if self.background_cc_can_send(*dest, front_len, hol) {
-                return true;
-            }
-        }
-        scanned == 0
     }
 
     /// Decay ramp toward base without allowing pin/increase (CC headroom suppress path).
@@ -1679,12 +1715,18 @@ impl PacingEngine {
 
     /// Runs one step of the APD state machine given the current queue fill ratio and
     /// wall-clock instant. Returns the send budget and clock mode for this tick.
-    fn apd_step(&mut self, fill_ratio: f32, now: Instant, hol_sojourn_ms: f32) -> ApdDecision {
+    fn apd_step(
+        &mut self,
+        fill_ratio: f32,
+        now: Instant,
+        hol_sojourn_ms: f32,
+        any_cc_sendable: bool,
+    ) -> ApdDecision {
         let cfg = self.apd.cfg;
         let base_burst = self.config.base_max_burst;
         let ramp_ceiling = cfg.ramp_max_burst.max(base_burst);
         let drain_burst = cfg.drain_max_burst.clamp(1, ramp_ceiling);
-        let suppress_cc = cfg.require_cc_headroom && !self.any_peer_data_cc_sendable(now);
+        let suppress_cc = cfg.require_cc_headroom && !any_cc_sendable;
 
         match self.apd.phase {
             ApdPhase::Cooldown => {
@@ -1817,9 +1859,27 @@ impl PacingEngine {
         let ctrl_divisor = if ctrl_pressure || ctrl_aging { 2 } else { 4 };
         self.interleave_counter = self.interleave_counter.wrapping_add(1);
         if self.interleave_counter % ctrl_divisor == 0 {
-            return self.control_q.pop_front().map(NextPacket::Control);
+            return self.pop_control_for_send();
         }
         None
+    }
+
+    fn pop_control_for_send(&mut self) -> Option<NextPacket> {
+        self.control_q.pop_front().map(|q| {
+            self.queued_packets_total = self.queued_packets_total.saturating_sub(1);
+            NextPacket::Control(q)
+        })
+    }
+
+    fn pop_retransmit_for_send(&mut self) -> Option<NextPacket> {
+        self.retransmit_q.pop_front().map(|q| {
+            self.queued_packets_total = self.queued_packets_total.saturating_sub(1);
+            NextPacket::Control(q)
+        })
+    }
+
+    fn note_data_dequeued(&mut self) {
+        self.queued_packets_total = self.queued_packets_total.saturating_sub(1);
     }
 
     /// Pop the next packet to send, using pure round-robin when `freeze_drr` is
@@ -1829,8 +1889,8 @@ impl PacingEngine {
             return self.pop_next();
         }
         // Retransmit priority is always preserved.
-        if let Some(pkt) = self.retransmit_q.pop_front() {
-            return Some(NextPacket::Control(pkt));
+        if let Some(pkt) = self.pop_retransmit_for_send() {
+            return Some(pkt);
         }
         if let Some(pkt) = self.try_pop_control_interleaved() {
             return Some(pkt);
@@ -1866,6 +1926,7 @@ impl PacingEngine {
             };
             if let Some((dest, entry, kind, now_empty)) = popped {
                 self.record_peer_pop_kind(kind);
+                self.note_data_dequeued();
                 if now_empty {
                     self.non_empty_peers = self.non_empty_peers.saturating_sub(1);
                 }
@@ -1876,12 +1937,12 @@ impl PacingEngine {
                 });
             }
         }
-        self.control_q.pop_front().map(NextPacket::Control)
+        self.pop_control_for_send()
     }
 
     fn pop_next(&mut self) -> Option<NextPacket> {
-        if let Some(pkt) = self.retransmit_q.pop_front() {
-            return Some(NextPacket::Control(pkt));
+        if let Some(pkt) = self.pop_retransmit_for_send() {
+            return Some(pkt);
         }
         if let Some(pkt) = self.try_pop_control_interleaved() {
             return Some(pkt);
@@ -1910,6 +1971,7 @@ impl PacingEngine {
                     };
                     if let Some((dest, entry, kind, now_empty)) = popped {
                         self.record_peer_pop_kind(kind);
+                        self.note_data_dequeued();
                         if now_empty {
                             self.non_empty_peers = self.non_empty_peers.saturating_sub(1);
                         }
@@ -1921,16 +1983,16 @@ impl PacingEngine {
                     }
                 }
             }
-            return self.control_q.pop_front().map(NextPacket::Control);
+            return self.pop_control_for_send();
         }
 
         let n = self.peer_queues.len();
         if n == 0 {
-            return self.control_q.pop_front().map(NextPacket::Control);
+            return self.pop_control_for_send();
         }
 
         if self.non_empty_peers == 0 {
-            return self.control_q.pop_front().map(NextPacket::Control);
+            return self.pop_control_for_send();
         }
 
         let (priority_on, threshold) = self.peer_lane_config();
@@ -2016,6 +2078,7 @@ impl PacingEngine {
             };
             if let Some((dest, entry, kind, now_empty)) = send {
                 self.record_peer_pop_kind(kind);
+                self.note_data_dequeued();
                 if now_empty {
                     self.non_empty_peers = self.non_empty_peers.saturating_sub(1);
                 }
@@ -2028,7 +2091,7 @@ impl PacingEngine {
         }
         self.drr_rtt_scale_applied = self.drr_rtt_scale_applied.saturating_add(rtt_scale_hits);
 
-        self.control_q.pop_front().map(NextPacket::Control)
+        self.pop_control_for_send()
     }
 }
 
@@ -2210,7 +2273,7 @@ mod tests {
         let mut p = apd_engine();
         let now = Instant::now();
         // Fresh engine starts in Cooldown; cooldown_until is None, so it moves to Alert.
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Alert);
         assert!(!p.apd.last_pure_spin);
     }
@@ -2220,15 +2283,15 @@ mod tests {
         let mut p = apd_engine();
         let now = Instant::now();
         // Advance to Alert phase first.
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Alert);
 
         // confirm_ticks = 3: need 3 consecutive ticks above high_wm.
-        p.apd_step(0.80, now, 0.0); // counter = 1
+        p.apd_step(0.80, now, 0.0, true); // counter = 1
         assert_eq!(p.apd.phase, ApdPhase::Alert);
-        p.apd_step(0.80, now, 0.0); // counter = 2
+        p.apd_step(0.80, now, 0.0, true); // counter = 2
         assert_eq!(p.apd.phase, ApdPhase::Alert);
-        p.apd_step(0.80, now, 0.0); // counter = 3 → Drain
+        p.apd_step(0.80, now, 0.0, true); // counter = 3 → Drain
         assert_eq!(p.apd.phase, ApdPhase::Drain);
         assert_eq!(p.apd.drain_episodes, 1);
     }
@@ -2237,9 +2300,9 @@ mod tests {
     fn apd_alert_counter_decrements_on_low_fill() {
         let mut p = apd_engine();
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0); // → Alert
-        p.apd_step(0.80, now, 0.0); // counter = 1
-        p.apd_step(0.20, now, 0.0); // counter back to 0 (saturating_sub)
+        p.apd_step(0.0, now, 0.0, true); // → Alert
+        p.apd_step(0.80, now, 0.0, true); // counter = 1
+        p.apd_step(0.20, now, 0.0, true); // counter back to 0 (saturating_sub)
         assert_eq!(p.apd.confirm_counter, 0);
         assert_eq!(p.apd.phase, ApdPhase::Alert);
     }
@@ -2248,14 +2311,14 @@ mod tests {
     fn apd_drain_exits_on_low_watermark() {
         let mut p = apd_engine();
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0); // → Alert
+        p.apd_step(0.0, now, 0.0, true); // → Alert
         for _ in 0..3 {
-            p.apd_step(0.80, now, 0.0); // → Drain after 3 ticks
+            p.apd_step(0.80, now, 0.0, true); // → Drain after 3 ticks
         }
         assert_eq!(p.apd.phase, ApdPhase::Drain);
 
         // Fill drops below low_watermark.
-        p.apd_step(0.10, now, 0.0);
+        p.apd_step(0.10, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Cooldown);
         assert!(p.apd.cooldown_until.is_some());
         assert_eq!(p.apd_signal(), (false, 0));
@@ -2265,11 +2328,11 @@ mod tests {
     fn apd_drain_uses_drain_max_burst() {
         let mut p = apd_engine();
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         for _ in 0..3 {
-            p.apd_step(0.80, now, 0.0);
+            p.apd_step(0.80, now, 0.0, true);
         }
-        let decision = p.apd_step(0.80, now, 0.0);
+        let decision = p.apd_step(0.80, now, 0.0, true);
         assert_eq!(decision.effective_burst, 6);
     }
 
@@ -2277,9 +2340,9 @@ mod tests {
     fn apd_no_drain_below_high_watermark() {
         let mut p = apd_engine();
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         for _ in 0..10 {
-            p.apd_step(0.50, now, 0.0);
+            p.apd_step(0.50, now, 0.0, true);
             assert_eq!(p.apd.phase, ApdPhase::Alert);
         }
     }
@@ -2289,13 +2352,13 @@ mod tests {
         let mut p = apd_engine();
         p.apd.cfg.spinloop_budget_ms = 1;
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0); // → Alert
+        p.apd_step(0.0, now, 0.0, true); // → Alert
         for _ in 0..3 {
-            p.apd_step(0.80, now, 0.0); // → Drain
+            p.apd_step(0.80, now, 0.0, true); // → Drain
         }
         assert_eq!(p.apd.phase, ApdPhase::Drain);
         std::thread::sleep(Duration::from_millis(5));
-        p.apd_step(0.80, Instant::now(), 0.0);
+        p.apd_step(0.80, Instant::now(), 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Cooldown);
         assert_eq!(p.apd.drain_budget_hits, 1);
     }
@@ -2305,13 +2368,13 @@ mod tests {
         let mut p = apd_engine();
         p.apd.cfg.spinloop_budget_ms = 0;
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         for _ in 0..3 {
-            p.apd_step(0.80, now, 0.0);
+            p.apd_step(0.80, now, 0.0, true);
         }
         assert_eq!(p.apd.phase, ApdPhase::Drain);
         for _ in 0..5 {
-            p.apd_step(0.80, now, 0.0);
+            p.apd_step(0.80, now, 0.0, true);
             assert_eq!(p.apd.phase, ApdPhase::Drain);
         }
         assert_eq!(p.apd.drain_budget_hits, 0);
@@ -2322,12 +2385,12 @@ mod tests {
         let mut p = apd_engine();
         p.apd.cfg.spinloop_budget_ms = 0;
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         for _ in 0..3 {
-            p.apd_step(0.80, now, 0.0);
+            p.apd_step(0.80, now, 0.0, true);
         }
         assert_eq!(p.apd.phase, ApdPhase::Drain);
-        p.apd_step(0.10, now, 0.0);
+        p.apd_step(0.10, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Cooldown);
     }
 
@@ -2336,9 +2399,9 @@ mod tests {
         let mut p = apd_engine();
         p.apd.cfg.confirm_ticks = 0;
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Alert);
-        p.apd_step(0.80, now, 0.0);
+        p.apd_step(0.80, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Drain);
     }
 
@@ -2451,9 +2514,9 @@ mod tests {
         p.apd.cfg.low_watermark = 0.5;
         p.apd.cfg.confirm_ticks = 1;
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Alert);
-        p.apd_step(0.51, now, 0.0);
+        p.apd_step(0.51, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Drain);
     }
 
@@ -2464,17 +2527,17 @@ mod tests {
         p.apd.cfg.low_watermark = 0.5;
         p.apd.cfg.confirm_ticks = 1;
         let now = Instant::now();
-        p.apd_step(0.0, now, 0.0);
-        p.apd_step(0.51, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
+        p.apd_step(0.51, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Drain);
-        p.apd_step(0.49, now, 0.0);
+        p.apd_step(0.49, now, 0.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Cooldown);
     }
 
     fn pin_apd_ramp(p: &mut PacingEngine, now: Instant) {
-        p.apd_step(0.0, now, 0.0);
+        p.apd_step(0.0, now, 0.0, true);
         for _ in 0..2 {
-            p.apd_step(0.80, now, 0.0);
+            p.apd_step(0.80, now, 0.0, true);
         }
         let ceiling = p.apd.cfg.ramp_max_burst.max(p.config.base_max_burst);
         p.apd.ramp_burst = ceiling;
@@ -2487,7 +2550,7 @@ mod tests {
         let now = Instant::now();
         pin_apd_ramp(&mut p, now);
         for _ in 0..3 {
-            p.apd_step(0.05, now, 25.0);
+            p.apd_step(0.05, now, 25.0, true);
         }
         assert_eq!(p.apd.phase, ApdPhase::Drain);
         assert_eq!(p.apd.drain_arm_sojourn, 1);
@@ -2499,12 +2562,12 @@ mod tests {
         let now = Instant::now();
         pin_apd_ramp(&mut p, now);
         for _ in 0..3 {
-            p.apd_step(0.05, now, 25.0);
+            p.apd_step(0.05, now, 25.0, true);
         }
         assert_eq!(p.apd.phase, ApdPhase::Drain);
-        p.apd_step(0.05, now, 15.0);
+        p.apd_step(0.05, now, 15.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Drain);
-        p.apd_step(0.05, now, 5.0);
+        p.apd_step(0.05, now, 5.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Cooldown);
     }
 
@@ -2515,10 +2578,10 @@ mod tests {
         let now = Instant::now();
         pin_apd_ramp(&mut p, now);
         for _ in 0..3 {
-            p.apd_step(0.80, now, 0.0);
+            p.apd_step(0.80, now, 0.0, true);
         }
         assert_eq!(p.apd.phase, ApdPhase::Drain);
-        p.apd_step(0.10, now, 50.0);
+        p.apd_step(0.10, now, 50.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Cooldown);
     }
 
@@ -2546,7 +2609,7 @@ mod tests {
         );
         p.non_empty_peers = 1;
         let now = Instant::now();
-        let ms = p.max_hol_sojourn_ms(now);
+        let ms = p.max_hol_sojourn_ms_for_test(now);
         assert!(ms >= 25.0, "expected aged HOL sojourn, got {ms}");
     }
 
@@ -2633,7 +2696,7 @@ mod tests {
         let now = Instant::now();
         pin_apd_ramp(&mut p, now);
         for _ in 0..3 {
-            p.apd_step(0.05, now, 25.0);
+            p.apd_step(0.05, now, 25.0, true);
         }
         assert_eq!(p.apd.phase, ApdPhase::Drain);
         for _ in 0..20 {
@@ -2862,7 +2925,7 @@ mod tests {
         );
         p.non_empty_peers = 1;
         p.enqueue_peer(Bytes::from(vec![0u8; 10]), dest);
-        let ms = p.max_hol_sojourn_ms(Instant::now());
+        let ms = p.max_hol_sojourn_ms_for_test(Instant::now());
         assert!(ms >= 20.0, "expected bulk HOL in max sojourn, got {ms}");
     }
 
@@ -2986,9 +3049,10 @@ mod tests {
         enable_cc_starve(&mut p, dest);
         let now = Instant::now();
         let ceiling = p.apd.cfg.ramp_max_burst.max(p.config.base_max_burst);
-        p.apd_step(0.0, now, 0.0); // → Alert
+        // any_cc=false: peer starved (no tokens) → suppress drain arm / ramp pin.
+        p.apd_step(0.0, now, 0.0, false); // → Alert
         for _ in 0..8 {
-            p.apd_step(0.95, now, 100.0);
+            p.apd_step(0.95, now, 100.0, false);
         }
         assert_ne!(p.apd.phase, ApdPhase::Drain);
         assert!(p.apd.ramp_burst < ceiling);
@@ -3004,7 +3068,7 @@ mod tests {
         let now = Instant::now();
         pin_apd_ramp(&mut p, now);
         p.apd.cfg.confirm_ticks = 1;
-        p.apd_step(0.95, now, 100.0);
+        p.apd_step(0.95, now, 100.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Drain);
     }
 
@@ -3017,7 +3081,7 @@ mod tests {
         let now = Instant::now();
         pin_apd_ramp(&mut p, now);
         p.apd.cfg.confirm_ticks = 1;
-        p.apd_step(0.95, now, 100.0);
+        p.apd_step(0.95, now, 100.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Drain);
     }
 
@@ -3035,7 +3099,7 @@ mod tests {
         let now = Instant::now();
         pin_apd_ramp(&mut p, now);
         p.apd.cfg.confirm_ticks = 1;
-        p.apd_step(0.95, now, 100.0);
+        p.apd_step(0.95, now, 100.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Drain);
     }
 
@@ -3049,10 +3113,10 @@ mod tests {
         let now = Instant::now();
         pin_apd_ramp(&mut p, now);
         p.apd.cfg.confirm_ticks = 1;
-        p.apd_step(0.95, now, 100.0);
+        p.apd_step(0.95, now, 100.0, true);
         assert_eq!(p.apd.phase, ApdPhase::Drain);
         p.background_cc.set_peer_tokens_for_test(dest, 0.0);
-        p.apd_step(0.95, now, 100.0);
+        p.apd_step(0.95, now, 100.0, false);
         assert_eq!(p.apd.phase, ApdPhase::Cooldown);
         assert!(p.apd_cc_headroom_suppressions() >= 1);
     }
@@ -3070,5 +3134,48 @@ mod tests {
         assert!(round.apd_require_cc_headroom);
         let apd = super::apd_config_from_network(&round);
         assert!(apd.require_cc_headroom);
+    }
+
+    #[test]
+    fn queued_packets_total_tracks_enqueue_pop_reset() {
+        let mut p = PacingEngine::new();
+        assert_eq!(p.queued_packets_total_for_test(), 0);
+        assert!(p.enqueue_peer(Bytes::from_static(b"a"), addr(1)));
+        let _ = p.enqueue_control(Bytes::from_static(b"c"), addr(1));
+        assert_eq!(p.queued_packets_total_for_test(), 2);
+        assert!(
+            (p.queue_fill_ratio_for_test() - p.queue_snapshot().fill_ratio).abs() < f32::EPSILON
+        );
+        let _ = p.pop_next();
+        assert_eq!(p.queued_packets_total_for_test(), 1);
+        p.reset_session_runtime();
+        assert_eq!(p.queued_packets_total_for_test(), 0);
+        assert_eq!(p.queue_fill_ratio_for_test(), 0.0);
+    }
+
+    #[test]
+    fn drr_rtt_ref_refreshes_every_32_ticks() {
+        let mut p = PacingEngine::new();
+        p.config.drr_enabled = true;
+        p.config.drr_rtt_aware = true;
+        let d = addr(90);
+        assert!(p.enqueue_peer_with_hints(Bytes::from_static(b"x"), d, Some(40.0), None));
+        p.refresh_drr_rtt_ref_for_test();
+        assert!((p.cached_rtt_ref_ms_for_test() - 40.0).abs() < 0.01);
+        if let Some(q) = p.peer_queues.get_mut(&d) {
+            q.rtt_ms = 80.0;
+        }
+        for _ in 0..31 {
+            let _ = p.tick_simulated_ok();
+        }
+        assert!(
+            (p.cached_rtt_ref_ms_for_test() - 40.0).abs() < 0.01,
+            "ref must stay stale across 31 ticks"
+        );
+        let _ = p.tick_simulated_ok();
+        assert!(
+            (p.cached_rtt_ref_ms_for_test() - 80.0).abs() < 0.01,
+            "ref refreshes on 32nd tick"
+        );
     }
 }

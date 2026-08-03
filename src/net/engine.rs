@@ -48,7 +48,7 @@ use crate::net::msyn_sync::{
 };
 use crate::net::outbound_udp::OutboundUdpClock;
 use crate::net::pacing::PacingQueueSnapshot;
-use crate::net::pacing::{ApdPhase, PacingConfig, PacingEngine};
+use crate::net::pacing::{PacingConfig, PacingEngine};
 use crate::net::pacing_worker::{start_pacing_worker, PacingEvent, PacingWorkerHandle};
 use crate::net::packet::*;
 use crate::net::punch_workflow;
@@ -514,12 +514,12 @@ pub(crate) type PunchStateView = Arc<RwLock<PunchState>>;
 
 #[derive(Default)]
 struct PeerFecSendState {
-    backoff_until: Option<Instant>,
     ratio_last: Option<(u8, u8)>,
     ratio_last_change: Option<Instant>,
     /// Last time queuing delay exceeded the congestive threshold (FEC recovery).
     last_congestive_at: Option<Instant>,
-    loss_ewma_cached: Option<f64>,
+    /// Peer-reported wire-loss fraction from pong (`loss_permille/1000`). FEC-only.
+    rx_loss_ewma: f64,
     queuing_delay_ms_cached: Option<f64>,
 }
 
@@ -608,6 +608,8 @@ pub struct P2PEngine {
     cached_stun_endpoint: Option<(Instant, stun::PublicEndpoint)>,
     pending_pings: HashMap<u64, PendingPing>,
     next_ping_id: u64,
+    /// Consecutive CC-probe timeouts per endpoint (reset on any matched pong).
+    probe_miss_by_ep: HashMap<SocketAddr, u32>,
     heal_cooldown_until: HashMap<String, Instant>,
     ping_watchdog_interval: Interval,
     cc_probe_interval: Interval,
@@ -638,6 +640,8 @@ pub struct P2PEngine {
     rx_bytes_pending_vip: HashMap<u32, u64>,
 
     broadcast_scratch: Vec<SocketAddr>,
+    cc_probe_scratch: Vec<SocketAddr>,
+    tick_done_seq: u64,
     runtime_trace: Arc<RuntimeTrace>,
     applied_udp_sndbuf: i32,
     applied_udp_rcvbuf: i32,
@@ -669,6 +673,18 @@ enum PendingPingKind {
     User { reply: oneshot::Sender<i64> },
     Heal { vip: String, endpoint: SocketAddr },
     Probe,
+}
+
+/// Increment consecutive probe-miss streak; returns true when streak >= threshold
+/// (caller should `note_fail` at most once per endpoint per expire sweep).
+fn record_probe_miss(
+    streak: &mut HashMap<SocketAddr, u32>,
+    dest: SocketAddr,
+    threshold: u32,
+) -> bool {
+    let n = streak.entry(dest).or_insert(0);
+    *n = n.saturating_add(1);
+    *n >= threshold
 }
 
 struct PendingStunQuery {
@@ -935,8 +951,8 @@ impl P2PEngine {
             fec_shard_payload_size: 1024,
             fec_flush_standard: crate::net::fec::FEC_FLUSH_TIMEOUT,
             fec_flush_aggressive: crate::net::fec::FEC_FLUSH_TIMEOUT_AGGRESSIVE,
-            fec_adaptive_off_below: 0.015,
-            fec_adaptive_on_above: 0.03,
+            fec_adaptive_off_below: 0.025,
+            fec_adaptive_on_above: 0.05,
             encrypt_scratch: BytesMut::with_capacity(default_buffers.encrypt_scratch_bytes),
             control_scratch: BytesMut::with_capacity(default_buffers.control_scratch_bytes),
             plain_data_scratch: BytesMut::with_capacity(default_buffers.plain_data_scratch_bytes),
@@ -1012,6 +1028,7 @@ impl P2PEngine {
             cached_stun_endpoint: None,
             pending_pings: HashMap::new(),
             next_ping_id: 1,
+            probe_miss_by_ep: HashMap::new(),
             heal_cooldown_until: HashMap::new(),
             ping_watchdog_interval,
             cc_probe_interval,
@@ -1037,6 +1054,8 @@ impl P2PEngine {
             last_seen_pending: HashMap::new(),
             rx_bytes_pending_vip: HashMap::new(),
             broadcast_scratch: Vec::new(),
+            cc_probe_scratch: Vec::new(),
+            tick_done_seq: 0,
             runtime_trace,
             applied_udp_sndbuf,
             applied_udp_rcvbuf,
@@ -1595,38 +1614,34 @@ impl P2PEngine {
         vip.parse::<Ipv4Addr>().ok().map(u32::from)
     }
 
-    /// DRR fairness hint: base RTT only (propagation). Missing base → no scale.
-    fn pacing_rtt_hint_ms(&self, dest: SocketAddr) -> Option<f32> {
-        if !self.pacing.load_obs().drr_rtt_aware {
-            return None;
-        }
+    /// One routing read-guard: VIP + optional DRR RTT hint + queuing-delay hint.
+    fn tx_path_hints(&self, dest: SocketAddr) -> (Option<u32>, Option<f32>, Option<f32>) {
+        let drr_rtt_aware = self.pacing.load_obs().drr_rtt_aware;
         let rt = self.routing.read();
-        let vip = rt.ep_to_vip.get(&dest)?;
-        let entry = rt.table.get(vip)?;
-        if entry.rtt_base_ms > 0.0 {
+        let Some(vip_str) = rt.ep_to_vip.get(&dest) else {
+            return (None, None, None);
+        };
+        let vip_u32 = vip_str.parse::<Ipv4Addr>().ok().map(u32::from);
+        let Some(entry) = rt.table.get(vip_str) else {
+            return (vip_u32, None, None);
+        };
+        let rtt = if drr_rtt_aware && entry.rtt_base_ms > 0.0 {
             Some(entry.rtt_base_ms as f32)
         } else {
             None
-        }
-    }
-
-    fn routing_queuing_delay_hint_ms(&self, dest: SocketAddr) -> Option<f32> {
-        let rt = self.routing.read();
-        let vip = rt.ep_to_vip.get(&dest)?;
-        let entry = rt.table.get(vip)?;
-        let qd = crate::routing::effective_queuing_delay_ms(entry);
-        if qd >= 0.0 {
-            Some(qd as f32)
+        };
+        let qd_raw = crate::routing::effective_queuing_delay_ms(entry);
+        let qd = if qd_raw >= 0.0 {
+            Some(qd_raw as f32)
         } else {
             None
-        }
+        };
+        (vip_u32, rtt, qd)
     }
 
     fn pacing_enqueue_hints(&self, dest: SocketAddr) -> (Option<f32>, Option<f32>) {
-        (
-            self.pacing_rtt_hint_ms(dest),
-            self.routing_queuing_delay_hint_ms(dest),
-        )
+        let (_, rtt, qd) = self.tx_path_hints(dest);
+        (rtt, qd)
     }
 
     fn data_plane_primary_key(&self) -> Option<Key> {
@@ -1865,6 +1880,7 @@ impl P2PEngine {
         self.pmtud = PathMtuDiscovery::new();
         self.heal_cooldown_until.clear();
         self.pending_pings.clear();
+        self.probe_miss_by_ep.clear();
         self.fec_decoders.clear();
         self.fec_send_by_dest.clear();
         self.state.prev_path_kind.clear();
@@ -2101,7 +2117,7 @@ impl P2PEngine {
                         self.on_peer_route_removed(vip, node_id.as_deref());
                     }
                     for (_, ep, _) in victims {
-                        self.invalidate_fec_loss_ewma_cache(ep);
+                        self.invalidate_fec_qd_cache(ep);
                         self.state.crypto_keys.unbind_peer(ep);
                         self.reliable.flush_dest(ep);
                         self.teardown_fec_peer(ep);
@@ -2130,7 +2146,7 @@ impl P2PEngine {
                                     .routing
                                     .write()
                                     .note_fail(dest, owner_ep_hint);
-                                self.refresh_fec_loss_ewma_cache(dest);
+                                self.refresh_fec_qd_cache(dest);
                                 if self.state.feature_flags.predictive_heal {
                                     if let (Some(vip), true) = (fail.vip, fail.needs_heal) {
                                         self.spawn_predictive_heal(vip).await;
@@ -2140,17 +2156,24 @@ impl P2PEngine {
                         }
                     }
                     if self.metrics.is_enabled() {
-                        let obs = self.pacing.load_obs();
-                        self.metrics.set_pacing_dropped(obs.dropped_packets);
-                        self.metrics.set_pacing_drop_data_normal(obs.dropped_data);
-                        self.metrics.set_pacing_shed_sojourn(obs.shed_sojourn);
-                        self.metrics
-                            .set_pacing_drop_control_normal(obs.dropped_control_normal);
-                        self.metrics
-                            .set_pacing_drop_control_retransmit(obs.dropped_control_retransmit);
-                        self.refresh_pacing_thread_metrics();
+                        self.tick_done_seq = self.tick_done_seq.wrapping_add(1);
+                        if self.tick_done_seq % 8 == 0 {
+                            let obs = self.pacing.load_obs();
+                            self.metrics.set_pacing_dropped(obs.dropped_packets);
+                            self.metrics.set_pacing_drop_data_normal(obs.dropped_data);
+                            self.metrics.set_pacing_shed_sojourn(obs.shed_sojourn);
+                            self.metrics
+                                .set_pacing_drop_control_normal(obs.dropped_control_normal);
+                            self.metrics
+                                .set_pacing_drop_control_retransmit(obs.dropped_control_retransmit);
+                            self.refresh_pacing_thread_metrics();
+                        }
                     }
-                    let drain = matches!(self.pacing.load_obs().apd_phase, ApdPhase::Drain);
+                    let drain = self
+                        .pacing_thread
+                        .shared
+                        .apd_pure_spin
+                        .load(Ordering::Acquire);
                     self.fec_tx.request_flush_due(drain);
                     self.reliable.tick_into(
                         &mut self.reliable_tick_buf,
@@ -2161,7 +2184,7 @@ impl P2PEngine {
                     for (_seq, dest) in reliable_failures {
                         let owner_ep_hint = self.owner_send_endpoint();
                         let fail = self.routing.write().note_fail(dest, owner_ep_hint);
-                        self.refresh_fec_loss_ewma_cache(dest);
+                        self.refresh_fec_qd_cache(dest);
                         if self.state.feature_flags.predictive_heal {
                             if let (Some(vip), true) = (fail.vip, fail.needs_heal) {
                                 self.spawn_predictive_heal(vip).await;
@@ -2205,7 +2228,10 @@ impl P2PEngine {
                     self.run_decentralized_tick().await;
                 }
                 _ = self.ping_watchdog_interval.tick() => {
-                    self.expire_pending_pings();
+                    let heal_vips = self.expire_pending_pings();
+                    for vip in heal_vips {
+                        self.spawn_predictive_heal(vip).await;
+                    }
                 }
                 _ = self.cc_probe_interval.tick() => {
                     self.send_cc_probes().await;
@@ -2290,14 +2316,27 @@ impl P2PEngine {
                     self.metrics
                         .inc_fec_recovered_packets(decoded.recovered.len() as u64);
                 }
-                for pkt in decoded.recovered {
+                let shards_new = decoded.shards_new;
+                let shards_missing = decoded.shards_missing;
+                let recovered = decoded.recovered;
+                if shards_new > 0 || shards_missing > 0 {
+                    if let Some(vip) = self.endpoint_to_vip_u32(from) {
+                        self.size_loss.note_wire_obs(
+                            vip,
+                            shards_missing as u64,
+                            shards_new as u64,
+                            Instant::now(),
+                        );
+                    }
+                }
+                for pkt in recovered {
                     if let Some((ty, inner_body)) = parse_compact(&pkt) {
-                        self.handle_compact_packet(ty, inner_body, from).await;
+                        self.handle_compact_packet(ty, inner_body, from, true).await;
                     }
                 }
             }
             DatagramKind::Compact(ty, body) => {
-                self.handle_compact_packet(ty, body, from).await;
+                self.handle_compact_packet(ty, body, from, false).await;
             }
         }
     }
@@ -2307,6 +2346,7 @@ impl P2PEngine {
         ty: CompactPacketType,
         body: &[u8],
         from: SocketAddr,
+        from_fec_recovery: bool,
     ) {
         match ty {
             CompactPacketType::Reliable => {
@@ -2378,6 +2418,10 @@ impl P2PEngine {
                         .commit(counter);
                     self.size_loss
                         .note_encrypted_commit(peer_vip_u32, frame_len, gap, now);
+                    // Wire-origin only: FEC recovery must not dilute shard wire-loss.
+                    if !from_fec_recovery {
+                        self.size_loss.note_wire_obs(peer_vip_u32, gap, 1, now);
+                    }
                     let plain = self.decrypt_scratch.split().freeze();
                     self.handle_mdat_like(plain, from).await;
                 }
@@ -2820,10 +2864,20 @@ impl P2PEngine {
 
     fn prune_fec_decoders(&mut self) {
         let tracked: HashSet<SocketAddr> = self.routing.read().ep_to_vip.keys().copied().collect();
+        let now = Instant::now();
+        let mut wire_obs: Vec<(SocketAddr, u16)> = Vec::new();
         self.fec_decoders.retain(|ep, decoder| {
-            decoder.evict_expired();
+            let missing = decoder.evict_expired();
+            if missing > 0 {
+                wire_obs.push((*ep, missing));
+            }
             tracked.contains(ep) || !decoder.is_empty()
         });
+        for (ep, missing) in wire_obs {
+            if let Some(vip) = self.endpoint_to_vip_u32(ep) {
+                self.size_loss.note_wire_obs(vip, missing as u64, 0, now);
+            }
+        }
     }
 
     fn allocate_ping_id(&mut self) -> u64 {
@@ -2998,7 +3052,7 @@ impl P2PEngine {
                             handler(vip);
                         }
                     }
-                    self.invalidate_fec_loss_ewma_cache(ep);
+                    self.invalidate_fec_qd_cache(ep);
                     self.state.crypto_keys.unbind_peer(ep);
                     self.reliable.flush_dest(ep);
                     self.teardown_fec_peer(ep);
@@ -3368,18 +3422,11 @@ impl P2PEngine {
             }
             EngineCmd::QueryFecStats { reply } => {
                 let mut out = Vec::new();
-                let rt = self.routing.read();
                 for (dest, st) in &self.fec_send_by_dest {
                     let Some((ds, ps)) = st.ratio_last else {
                         continue;
                     };
-                    let loss_ewma = rt
-                        .ep_to_vip
-                        .get(dest)
-                        .and_then(|vip| rt.table.get(vip))
-                        .map(|e| e.loss_ewma)
-                        .unwrap_or(0.0);
-                    out.push((*dest, ds, ps, loss_ewma));
+                    out.push((*dest, ds, ps, st.rx_loss_ewma));
                 }
                 let _ = reply.send(out);
                 false
@@ -4354,7 +4401,7 @@ impl P2PEngine {
                     }
                 }
                 if let Some((ep, _)) = leave_evicted {
-                    self.invalidate_fec_loss_ewma_cache(ep);
+                    self.invalidate_fec_qd_cache(ep);
                     self.state.crypto_keys.unbind_peer(ep);
                     self.reliable.flush_dest(ep);
                     self.teardown_fec_peer(ep);
@@ -4635,14 +4682,21 @@ impl P2PEngine {
         if let Some((ping_id, sender_ts)) = decode_ping_payload(body) {
             let owd = (now_epoch_ms() as i64).saturating_sub(sender_ts as i64);
             let owd_i32 = owd.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            let pong = encode_pong_payload(ping_id, sender_ts, owd_i32);
+            let loss_permille = self
+                .endpoint_to_vip_u32(from)
+                .map(|vip| (self.size_loss.loss_ewma(vip) * 1000.0).round() as u32)
+                .unwrap_or(0)
+                .min(1000);
+            let pong = encode_pong_payload(ping_id, sender_ts, owd_i32, loss_permille);
             self.send_compact_to(from, CompactPacketType::Pong, &pong)
                 .await;
         }
     }
 
     async fn handle_pong_body(&mut self, body: &[u8], from: SocketAddr) {
-        let Some((ping_id, _fallback_ts, fwd_owd_sample_ms)) = decode_pong_payload(body) else {
+        let Some((ping_id, _fallback_ts, fwd_owd_sample_ms, loss_permille)) =
+            decode_pong_payload(body)
+        else {
             return;
         };
         self.touch_routing_endpoint(from);
@@ -4659,6 +4713,7 @@ impl P2PEngine {
             self.pending_pings.insert(ping_id, pending);
             return;
         }
+        self.probe_miss_by_ep.remove(&from);
         let rtt = (now_ms.saturating_sub(pending.sent_at_ms)) as i64;
         let owner_ep_hint = self.owner_send_endpoint();
         let (vip_rtt_updated, owd_outcome) = {
@@ -4680,7 +4735,10 @@ impl P2PEngine {
             }
             crate::routing::OwdSampleOutcome::Ignored => {}
         }
-        self.refresh_fec_loss_ewma_cache(from);
+        // Peer RX wire-loss feeds adaptive FEC only — not CC / routing.loss_ewma.
+        let st = self.fec_send_by_dest.entry(from).or_default();
+        st.rx_loss_ewma = (loss_permille.min(1000) as f64) / 1000.0;
+        self.refresh_fec_qd_cache(from);
         if vip_rtt_updated {
             self.publish_cc_sample_for_endpoint(from);
         }
@@ -4840,23 +4898,21 @@ impl P2PEngine {
         Ok(())
     }
 
-    fn refresh_fec_loss_ewma_cache(&mut self, ep: SocketAddr) {
-        let (loss, qd) = {
+    fn refresh_fec_qd_cache(&mut self, ep: SocketAddr) {
+        let qd = {
             let rt = self.routing.read();
             rt.ep_to_vip
                 .get(&ep)
                 .and_then(|vip| rt.table.get(vip))
-                .map(|e| (e.loss_ewma, crate::routing::effective_queuing_delay_ms(e)))
-                .unwrap_or((0.0, -1.0))
+                .map(|e| crate::routing::effective_queuing_delay_ms(e))
+                .unwrap_or(-1.0)
         };
         let st = self.fec_send_by_dest.entry(ep).or_default();
-        st.loss_ewma_cached = Some(loss);
         st.queuing_delay_ms_cached = Some(qd);
     }
 
-    fn invalidate_fec_loss_ewma_cache(&mut self, ep: SocketAddr) {
+    fn invalidate_fec_qd_cache(&mut self, ep: SocketAddr) {
         if let Some(st) = self.fec_send_by_dest.get_mut(&ep) {
-            st.loss_ewma_cached = None;
             st.queuing_delay_ms_cached = None;
         }
     }
@@ -4892,6 +4948,7 @@ impl P2PEngine {
         self.fec_send_by_dest.remove(&ep);
         let _ = self.fec_tx.remove_peer_barrier(ep);
         self.fec_decoders.remove(&ep);
+        self.probe_miss_by_ep.remove(&ep);
         self.remove_peer_endpoint(ep);
     }
 
@@ -4929,16 +4986,6 @@ impl P2PEngine {
             return;
         }
         let now = Instant::now();
-        if self
-            .fec_send_by_dest
-            .get(&dest)
-            .and_then(|s| s.backoff_until)
-            .map(|until| until > now)
-            .unwrap_or(false)
-        {
-            self.enqueue_normal_packet(pkt, dest);
-            return;
-        }
         if pkt.len() > self.fec_shard_payload_size {
             self.metrics.inc_fec_oversize_bypass();
             self.enqueue_normal_packet(pkt, dest);
@@ -4954,23 +5001,8 @@ impl P2PEngine {
             self.enqueue_normal_packet(pkt, dest);
             return;
         }
-        let loss_ewma = {
-            let st = self.fec_send_by_dest.entry(dest).or_default();
-            if let Some(cached) = st.loss_ewma_cached {
-                cached
-            } else {
-                let val = {
-                    let rt = self.routing.read();
-                    rt.ep_to_vip
-                        .get(&dest)
-                        .and_then(|vip| rt.table.get(vip))
-                        .map(|e| e.loss_ewma)
-                        .unwrap_or(0.0)
-                };
-                st.loss_ewma_cached = Some(val);
-                val
-            }
-        };
+        // Peer-reported wire-loss (pong) — FEC adaptive input only, not CC.
+        let loss_ewma = self.fec_send_by_dest.entry(dest).or_default().rx_loss_ewma;
         let queuing_delay_ms = {
             let st = self.fec_send_by_dest.entry(dest).or_default();
             if let Some(cached) = st.queuing_delay_ms_cached {
@@ -5221,10 +5253,10 @@ impl P2PEngine {
             self.note_pmtud_tx_oversize(dest);
             return;
         }
-        if let Some(vip) = self.endpoint_to_vip_u32(dest) {
+        let (vip, rtt, qd) = self.tx_path_hints(dest);
+        if let Some(vip) = vip {
             self.size_loss.note_tx_offer(vip, pkt.len(), Instant::now());
         }
-        let (rtt, qd) = self.pacing_enqueue_hints(dest);
         if !self.pacing.try_enqueue_data(pkt, dest, rtt, qd) {
             self.metrics.inc_pacing_cmd_channel_full();
         }
@@ -5336,8 +5368,12 @@ impl P2PEngine {
         if self.advanced_tuning.congestion.probe_interval_ms == 0 {
             return;
         }
-        let endpoints = self.routing.read().endpoints_excluding_stale();
-        let n = endpoints.len();
+        self.cc_probe_scratch.clear();
+        {
+            let rt = self.routing.read();
+            rt.push_endpoints_excluding_stale(&mut self.cc_probe_scratch);
+        }
+        let n = self.cc_probe_scratch.len();
         if n == 0 {
             return;
         }
@@ -5345,14 +5381,21 @@ impl P2PEngine {
         let start = self.cc_probe_cursor % n;
         let mut batch = Vec::with_capacity(take_n);
         for i in 0..take_n {
-            batch.push(endpoints[(start + i) % n]);
+            batch.push(self.cc_probe_scratch[(start + i) % n]);
         }
         self.cc_probe_cursor = (start + take_n) % n;
         self.send_probe_pings_to(&batch).await;
     }
 
     async fn send_ping_all(&mut self) {
-        let endpoints = self.routing.read().endpoints_excluding_stale();
+        self.cc_probe_scratch.clear();
+        {
+            let rt = self.routing.read();
+            rt.push_endpoints_excluding_stale(&mut self.cc_probe_scratch);
+        }
+        // Clone into a short-lived slice owner: send_probe_pings_to needs &[SocketAddr]
+        // while we hold &mut self. Scratch is only for listing; batch is small.
+        let endpoints = self.cc_probe_scratch.clone();
         self.send_probe_pings_to(&endpoints).await;
     }
 
@@ -5463,46 +5506,48 @@ impl P2PEngine {
     }
 
     async fn drive_pmtud_tick(&mut self) {
-        let peers: Vec<SocketAddr> = {
-            let rt = self.routing.read();
-            let mut v = Vec::new();
-            rt.push_endpoints_excluding_stale(&mut v);
-            v
-        };
         let now = Instant::now();
         let cong = &self.advanced_tuning.congestion;
         let mut early_wake = crate::pmtud::PmtudEventCounts::default();
-        let mut inputs: Vec<PeerTickInput> = Vec::with_capacity(peers.len());
-        for &ep in &peers {
-            let (rtt_ms, qd_ms) = {
-                let rt = self.routing.read();
-                match rt.ep_to_vip.get(&ep).and_then(|vip| rt.table.get(vip)) {
-                    Some(e) => (
-                        e.smoothed_rtt_ms,
-                        crate::routing::effective_queuing_delay_ms(e),
-                    ),
-                    None => (-1.0, -1.0),
+        let mut inputs: Vec<PeerTickInput> = Vec::new();
+        {
+            let rt = self.routing.read();
+            let mut peers = Vec::new();
+            rt.push_endpoints_excluding_stale(&mut peers);
+            inputs.reserve(peers.len());
+            for &ep in &peers {
+                let (rtt_ms, qd_ms, vip_u32) = match rt.ep_to_vip.get(&ep).and_then(|vip| {
+                    let entry = rt.table.get(vip)?;
+                    let vip_u32 = vip.parse::<Ipv4Addr>().ok().map(u32::from);
+                    Some((
+                        entry.smoothed_rtt_ms,
+                        crate::routing::effective_queuing_delay_ms(entry),
+                        vip_u32,
+                    ))
+                }) {
+                    Some((rtt, qd, vip)) => (rtt, qd, vip),
+                    None => (-1.0, -1.0, None),
+                };
+                let health = match vip_u32 {
+                    Some(vip) => self.size_loss.health(vip, now),
+                    None => SizeHealth::default(),
+                };
+                let qd_ok = qd_ms >= 0.0
+                    && cong.rtt_base_tracking
+                    && !fec_delay_is_congestive(
+                        qd_ms,
+                        cong.target_queue_delay_ms,
+                        cong.congestion_loss_threshold,
+                    );
+                if health.large_collapsed && qd_ok && self.pmtud.request_early_wake(ep, now) {
+                    early_wake.early_wake_events = early_wake.early_wake_events.saturating_add(1);
                 }
-            };
-            let health = match self.endpoint_to_vip_u32(ep) {
-                Some(vip) => self.size_loss.health(vip, now),
-                None => SizeHealth::default(),
-            };
-            let qd_ok = qd_ms >= 0.0
-                && cong.rtt_base_tracking
-                && !fec_delay_is_congestive(
-                    qd_ms,
-                    cong.target_queue_delay_ms,
-                    cong.congestion_loss_threshold,
-                );
-            if health.large_collapsed && qd_ok && self.pmtud.request_early_wake(ep, now) {
-                early_wake.early_wake_events = early_wake.early_wake_events.saturating_add(1);
+                inputs.push(PeerTickInput {
+                    addr: ep,
+                    health,
+                    rtt_ms,
+                });
             }
-            inputs.push(PeerTickInput {
-                addr: ep,
-                health,
-                rtt_ms,
-            });
         }
         self.metrics.add_pmtud_events(early_wake);
 
@@ -5650,7 +5695,7 @@ impl P2PEngine {
                 }
             }
             for ep in evicted_eps {
-                self.invalidate_fec_loss_ewma_cache(ep);
+                self.invalidate_fec_qd_cache(ep);
                 self.state.crypto_keys.unbind_peer(ep);
                 self.reliable.flush_dest(ep);
                 self.teardown_fec_peer(ep);
@@ -5758,7 +5803,7 @@ impl P2PEngine {
                     self.notify_roster_remove(&vip);
                     self.stop_peer_reconnect_for_vip(&vip);
                 }
-                self.invalidate_fec_loss_ewma_cache(ep);
+                self.invalidate_fec_qd_cache(ep);
                 self.state.crypto_keys.unbind_peer(ep);
                 self.reliable.flush_dest(ep);
                 self.teardown_fec_peer(ep);
@@ -6274,7 +6319,7 @@ impl P2PEngine {
         let _ = self.socket.send_to(&req, stun_addr).await;
     }
 
-    fn expire_pending_pings(&mut self) {
+    fn expire_pending_pings(&mut self) -> Vec<String> {
         let now = Instant::now();
         let expired: Vec<u64> = self
             .pending_pings
@@ -6282,6 +6327,8 @@ impl P2PEngine {
             .filter(|(_, p)| p.deadline <= now)
             .map(|(k, _)| *k)
             .collect();
+        let threshold = self.advanced_tuning.engine_limits.probe_miss_fail_threshold;
+        let mut fail_eps: HashSet<SocketAddr> = HashSet::new();
         for k in expired {
             if let Some(p) = self.pending_pings.remove(&k) {
                 match p.kind {
@@ -6303,10 +6350,30 @@ impl P2PEngine {
                             );
                         }
                     }
-                    PendingPingKind::Probe => {}
+                    PendingPingKind::Probe => {
+                        if record_probe_miss(&mut self.probe_miss_by_ep, p.dest, threshold) {
+                            fail_eps.insert(p.dest);
+                        }
+                    }
                 }
             }
         }
+        let mut heal_vips = Vec::new();
+        if fail_eps.is_empty() {
+            return heal_vips;
+        }
+        let owner_ep_hint = self.owner_send_endpoint();
+        let predictive = self.state.feature_flags.predictive_heal;
+        for dest in fail_eps {
+            let fail = self.routing.write().note_fail(dest, owner_ep_hint);
+            self.refresh_fec_qd_cache(dest);
+            if predictive {
+                if let (Some(vip), true) = (fail.vip, fail.needs_heal) {
+                    heal_vips.push(vip);
+                }
+            }
+        }
+        heal_vips
     }
 
     fn try_stop_ice_checks_for_join_peer(&mut self, from: SocketAddr, body: &[u8]) {
@@ -6400,8 +6467,8 @@ impl P2PEngine {
         if let Some(prev) = old_ep {
             self.reliable.migrate_dest(prev, ep);
             if prev != ep {
-                self.invalidate_fec_loss_ewma_cache(prev);
-                self.invalidate_fec_loss_ewma_cache(ep);
+                self.invalidate_fec_qd_cache(prev);
+                self.invalidate_fec_qd_cache(ep);
                 self.peer_sync_state.remove(vip);
                 self.state.crypto_keys.unbind_peer(prev);
                 self.fec_send_by_dest.remove(&prev);
@@ -6410,7 +6477,7 @@ impl P2PEngine {
                 self.remove_peer_endpoint(prev);
             }
         } else {
-            self.invalidate_fec_loss_ewma_cache(ep);
+            self.invalidate_fec_qd_cache(ep);
         }
         self.remember_endpoint(vip, ep);
     }
@@ -6429,7 +6496,7 @@ impl P2PEngine {
             self.sync_dest_relay_path_stamp(vip);
         }
         self.apply_route_endpoint_change_side_effects(vip, ep, old_ep);
-        self.refresh_fec_loss_ewma_cache(ep);
+        self.refresh_fec_qd_cache(ep);
     }
 
     fn prune_orphan_per_peer_keys(&mut self) {
@@ -6640,16 +6707,22 @@ fn decode_ping_payload(body: &[u8]) -> Option<(u64, u64)> {
     Some((u64::from_le_bytes(id_bytes), u64::from_le_bytes(ts_bytes)))
 }
 
-fn encode_pong_payload(ping_id: u64, sender_ts: u64, fwd_owd_sample_ms: i32) -> [u8; 20] {
-    let mut out = [0u8; 20];
+fn encode_pong_payload(
+    ping_id: u64,
+    sender_ts: u64,
+    fwd_owd_sample_ms: i32,
+    loss_permille: u32,
+) -> [u8; 24] {
+    let mut out = [0u8; 24];
     out[..8].copy_from_slice(&ping_id.to_le_bytes());
     out[8..16].copy_from_slice(&sender_ts.to_le_bytes());
     out[16..20].copy_from_slice(&fwd_owd_sample_ms.to_le_bytes());
+    out[20..24].copy_from_slice(&loss_permille.min(1000).to_le_bytes());
     out
 }
 
-fn decode_pong_payload(body: &[u8]) -> Option<(u64, u64, i32)> {
-    if body.len() < 20 {
+fn decode_pong_payload(body: &[u8]) -> Option<(u64, u64, i32, u32)> {
+    if body.len() != 24 {
         return None;
     }
     let mut id_bytes = [0u8; 8];
@@ -6658,10 +6731,13 @@ fn decode_pong_payload(body: &[u8]) -> Option<(u64, u64, i32)> {
     ts_bytes.copy_from_slice(&body[8..16]);
     let mut owd_bytes = [0u8; 4];
     owd_bytes.copy_from_slice(&body[16..20]);
+    let mut loss_bytes = [0u8; 4];
+    loss_bytes.copy_from_slice(&body[20..24]);
     Some((
         u64::from_le_bytes(id_bytes),
         u64::from_le_bytes(ts_bytes),
         i32::from_le_bytes(owd_bytes),
+        u32::from_le_bytes(loss_bytes).min(1000),
     ))
 }
 
@@ -6858,10 +6934,18 @@ mod tests {
 
     #[test]
     fn pong_payload_round_trip_and_short_rejected() {
-        let enc = encode_pong_payload(7, 1_700_000_000_000, -42);
-        assert_eq!(decode_pong_payload(&enc), Some((7, 1_700_000_000_000, -42)));
+        let enc = encode_pong_payload(7, 1_700_000_000_000, -42, 50);
+        assert_eq!(
+            decode_pong_payload(&enc),
+            Some((7, 1_700_000_000_000, -42, 50))
+        );
         assert_eq!(decode_pong_payload(&enc[..16]), None);
         assert_eq!(decode_pong_payload(&enc[..19]), None);
+        assert_eq!(decode_pong_payload(&enc[..20]), None);
+        assert_eq!(decode_pong_payload(&enc[..23]), None);
+        let mut long = enc.to_vec();
+        long.push(0);
+        assert_eq!(decode_pong_payload(&long), None);
     }
 
     #[test]
@@ -6869,9 +6953,35 @@ mod tests {
         let sender_ts = 1_000u64;
         let recv_ts = 1_035u64;
         let owd = (recv_ts as i64).saturating_sub(sender_ts as i64) as i32;
-        let enc = encode_pong_payload(99, sender_ts, owd);
+        let enc = encode_pong_payload(99, sender_ts, owd, 0);
         let decoded = decode_pong_payload(&enc).unwrap();
         assert_eq!(decoded.2, 35);
+        assert_eq!(decoded.3, 0);
+    }
+
+    #[test]
+    fn pong_loss_permille_clamped_at_encode() {
+        let enc = encode_pong_payload(1, 2, 3, 5000);
+        assert_eq!(decode_pong_payload(&enc), Some((1, 2, 3, 1000)));
+    }
+
+    #[test]
+    fn adaptive_fec_ratio_turns_on_above_rx_loss() {
+        // Mirrors fec_send consumption: rx_loss_ewma past on_above engages ladder.
+        let on_above = 0.05;
+        let off_below = 0.025;
+        assert_eq!(
+            adaptive_fec_ratio_hyst_tuned(0.0, None, off_below, on_above),
+            (0, 0)
+        );
+        assert_eq!(
+            adaptive_fec_ratio_hyst_tuned(0.05, None, off_below, on_above),
+            (7, 1)
+        );
+        assert_eq!(
+            adaptive_fec_ratio_hyst_tuned(0.05, Some((0, 0)), off_below, on_above),
+            (7, 1)
+        );
     }
 
     #[test]
@@ -7397,5 +7507,148 @@ mod tests {
                 },
             );
         }
+    }
+
+    async fn test_engine() -> P2PEngine {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rt = Arc::new(RwLock::new(RoutingTable::new()));
+        let (_tun_tx, tun_rx) = mpsc::channel(8);
+        let (inject_tx, _inject_rx) = broadcast::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let metrics = Arc::new(EngineMetrics::new());
+        P2PEngine::new(
+            Arc::new(socket),
+            Arc::new(pmtud_socket),
+            rt,
+            tun_rx,
+            inject_tx,
+            cmd_rx,
+            false,
+            Ipv4Addr::new(10, 1, 1, 2),
+            "n".to_string(),
+            24,
+            metrics,
+            PaceClockApply::default(),
+            500,
+            Arc::new(RuntimeTrace::new()),
+            8,
+            crate::ui_events::UiEventBus::new(),
+        )
+    }
+
+    fn insert_expired_probe(eng: &mut P2PEngine, dest: SocketAddr) {
+        let id = eng.allocate_ping_id();
+        eng.pending_pings.insert(
+            id,
+            PendingPing {
+                dest,
+                allow_ip_match: false,
+                deadline: Instant::now() - Duration::from_millis(1),
+                sent_at_ms: 0,
+                kind: PendingPingKind::Probe,
+            },
+        );
+    }
+
+    #[test]
+    fn record_probe_miss_reports_from_threshold_onward() {
+        let dest: SocketAddr = "198.51.100.1:1".parse().unwrap();
+        let mut streak = HashMap::new();
+        let threshold = 8u32;
+        let mut should_fail = 0u32;
+        for i in 1..=20 {
+            if record_probe_miss(&mut streak, dest, threshold) {
+                should_fail += 1;
+                assert!(i >= threshold);
+            }
+        }
+        assert_eq!(should_fail, 20 - threshold + 1);
+        assert_eq!(streak.get(&dest).copied(), Some(20));
+    }
+
+    #[tokio::test]
+    async fn probe_miss_under_threshold_does_not_note_fail() {
+        let mut eng = test_engine().await;
+        let dest: SocketAddr = "198.51.100.9:9".parse().unwrap();
+        eng.routing.write().update("10.1.0.9", dest, None);
+        let threshold = eng.advanced_tuning.engine_limits.probe_miss_fail_threshold;
+        for _ in 0..(threshold - 1) {
+            insert_expired_probe(&mut eng, dest);
+        }
+        let heals = eng.expire_pending_pings();
+        assert!(heals.is_empty());
+        assert_eq!(eng.routing.read().table["10.1.0.9"].fail_streak, 0);
+        assert_eq!(
+            eng.probe_miss_by_ep.get(&dest).copied(),
+            Some(threshold - 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_miss_at_threshold_notes_fail_once_per_sweep() {
+        let mut eng = test_engine().await;
+        let dest: SocketAddr = "198.51.100.9:9".parse().unwrap();
+        eng.routing.write().update("10.1.0.9", dest, None);
+        let threshold = eng.advanced_tuning.engine_limits.probe_miss_fail_threshold;
+        for _ in 0..threshold {
+            insert_expired_probe(&mut eng, dest);
+        }
+        let heals = eng.expire_pending_pings();
+        assert!(heals.is_empty());
+        assert_eq!(
+            eng.routing.read().table["10.1.0.9"].fail_streak,
+            1,
+            "batch of threshold misses => one note_fail"
+        );
+
+        insert_expired_probe(&mut eng, dest);
+        let heals = eng.expire_pending_pings();
+        assert!(heals.is_empty());
+        assert_eq!(
+            eng.routing.read().table["10.1.0.9"].fail_streak,
+            2,
+            "next sweep adds one more note_fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn matched_pong_resets_probe_miss_streak() {
+        let mut eng = test_engine().await;
+        let dest: SocketAddr = "198.51.100.9:9".parse().unwrap();
+        eng.routing.write().update("10.1.0.9", dest, None);
+        eng.probe_miss_by_ep.insert(dest, 20);
+        let ping_id = eng.allocate_ping_id();
+        eng.pending_pings.insert(
+            ping_id,
+            PendingPing {
+                dest,
+                allow_ip_match: false,
+                deadline: Instant::now() + Duration::from_secs(5),
+                sent_at_ms: now_epoch_ms().saturating_sub(5),
+                kind: PendingPingKind::Probe,
+            },
+        );
+        let body = encode_pong_payload(ping_id, 1, 1, 0);
+        eng.handle_pong_body(&body, dest).await;
+        assert!(
+            !eng.probe_miss_by_ep.contains_key(&dest),
+            "pong must clear streak"
+        );
+
+        let threshold = eng.advanced_tuning.engine_limits.probe_miss_fail_threshold;
+        for _ in 0..(threshold - 1) {
+            insert_expired_probe(&mut eng, dest);
+        }
+        eng.expire_pending_pings();
+        assert_eq!(
+            eng.routing.read().table["10.1.0.9"].fail_streak,
+            0,
+            "misses after reset must re-accumulate from zero"
+        );
+        assert_eq!(
+            eng.probe_miss_by_ep.get(&dest).copied(),
+            Some(threshold - 1)
+        );
     }
 }

@@ -17,6 +17,36 @@ const LARGE_ALIVE_MEMORY: Duration = Duration::from_secs(10);
 const TX_OFFER_RECENT: Duration = Duration::from_secs(1);
 const GAP_CLAMP: u64 = 64;
 const RATE_TICK: Duration = Duration::from_millis(100);
+/// Per-observation decay for wire-loss counters (half-life ≈ 34 observations).
+const WIRE_LOSS_DECAY: f64 = 0.98;
+
+/// Decaying-counter wire-loss fraction for adaptive FEC feedback.
+#[derive(Clone, Debug, Default)]
+struct WireLossEwma {
+    lost_w: f64,
+    got_w: f64,
+}
+
+impl WireLossEwma {
+    fn note(&mut self, lost: u64, got: u64) {
+        if lost == 0 && got == 0 {
+            return;
+        }
+        self.lost_w *= WIRE_LOSS_DECAY;
+        self.got_w *= WIRE_LOSS_DECAY;
+        self.lost_w += lost as f64;
+        self.got_w += got as f64;
+    }
+
+    fn rate(&self) -> f64 {
+        let denom = self.lost_w + self.got_w;
+        if denom < 1.0 {
+            0.0
+        } else {
+            (self.lost_w / denom).clamp(0.0, 1.0)
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Bucket {
@@ -75,6 +105,7 @@ struct VipTracker {
     last_tx_offer_at: Option<Instant>,
     /// True once encrypted path observed a gap-capable commit (enables large_collapsed).
     encrypted_seen: bool,
+    wire_loss: WireLossEwma,
 }
 
 impl VipTracker {
@@ -86,6 +117,7 @@ impl VipTracker {
             last_large_alive_at: None,
             last_tx_offer_at: None,
             encrypted_seen: false,
+            wire_loss: WireLossEwma::default(),
         }
     }
 
@@ -180,6 +212,7 @@ impl SizeLossTable {
     }
 
     /// Encrypted commit: RX rate + optional gap attributed to reveal frame bucket (biased).
+    /// Does **not** update wire-loss EWMA — caller decides wire-origin vs FEC-recovery.
     pub fn note_encrypted_commit(&mut self, vip: u32, frame_len: usize, gap: u64, now: Instant) {
         let t = self.entry(vip, now);
         t.encrypted_seen = true;
@@ -191,6 +224,22 @@ impl SizeLossTable {
             // Bias: lost packets attributed to reveal bucket — documented in plan.
             t.buckets[idx].note_n(g, now);
         }
+    }
+
+    /// Wire-layer loss observation for adaptive FEC feedback (encrypted gaps or FEC shards).
+    pub fn note_wire_obs(&mut self, vip: u32, lost: u64, got: u64, now: Instant) {
+        if lost == 0 && got == 0 {
+            return;
+        }
+        self.entry(vip, now).wire_loss.note(lost, got);
+    }
+
+    /// Current wire-loss fraction in `[0, 1]` (0 when cold / insufficient weight).
+    pub fn loss_ewma(&self, vip: u32) -> f64 {
+        self.by_vip
+            .get(&vip)
+            .map(|t| t.wire_loss.rate())
+            .unwrap_or(0.0)
     }
 
     pub fn note_tx_offer(&mut self, vip: u32, frame_len: usize, now: Instant) {
@@ -277,5 +326,41 @@ mod tests {
         let h = t.health(1, now);
         assert!(h.warm);
         assert!(h.large_alive);
+    }
+
+    #[test]
+    fn wire_loss_ewma_cold_is_zero() {
+        let t = SizeLossTable::new();
+        assert_eq!(t.loss_ewma(1), 0.0);
+    }
+
+    #[test]
+    fn wire_loss_ewma_converges_near_five_percent() {
+        let mut t = SizeLossTable::new();
+        let now = Instant::now();
+        // Pattern: 1 lost + 19 got ≈ 5% loss, repeated to warm the counters.
+        for _ in 0..200 {
+            t.note_wire_obs(7, 1, 19, now);
+        }
+        let rate = t.loss_ewma(7);
+        assert!((rate - 0.05).abs() < 0.01, "expected ~0.05, got {rate}");
+    }
+
+    #[test]
+    fn wire_loss_ewma_zero_obs_noop() {
+        let mut t = SizeLossTable::new();
+        let now = Instant::now();
+        t.note_wire_obs(1, 0, 0, now);
+        assert_eq!(t.loss_ewma(1), 0.0);
+    }
+
+    #[test]
+    fn wire_loss_cleared_on_remove_vip() {
+        let mut t = SizeLossTable::new();
+        let now = Instant::now();
+        t.note_wire_obs(9, 5, 5, now);
+        assert!(t.loss_ewma(9) > 0.0);
+        t.remove_vip(9);
+        assert_eq!(t.loss_ewma(9), 0.0);
     }
 }

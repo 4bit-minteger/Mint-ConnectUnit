@@ -143,8 +143,8 @@ impl Default for FecTuning {
             shard_payload_size: 1024,
             flush_ms: 2,
             flush_aggressive_ms: 1,
-            adaptive_off_below: 0.015,
-            adaptive_on_above: 0.03,
+            adaptive_off_below: 0.025,
+            adaptive_on_above: 0.05,
             fec_max_total_shards: 16,
         }
     }
@@ -237,6 +237,8 @@ pub struct EngineLimitsTuning {
     /// Max serialized MSYN v4 JSON part size before compound wrap.
     pub msyn_shard_budget_bytes: usize,
     pub heal_cooldown_ms: u64,
+    /// Consecutive CC-probe timeouts on one endpoint before `note_fail` (3..=64).
+    pub probe_miss_fail_threshold: u32,
 }
 
 impl Default for EngineLimitsTuning {
@@ -251,6 +253,7 @@ impl Default for EngineLimitsTuning {
             msyn_body_max: 524_288,
             msyn_shard_budget_bytes: 1200,
             heal_cooldown_ms: 1_000,
+            probe_miss_fail_threshold: 8,
         }
     }
 }
@@ -267,6 +270,7 @@ impl EngineLimitsTuning {
         let shard_hi = 4096usize.min(self.msyn_body_max);
         self.msyn_shard_budget_bytes = self.msyn_shard_budget_bytes.clamp(512, shard_hi);
         self.heal_cooldown_ms = self.heal_cooldown_ms.clamp(50, 60_000);
+        self.probe_miss_fail_threshold = self.probe_miss_fail_threshold.clamp(3, 64);
     }
 }
 
@@ -659,8 +663,8 @@ mod tests {
         assert_eq!(d.fec.shard_payload_size, 1024);
         assert_eq!(d.fec.flush_ms, 2);
         assert_eq!(d.fec.flush_aggressive_ms, 1);
-        assert_eq!(d.fec.adaptive_off_below, 0.015);
-        assert_eq!(d.fec.adaptive_on_above, 0.03);
+        assert_eq!(d.fec.adaptive_off_below, 0.025);
+        assert_eq!(d.fec.adaptive_on_above, 0.05);
         assert_eq!(d.fec.fec_max_total_shards, 16);
 
         assert_eq!(d.pmtud.probe_timeout_ms, 500);
@@ -723,6 +727,7 @@ mod tests {
         assert_eq!(d.engine_limits.msyn_body_max, 524_288);
         assert_eq!(d.engine_limits.msyn_shard_budget_bytes, 1200);
         assert_eq!(d.engine_limits.stun_cache_ttl_secs, 30);
+        assert_eq!(d.engine_limits.probe_miss_fail_threshold, 8);
 
         assert_eq!(d.hole_punch.punch_stage1_packets, 3);
         assert_eq!(d.hole_punch.punch_stage2_pps, 128);
@@ -1008,11 +1013,16 @@ delivery_decouple_ratio = 1.5
         t.engine_limits.msyn_body_max = 10_000_000;
         t.engine_limits.msyn_shard_budget_bytes = 10_000;
         t.engine_limits.max_direct_retry_per_tick = 0;
+        t.engine_limits.probe_miss_fail_threshold = 0;
         t.fec.fec_max_total_shards = 999;
         t.clamp();
         assert_eq!(t.engine_limits.msyn_body_max, 524_288);
         assert_eq!(t.engine_limits.msyn_shard_budget_bytes, 4096);
         assert_eq!(t.engine_limits.max_direct_retry_per_tick, 1);
+        assert_eq!(t.engine_limits.probe_miss_fail_threshold, 3);
+        t.engine_limits.probe_miss_fail_threshold = 200;
+        t.clamp();
+        assert_eq!(t.engine_limits.probe_miss_fail_threshold, 64);
         assert_eq!(
             t.fec.fec_max_total_shards,
             crate::net::fec::FEC_MAX_TOTAL_SHARDS

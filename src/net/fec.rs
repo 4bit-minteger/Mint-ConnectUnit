@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -600,9 +600,12 @@ impl FecEncoder {
 }
 
 const FEC_DECODER_EVICT_INTERVAL: Duration = Duration::from_millis(50);
+const FEC_COMPLETED_GROUPS_CAP: usize = 128;
 
 pub struct FecDecoder {
     groups: HashMap<u32, PartialGroup>,
+    /// Recently completed group ids — ignore late shards (in-flight parity after early extract).
+    completed_groups: VecDeque<u32>,
     group_ttl: Duration,
     max_groups: usize,
     reconstruct_rs: Option<ReedSolomon>,
@@ -624,12 +627,42 @@ struct PartialGroup {
 pub struct FecDecodeResult {
     pub recovered: Vec<Bytes>,
     pub invalid: bool,
+    /// New unique shards accepted on this call (0 or 1).
+    pub shards_new: u8,
+    /// Shards still missing when a group closed/evicted on this call.
+    pub shards_missing: u16,
+}
+
+impl FecDecodeResult {
+    fn invalid_with_missing(shards_missing: u16) -> Self {
+        Self {
+            recovered: vec![],
+            invalid: true,
+            shards_new: 0,
+            shards_missing,
+        }
+    }
+
+    fn ok(recovered: Vec<Bytes>, shards_new: u8, shards_missing: u16) -> Self {
+        Self {
+            recovered,
+            invalid: false,
+            shards_new,
+            shards_missing,
+        }
+    }
+}
+
+#[inline]
+fn group_shards_missing(g: &PartialGroup) -> u16 {
+    (g.received.len() as u16).saturating_sub(g.received_count as u16)
 }
 
 impl FecDecoder {
     pub fn new() -> Self {
         Self {
             groups: HashMap::new(),
+            completed_groups: VecDeque::with_capacity(FEC_COMPLETED_GROUPS_CAP),
             group_ttl: Duration::from_millis(200),
             max_groups: 256,
             reconstruct_rs: None,
@@ -639,19 +672,28 @@ impl FecDecoder {
         }
     }
 
+    fn note_completed(&mut self, group_id: u32) {
+        if self.completed_groups.len() >= FEC_COMPLETED_GROUPS_CAP {
+            self.completed_groups.pop_front();
+        }
+        self.completed_groups.push_back(group_id);
+    }
+
     pub fn push_shard(&mut self, raw: &[u8]) -> FecDecodeResult {
         let now = Instant::now();
+        let mut shards_missing = 0u16;
         if now.duration_since(self.last_evict) >= FEC_DECODER_EVICT_INTERVAL {
-            self.evict_at(now);
+            shards_missing = shards_missing.saturating_add(self.evict_at(now));
             self.last_evict = now;
         }
         if raw.len() < FEC_COMPACT_HEADER_LEN || raw[0] != CompactPacketType::Fec.to_byte() {
-            return FecDecodeResult {
-                recovered: vec![],
-                invalid: true,
-            };
+            return FecDecodeResult::invalid_with_missing(shards_missing);
         }
         let group_id = u32::from_le_bytes([raw[1], raw[2], raw[3], raw[4]]);
+        if self.completed_groups.iter().any(|&id| id == group_id) {
+            // Late shard after early data-complete extract (typically parity).
+            return FecDecodeResult::ok(vec![], 0, shards_missing);
+        }
         let shard_idx = raw[5] as usize;
         let data_shards = raw[6];
         let parity_shards = raw[7];
@@ -667,15 +709,14 @@ impl FecDecoder {
             || shard_size > FEC_SHARD_PAYLOAD_SIZE
             || (shard_idx < data_shards as usize && (orig_len as usize) > shard_size)
         {
-            self.groups.remove(&group_id);
-            return FecDecodeResult {
-                recovered: vec![],
-                invalid: true,
-            };
+            if let Some(g) = self.groups.remove(&group_id) {
+                shards_missing = shards_missing.saturating_add(group_shards_missing(&g));
+            }
+            return FecDecodeResult::invalid_with_missing(shards_missing);
         }
         let payload = shard_data[..shard_size].to_vec();
         if !self.groups.contains_key(&group_id) && self.groups.len() >= self.max_groups {
-            self.evict_oldest_group();
+            shards_missing = shards_missing.saturating_add(self.evict_oldest_group());
         }
         let group = self.groups.entry(group_id).or_insert_with(|| PartialGroup {
             data_shards,
@@ -691,17 +732,13 @@ impl FecDecoder {
             || group.shard_size != shard_size
             || group.received.len() != total
         {
-            self.groups.remove(&group_id);
-            return FecDecodeResult {
-                recovered: vec![],
-                invalid: true,
-            };
+            if let Some(g) = self.groups.remove(&group_id) {
+                shards_missing = shards_missing.saturating_add(group_shards_missing(&g));
+            }
+            return FecDecodeResult::invalid_with_missing(shards_missing);
         }
         if group.received[shard_idx].is_some() {
-            return FecDecodeResult {
-                recovered: vec![],
-                invalid: false,
-            };
+            return FecDecodeResult::ok(vec![], 0, shards_missing);
         }
         group.received[shard_idx] = Some(payload);
         if shard_idx < group.data_shards as usize {
@@ -713,30 +750,26 @@ impl FecDecoder {
             .filter(|x| x.is_some())
             .count();
         if data_count == group.data_shards as usize {
-            return FecDecodeResult {
-                recovered: self.extract_data(group_id),
-                invalid: false,
-            };
+            // All data present — extract now. Outstanding parity is not counted as
+            // loss (may still be in flight); late parity ignored via completed_groups.
+            let (recovered, _) = self.extract_data(group_id);
+            self.note_completed(group_id);
+            return FecDecodeResult::ok(recovered, 1, shards_missing);
         }
         if group.received_count as usize >= group.data_shards as usize {
-            return FecDecodeResult {
-                recovered: self.reconstruct_and_extract(group_id),
-                invalid: false,
-            };
+            let (recovered, close_missing) = self.reconstruct_and_extract(group_id);
+            self.note_completed(group_id);
+            return FecDecodeResult::ok(recovered, 1, shards_missing.saturating_add(close_missing));
         }
-        FecDecodeResult {
-            recovered: vec![],
-            invalid: false,
-        }
+        FecDecodeResult::ok(vec![], 1, shards_missing)
     }
 
-    fn reconstruct_and_extract(&mut self, group_id: u32) -> Vec<Bytes> {
-        let group = match self.groups.get_mut(&group_id) {
-            Some(g) => g,
-            None => return vec![],
+    /// Reconstruct then extract. Returns `(recovered, shards_missing)`.
+    fn reconstruct_and_extract(&mut self, group_id: u32) -> (Vec<Bytes>, u16) {
+        let (data_n, parity_n) = match self.groups.get(&group_id) {
+            Some(g) => (g.data_shards as usize, g.parity_shards as usize),
+            None => return (vec![], 0),
         };
-        let data_n = group.data_shards as usize;
-        let parity_n = group.parity_shards as usize;
         let need_rebuild = self.reconstruct_rs.is_none()
             || self.reconstruct_rs_data != data_n
             || self.reconstruct_rs_parity != parity_n;
@@ -748,31 +781,40 @@ impl FecDecoder {
                     self.reconstruct_rs_parity = parity_n;
                 }
                 Err(_) => {
-                    self.groups.remove(&group_id);
-                    return vec![];
+                    return self.take_group_as_missing(group_id);
                 }
             }
         }
-        let rs = match self.reconstruct_rs.as_ref() {
-            Some(v) => v,
-            None => {
-                self.groups.remove(&group_id);
-                return vec![];
-            }
+        if self.reconstruct_rs.is_none() {
+            return self.take_group_as_missing(group_id);
+        }
+        let reconstruct_ok = {
+            let group = match self.groups.get_mut(&group_id) {
+                Some(g) => g,
+                None => return (vec![], 0),
+            };
+            // `reconstruct_rs` and `groups` are distinct fields — split borrow is fine.
+            self.reconstruct_rs
+                .as_ref()
+                .unwrap()
+                .reconstruct(&mut group.received)
+                .is_ok()
         };
-        if rs.reconstruct(&mut group.received).is_err() {
-            self.groups.remove(&group_id);
-            return vec![];
+        if !reconstruct_ok {
+            return self.take_group_as_missing(group_id);
         }
         self.extract_data(group_id)
     }
 
-    fn extract_data(&mut self, group_id: u32) -> Vec<Bytes> {
+    /// Extract data shards. Returns `(recovered, shards_missing)` where missing
+    /// is counted from wire receipts (`received_count`) before RS fill-in.
+    fn extract_data(&mut self, group_id: u32) -> (Vec<Bytes>, u16) {
         let group = match self.groups.remove(&group_id) {
             Some(g) => g,
-            None => return vec![],
+            None => return (vec![], 0),
         };
-        group.received[..group.data_shards as usize]
+        let missing = group_shards_missing(&group);
+        let recovered = group.received[..group.data_shards as usize]
             .iter()
             .zip(group.orig_lens.iter())
             .filter_map(|(shard, &orig_len)| {
@@ -782,30 +824,53 @@ impl FecDecoder {
                 }
                 Some(Bytes::copy_from_slice(&s[..orig_len as usize]))
             })
-            .collect()
+            .collect();
+        (recovered, missing)
     }
 
-    fn evict_at(&mut self, now: Instant) {
+    fn take_group_as_missing(&mut self, group_id: u32) -> (Vec<Bytes>, u16) {
+        match self.groups.remove(&group_id) {
+            Some(g) => (vec![], group_shards_missing(&g)),
+            None => (vec![], 0),
+        }
+    }
+
+    fn evict_at(&mut self, now: Instant) -> u16 {
         let ttl = self.group_ttl;
-        self.groups
-            .retain(|_, g| now.duration_since(g.created_at) < ttl);
+        let mut missing = 0u16;
+        self.groups.retain(|_, g| {
+            if now.duration_since(g.created_at) < ttl {
+                true
+            } else {
+                missing = missing.saturating_add(group_shards_missing(g));
+                false
+            }
+        });
+        missing
     }
 
-    pub fn evict_expired(&mut self) {
+    /// Drop TTL-expired groups; returns wire shards still missing on those groups.
+    pub fn evict_expired(&mut self) -> u16 {
         let now = Instant::now();
-        self.evict_at(now);
+        let missing = self.evict_at(now);
         self.last_evict = now;
+        missing
     }
 
-    fn evict_oldest_group(&mut self) {
+    fn evict_oldest_group(&mut self) -> u16 {
         let oldest = self
             .groups
             .iter()
             .min_by_key(|(_, g)| g.created_at)
             .map(|(id, _)| *id);
         if let Some(id) = oldest {
-            self.groups.remove(&id);
+            return self
+                .groups
+                .remove(&id)
+                .map(|g| group_shards_missing(&g))
+                .unwrap_or(0);
         }
+        0
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1082,16 +1147,62 @@ mod tests {
         assert_eq!(out.len(), 5);
         let mut dec = FecDecoder::new();
         let mut recovered = Vec::new();
+        let mut total_missing = 0u16;
         for (idx, pkt) in out.into_iter().enumerate() {
             if idx == 1 {
                 continue;
             }
             let r = dec.push_shard(&pkt);
+            total_missing = total_missing.saturating_add(r.shards_missing);
             if !r.recovered.is_empty() {
                 recovered = r.recovered;
             }
         }
         assert!(!recovered.is_empty());
+        // One data shard dropped on the wire → missing == 1 at group close.
+        assert_eq!(total_missing, 1);
+    }
+
+    #[test]
+    fn decoder_full_group_reports_zero_missing() {
+        let mut enc = FecEncoder::new(4, 1);
+        let mut out = Vec::new();
+        for i in 0..4 {
+            if let Some(pkts) = enc.push(Bytes::from(vec![i as u8; FEC_BUFFER_TEST_LEN])) {
+                out = pkts;
+            }
+        }
+        assert_eq!(out.len(), 5);
+        let mut dec = FecDecoder::new();
+        let mut close_missing = None;
+        let mut new_shards = 0u32;
+        for pkt in out {
+            let r = dec.push_shard(&pkt);
+            new_shards += u32::from(r.shards_new);
+            if !r.recovered.is_empty() {
+                close_missing = Some(r.shards_missing);
+            }
+        }
+        // Early data-complete extract: outstanding parity is ignored (shards_new=0), not loss.
+        assert!(new_shards >= 4, "expected at least all data shards counted");
+        assert_eq!(close_missing, Some(0));
+    }
+
+    #[test]
+    fn decoder_evict_counts_missing_shards() {
+        let mut dec = FecDecoder::new();
+        // data=5, parity=1 → total 6; deliver 1 shard → missing 5 on TTL evict.
+        let p = build_fec_packet(9, 0, 5, 1, &[3u8; 16], 16);
+        let r = dec.push_shard(&p);
+        assert!(!r.invalid);
+        assert_eq!(r.shards_new, 1);
+        assert!(!dec.is_empty());
+        for group in dec.groups.values_mut() {
+            group.created_at = Instant::now() - Duration::from_secs(1);
+        }
+        let missing = dec.evict_expired();
+        assert_eq!(missing, 5);
+        assert!(dec.is_empty());
     }
 
     #[test]
@@ -1227,7 +1338,7 @@ mod tests {
         for group in dec.groups.values_mut() {
             group.created_at = Instant::now() - Duration::from_secs(1);
         }
-        dec.evict_expired();
+        let _ = dec.evict_expired();
         assert!(dec.is_empty());
     }
 

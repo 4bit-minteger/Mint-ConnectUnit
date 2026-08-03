@@ -199,7 +199,7 @@ Code tags: `src/net/packet.rs`. Join handshake requires `proto_ver: 7` in `MPJN`
 | Compact `0x01` / `0x02` | IP payload (plain / encrypted) |
 | `MKPL` / `MHOL` / `MHAC` | Keepalive / hole-punch / hole-punch ack (standalone remain legal) |
 | `MCTL` | Compound control: HB/HOL and/or one MSYN v4 part (see Membership sync) |
-| Compact `0x07` / `0x08` | Ping / pong: ping body = `ping_id`+`sender_ts` (16 B); pong body = echo + `fwd_owd_sample_ms i32` (20 B). RTT at sender; forward OWD for CC/FEC |
+| Compact `0x07` / `0x08` | Ping / pong: ping body = `ping_id`+`sender_ts` (16 B); pong body = echo + `fwd_owd_sample_ms i32` + `loss_permille u32` (24 B). RTT at sender; forward OWD for CC/FEC; peer RX wire-loss (0–1000‰) for adaptive FEC |
 | `MPJN` / `MPJA` | Join request / ack |
 | `MPRX` | Proxy/relay wrapper |
 | `MKCK` | Kick |
@@ -282,6 +282,7 @@ Important internal state (non-exhaustive):
 - Multiple **`PathCandidate`** records: `Direct`, `OwnerRelay`, `IceSrflx`
 - EWMA: RTT, loss, bandwidth; **`quality_score`**; state `Candidate` / `Active` / `Degraded` / `Stale`
 - Optional delay telemetry: **`rtt_base_ms`** (windowed min-RTT) and **`queuing_delay_ms`** (`max(0, smoothed_rtt − base)`) for path quality / DRR fairness — fed by periodic compact **ping** probes (`probe_interval_ms`, default **40**; **0** = off). VIP-level RTT updates only from the **active** multipath endpoint; secondary-path samples stay path-local.
+- **Probe-miss failover:** consecutive CC-probe timeouts on one endpoint (no intervening matched pong) reaching `[engine_limits].probe_miss_fail_threshold` (default **8**, clamp **3–64**) call `note_fail` at most once per endpoint per ping-watchdog sweep. Detection latency is floored by the probe ping deadline (~**2 s**). With `probe_interval_ms = 0`, probes are off and this path is inactive (idle routes still age via `stale_mark_secs`).
 - **Forward OWD** (same probes): peer reports `fwd_owd_sample_ms` in compact **pong**; sender tracks windowed min **`owd_base_ms`** (`Option`; cold = `None`) and **`fwd_queuing_delay_ms`**. **Background CC** and the **FEC loss classifier** use **`effective_queuing_delay_ms`**: forward QD when OWD warm, else RTT-QD, else `-1` (cold → conservative loss MD). Clock jump (`|sample − base| > owd_clock_jump_reject_ms`, default **30000**) invalidates OWD base (fallback to RTT-QD).
 - **Control path race** (default on with multipath): recovery **`MHOL`** (`direct_retry`) and predictive **heal ping** fan out to up to **3** live `PathSet` endpoints in parallel. Periodic CC ping probes stay single-endpoint.
 - **Tombstones** when peers leave (revision counters for MSYN)
@@ -362,7 +363,7 @@ Scheduler packet capacity with defaults:
 scheduler_capacity_pps ≈ base_max_burst × 1_000_000 / pace_tick_us
 ```
 
-With current defaults (`500 µs`, base burst `3`), scheduler capacity is `6,000 pps`. Sustained send rate in bytes mode is capped by `pace_target_bps` (factory **50_000_000** ≈ 400 Mbit/s). `pace_budget_cap_packets=32` allows accumulated credit after idle or delayed ticks; it does not raise the sustained target.
+With current defaults (`300 µs`, base burst `2`), scheduler capacity is approximately `6,667 pps`. Sustained send rate in bytes mode is capped by `pace_target_bps` (factory **50_000_000** ≈ 400 Mbit/s). `pace_budget_cap_packets=32` allows accumulated credit after idle or delayed ticks; it does not raise the sustained target.
 
 **Token-bucket units:** `pace_budget_cap_packets` is always a packet-unit knob (`1..=4096`), even when `pace_rate_mode=bytes`. In bytes mode the engine refills at `pace_target_bps` (or `pace_target_pps×1300` if `pace_target_bps=0`), charges each send by wire length, and caps the balance at `pace_budget_cap_packets × 1300` bytes — do not put a raw byte count in `pace_budget_cap_packets`.
 
@@ -417,7 +418,7 @@ Field-level defaults and ↑/↓ semantics: [Operational defaults](#operational-
 
 - **Reed–Solomon** over shards (**1279 B** payload per shard default).
 - Encoder per destination; decoder map keyed by source address.
-- **Adaptive** parity from loss EWMA (thresholds via `adaptive_off_below` / `adaptive_on_above`) or **forced ratio** via `fec_force_*` fields.
+- **Adaptive** parity from **peer-reported RX wire-loss** carried in compact pong (`loss_permille` → `rx_loss_ewma`), not from `RouteEntry.loss_ewma` (that field remains for failover / quality scoring only). RX measures wire loss from encrypted counter gaps (uncoded path) and FEC shard missing counts (coded path); FEC-recovered packets do not dilute the estimator. Thresholds via `adaptive_off_below` / `adaptive_on_above`, or **forced ratio** via `fec_force_*` fields.
 - **Loss classifier** (default **on**): when `loss_classifier_enabled = true`, adaptive FEC will **not increase** parity if `effective_queuing_delay / target_queue_delay_ms` exceeds `congestion_loss_threshold` (forward OWD when warm, else RTT-QD). Decreasing or turning FEC off still follows loss hysteresis. After delay recovers, a **recovery step-down** may lower parity while loss EWMA is sticky, within `fec_recovery_recency_ms` (default **1200**, **0** = disable step-down only) of the last congestive sample. The same predicate also gates **Background CC** loss multiplicative decrease and loss-driven delivery anchoring: a rising loss edge cuts rate only when delay is congestive (or when QD telemetry is untrusted — `rtt_base_tracking = false` or `qd_ms < 0` — in which case loss MD stays conservative). Non-congestive loss is left to FEC.
 - **Background CC (LEDBAT)** (`congestion_enabled`, default **on**): per-peer byte rate via token bucket; delay gradient updates rate from effective queuing delay (forward OWD preferred). With `congestion_enabled = false`, pacing CC actuation is off.
 - Flush timers **2 ms / 4 ms** (aggressive vs default); small packets may flush immediately. While APD is in **Drain**, timer flush emits **passthrough only** (no parity).
@@ -686,7 +687,7 @@ Sanitize rule: when `shed_enabled && apd_enabled && apd_sojourn_enabled`, `shed_
 | Item | Meaning | If ↑ / on | If ↓ / off |
 |------|---------|-----------|------------|
 | `fec_enabled` | Reed–Solomon groups on data path | Better recovery on loss; more bandwidth/CPU | Less overhead; loss hurts more |
-| Forced `fec-s` ratio | Fixed data/parity shards | More parity → more recovery, more overhead | Adaptive only: follows loss EWMA |
+| Forced `fec-s` ratio | Fixed data/parity shards | More parity → more recovery, more overhead | Adaptive only: follows peer RX wire-loss in pong |
 | Adaptive thresholds (`advanced.fec`) | Loss % → shard layout | Earlier FEC on | Later FEC on / easier off |
 | Loss classifier (`advanced.congestion`) | Hold parity **increases** when queuing delay ratio is high; after delay recovers, optional one-step parity **step-down** if congestion was recent | On: avoids pumping parity into bufferbloat; sheds sticky FEC sooner post-bloat | Off: loss-only adaptive FEC |
 
@@ -719,7 +720,7 @@ Tracks base RTT and queuing delay on each `RouteEntry`. Optional gate on adaptiv
 | `base_rtt_window_secs` | 4 | Min-RTT / min-OWD window length (**1–60**) | Slower base adaptation | Faster base churn |
 | `base_rtt_stale_windows` | 3 | Consecutive windows before base may **rise** (**1–10**) | Base rises only after more confirmation | Base rises sooner when path worsens |
 | `owd_clock_jump_reject_ms` | **30000** | Invalidate forward OWD base when `|sample − base|` exceeds this (**1000–600000**) | More tolerant of clock steps | Rejects / resets OWD sooner |
-| `probe_interval_ms` | 40 | Periodic compact ping/pong for RTT + forward OWD samples (**0** = off, else **20–1000**) | Fresher queuing-delay telemetry | Less control traffic; sparser samples |
+| `probe_interval_ms` | 40 | Periodic compact ping/pong for RTT + forward OWD samples (**0** = off, else **20–1000**). Also drives probe-miss failover when on | Fresher queuing-delay telemetry; faster silent-peer detect | Less control traffic; sparser samples; **0** disables probe-miss failover |
 | `fec_recovery_recency_ms` | **1200** | After last congestive sample, how long recovery may step parity down one ladder rung (**0** = off; else **100–60000**) | Longer sticky post-bloat shed window | Shorter / disable step-down (hold-increase only) |
 
 With defaults, `congestion_enabled = true` applies a per-peer token bucket (initial rate `initial_rate_bps`, burst `burst_cap_bytes`) in addition to the global pacing budget. Queuing-delay / loss-edge decreases use classic AIMD/MD when the permission rate is near measured TX delivery; when the ceiling sits clearly above the delivery EWMA (`delivery_decouple_ratio`), the first decrease hard-anchors to `delivery_ewma × delivery_anchor_factor` and snaps the smoothed bucket rate in the same update. When `loss_classifier_enabled` is on and QD telemetry is trusted (`rtt_base_tracking`), a rising loss edge only participates in that decrease path if delay is congestive (`queuing_delay / target > congestion_loss_threshold`); otherwise the edge is ignored for CC (`cc_loss_ignored_random` metric) and FEC remains the recovery tool. Delivery EWMA is send-side (successful data TX only); if true path rate is below `min_rate_bps`, the floor still applies (same as classic MD). APD is a local latency valve on top (see cascade hierarchy), gated by `apd_require_cc_headroom` so CC-induced backlog does not false-trigger Drain spin. Under-target paths may slowly increase rate via `additive_increase_bps`.
@@ -856,10 +857,11 @@ Beyond [Failover defaults](#failover-defaults) and the `[routing_ewma]` / `quali
 | STUN keepalive | 5 s | Binding refresh to STUN server | — | — |
 | Ping watchdog | 100 ms | Detects peer ping timeouts | Faster failure detection; more CPU | Slower detect |
 
-**Per-tick / burst caps** (`[engine_limits]`: `max_direct_retry_per_tick`, `max_secondary_retry_per_tick`, `max_pending_heal_probes`, `heal_cooldown_ms`, `max_pending_stun_queries`, `max_cc_probes_per_tick`)
+**Per-tick / burst caps** (`[engine_limits]`: `max_direct_retry_per_tick`, `max_secondary_retry_per_tick`, `max_pending_heal_probes`, `heal_cooldown_ms`, `max_pending_stun_queries`, `max_cc_probes_per_tick`, `probe_miss_fail_threshold`)
 
 | Constant | Value | Meaning | If ↑ | If ↓ |
 |----------|------:|---------|------|------|
+| `probe_miss_fail_threshold` | 8 | Consecutive CC-probe timeouts (no pong) before one `note_fail` per expire sweep (**3–64**) | More tolerant of burst loss before failover | Faster silent-peer `note_fail` |
 | `MAX_EXTRA_KEYS` | 8 | Extra peer crypto keys cached | More parasitic/multi-key peers | Evict sooner |
 | MSYN `MAX_PER_TICK` | 8 | MSYN relay sends per tick | Faster membership flood | Slower fan-out |
 

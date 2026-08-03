@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -539,8 +539,11 @@ fn publish_apd(shared: &PaceClockShared, pacing: &PacingEngine) {
     shared.apd_pure_spin.store(apd_spin, Ordering::Release);
 }
 
-/// Returns `(stop, needs_obs_publish)`.
-fn handle_command(pacing: &mut PacingEngine, cmd: PacingCommand) -> (bool, bool) {
+/// Returns `(stop, needs_obs_publish, outbound_local_action)`.
+fn handle_command(
+    pacing: &mut PacingEngine,
+    cmd: PacingCommand,
+) -> (bool, bool, OutboundLocalAction) {
     match cmd {
         PacingCommand::EnqueueData {
             pkt,
@@ -549,7 +552,7 @@ fn handle_command(pacing: &mut PacingEngine, cmd: PacingCommand) -> (bool, bool)
             qd_hint,
         } => {
             let _ = pacing.enqueue_peer_with_hints(pkt, dest, rtt_hint, qd_hint);
-            (false, false)
+            (false, false, OutboundLocalAction::None)
         }
         PacingCommand::TryEnqueuePeerBatch {
             dest,
@@ -560,19 +563,19 @@ fn handle_command(pacing: &mut PacingEngine, cmd: PacingCommand) -> (bool, bool)
         } => {
             let ok = pacing.try_enqueue_peer_batch(dest, &pkts, rtt_hint, qd_hint);
             let _ = reply.send(ok);
-            (false, false)
+            (false, false, OutboundLocalAction::None)
         }
         PacingCommand::EnqueueControl { pkt, dest } => {
             let _ = pacing.enqueue_control(pkt, dest);
-            (false, false)
+            (false, false, OutboundLocalAction::None)
         }
         PacingCommand::EnqueueRetransmit { pkt, dest } => {
             let _ = pacing.enqueue_retransmit(pkt, dest);
-            (false, false)
+            (false, false, OutboundLocalAction::None)
         }
         PacingCommand::RemovePeer { dest } => {
             pacing.remove_peer(dest);
-            (false, true)
+            (false, true, OutboundLocalAction::Remove(dest))
         }
         PacingCommand::OnCcSample {
             dest,
@@ -580,30 +583,69 @@ fn handle_command(pacing: &mut PacingEngine, cmd: PacingCommand) -> (bool, bool)
             loss_ewma,
         } => {
             pacing.on_cc_sample(dest, qd_ms, loss_ewma);
-            (false, false)
+            (false, false, OutboundLocalAction::None)
         }
         PacingCommand::SetConfig { cfg } => {
             pacing.set_config(cfg);
-            (false, true)
+            (false, true, OutboundLocalAction::None)
         }
         PacingCommand::SetDrrEnabled { enabled } => {
             pacing.config.drr_enabled = enabled;
-            (false, true)
+            (false, true, OutboundLocalAction::None)
         }
         PacingCommand::SetBackgroundCc { config } => {
             pacing.set_background_cc_config(config);
-            (false, true)
+            (false, true, OutboundLocalAction::None)
         }
         PacingCommand::ResetSession => {
             pacing.reset_session_runtime();
-            (false, true)
+            (false, true, OutboundLocalAction::ClearAll)
         }
         PacingCommand::ResetObservabilityCounters => {
             pacing.reset_observability_counters();
-            (false, true)
+            (false, true, OutboundLocalAction::None)
         }
-        PacingCommand::Stop => (true, false),
+        PacingCommand::Stop => (true, false, OutboundLocalAction::None),
     }
+}
+
+enum OutboundLocalAction {
+    None,
+    Remove(SocketAddr),
+    ClearAll,
+}
+
+const OUTBOUND_LOCAL_FLUSH: Duration = Duration::from_secs(1);
+
+fn apply_outbound_local_action(
+    local: &mut HashMap<SocketAddr, Instant>,
+    action: OutboundLocalAction,
+) {
+    match action {
+        OutboundLocalAction::None => {}
+        OutboundLocalAction::Remove(dest) => {
+            local.remove(&dest);
+        }
+        OutboundLocalAction::ClearAll => {
+            local.clear();
+        }
+    }
+}
+
+fn flush_outbound_local(
+    local: &mut HashMap<SocketAddr, Instant>,
+    shared: &OutboundUdpClock,
+    pending_notes: &mut u64,
+    last_flush: &mut Instant,
+) {
+    if !local.is_empty() {
+        shared.merge_notes(local);
+    }
+    if *pending_notes > 0 {
+        shared.account_notes(*pending_notes);
+        *pending_notes = 0;
+    }
+    *last_flush = Instant::now();
 }
 
 fn pacing_worker_main(
@@ -626,19 +668,36 @@ fn pacing_worker_main(
         Err(_) => return,
     };
     rt.block_on(async move {
+        let mut outbound_local: HashMap<SocketAddr, Instant> = HashMap::new();
+        let mut outbound_pending_notes: u64 = 0;
+        let mut outbound_last_flush = Instant::now();
+        let mut tick_seq: u64 = 0;
         publish_obs(&obs, &pacing);
         loop {
             if stop.load(Ordering::Acquire) {
                 while let Ok(cmd) = cmd_rx.try_recv() {
-                    let (stop_cmd, need_obs) = handle_command(&mut pacing, cmd);
+                    let (stop_cmd, need_obs, ob_act) = handle_command(&mut pacing, cmd);
+                    apply_outbound_local_action(&mut outbound_local, ob_act);
                     if need_obs {
                         publish_obs(&obs, &pacing);
                     }
                     if stop_cmd {
+                        flush_outbound_local(
+                            &mut outbound_local,
+                            &outbound_udp,
+                            &mut outbound_pending_notes,
+                            &mut outbound_last_flush,
+                        );
                         publish_obs(&obs, &pacing);
                         return;
                     }
                 }
+                flush_outbound_local(
+                    &mut outbound_local,
+                    &outbound_udp,
+                    &mut outbound_pending_notes,
+                    &mut outbound_last_flush,
+                );
                 publish_obs(&obs, &pacing);
                 return;
             }
@@ -646,11 +705,18 @@ fn pacing_worker_main(
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            let (stop_cmd, need_obs) = handle_command(&mut pacing, cmd);
+                            let (stop_cmd, need_obs, ob_act) = handle_command(&mut pacing, cmd);
+                            apply_outbound_local_action(&mut outbound_local, ob_act);
                             if need_obs {
                                 publish_obs(&obs, &pacing);
                             }
                             if stop_cmd {
+                                flush_outbound_local(
+                                    &mut outbound_local,
+                                    &outbound_udp,
+                                    &mut outbound_pending_notes,
+                                    &mut outbound_last_flush,
+                                );
                                 publish_obs(&obs, &pacing);
                                 return;
                             }
@@ -663,14 +729,35 @@ fn pacing_worker_main(
                         return;
                     }
                     let started = Instant::now();
-                    let outbound = outbound_udp.clone();
                     let metrics_note = metrics.clone();
-                    let tick_result = pacing.tick_noting(&socket, move |dest| {
-                        outbound.note(dest);
+                    let mut noted_new = false;
+                    let mut tick_notes = 0u64;
+                    let tick_result = pacing.tick_noting(&socket, |dest| {
+                        let now = Instant::now();
+                        if outbound_local.insert(dest, now).is_none() {
+                            noted_new = true;
+                        }
+                        tick_notes = tick_notes.saturating_add(1);
                         metrics_note.inc_outbound_note();
                     });
+                    outbound_pending_notes =
+                        outbound_pending_notes.saturating_add(tick_notes);
+                    if noted_new
+                        || started.saturating_duration_since(outbound_last_flush)
+                            >= OUTBOUND_LOCAL_FLUSH
+                    {
+                        flush_outbound_local(
+                            &mut outbound_local,
+                            &outbound_udp,
+                            &mut outbound_pending_notes,
+                            &mut outbound_last_flush,
+                        );
+                    }
                     publish_apd(&clock_shared, &pacing);
-                    publish_obs(&obs, &pacing);
+                    tick_seq = tick_seq.wrapping_add(1);
+                    if tick_seq % 8 == 0 {
+                        publish_obs(&obs, &pacing);
+                    }
                     let tick_duration_us = started.elapsed().as_micros() as u64;
                     let (sent, socket_dead) = match tick_result {
                         TickResult::Progress(sent) => (sent, None),
