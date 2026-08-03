@@ -2,6 +2,7 @@ pub mod background_cc;
 pub mod decentralized;
 pub mod engine;
 pub mod fec;
+pub mod fec_tx_worker;
 pub mod msyn_sync;
 pub mod outbound_udp;
 pub mod pace_clock;

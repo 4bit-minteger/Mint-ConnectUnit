@@ -176,6 +176,8 @@ pub struct PeerTickInput {
 pub struct PathMtuDiscovery {
     peers: HashMap<SocketAddr, PeerState>,
     min_path_mtu: usize,
+    /// When set, PLPMTUD search is frozen at this IP-total MTU.
+    pinned: Option<usize>,
     probe_id_counter: u32,
     rr_cursor: usize,
     /// Configured floor for adaptive probe timeout.
@@ -196,6 +198,7 @@ impl PathMtuDiscovery {
         Self {
             peers: HashMap::new(),
             min_path_mtu: DEFAULT_MTU,
+            pinned: None,
             probe_id_counter: 0,
             rr_cursor: 0,
             probe_timeout: Duration::from_millis(t.probe_timeout_ms),
@@ -217,6 +220,9 @@ impl PathMtuDiscovery {
         self.max_probes_per_search = t.max_probes_per_search;
         self.max_concurrent_peers = t.max_concurrent_peers;
         self.stable_downgrade_batches = t.stable_downgrade_batches;
+        if self.pinned.is_some() {
+            return;
+        }
         for peer in self.peers.values_mut() {
             peer.abort_inflight();
             peer.step = self.raise_step;
@@ -230,6 +236,53 @@ impl PathMtuDiscovery {
 
     pub fn set_raise_period(&mut self, secs: u64) {
         self.raise_period = Duration::from_secs(secs.max(1));
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.pinned.is_some()
+    }
+
+    /// Freeze or unfreeze path MTU. `Some(m)` clamps to `MIN_MTU..=MAX_MTU`.
+    pub fn set_pinned(&mut self, path_mtu: Option<usize>) {
+        match path_mtu {
+            Some(m) => {
+                let m = Self::clamp_size(m);
+                self.pinned = Some(m);
+                self.min_path_mtu = m;
+                let raise_period = self.raise_period;
+                for peer in self.peers.values_mut() {
+                    peer.abort_inflight();
+                    peer.last_good = m;
+                    peer.stable = m;
+                    peer.first_bad = m.saturating_add(1).min(FIRST_BAD_SENTINEL);
+                    peer.phase = Phase::Frozen;
+                    peer.probes_used = 0;
+                    peer.next_raise_at = Instant::now() + raise_period;
+                    peer.down_from_stable = None;
+                    peer.downsearch_got_ack = false;
+                }
+            }
+            None => {
+                self.pinned = None;
+                self.min_path_mtu = DEFAULT_MTU;
+                let raise_period = self.raise_period;
+                let raise_step = self.raise_step;
+                let now = Instant::now();
+                for peer in self.peers.values_mut() {
+                    *peer = PeerState::new(now, raise_period, raise_step);
+                }
+            }
+        }
+    }
+
+    /// IP-total path MTU implied by a TUN adapter payload MTU (inverse of suggestion).
+    pub fn path_mtu_from_adapter(adapter_mtu: usize, enc_overhead: usize) -> usize {
+        // Match CLI effective_adapter_mtu range (576..=1500).
+        let adapter = adapter_mtu.clamp(MIN_MTU, MAX_MTU);
+        adapter
+            .saturating_add(UNDERLAY_IPV4_UDP_OVERHEAD)
+            .saturating_add(enc_overhead)
+            .clamp(MIN_MTU, MAX_MTU)
     }
 
     pub fn remove_peer(&mut self, peer: SocketAddr) {
@@ -310,6 +363,9 @@ impl PathMtuDiscovery {
     /// Early-wake Plateau/Frozen so the next tick can Raise or Revalidate (TX-oversize hint).
     /// Does not abort inflight, change phase, or bump `search_gen`.
     pub fn request_revalidate(&mut self, peer: SocketAddr, now: Instant) -> bool {
+        if self.pinned.is_some() {
+            return false;
+        }
         let Some(st) = self.peers.get_mut(&peer) else {
             return false;
         };
@@ -330,6 +386,9 @@ impl PathMtuDiscovery {
 
     /// Data-plane size-collapse early wake (10s cooldown, Plateau/Frozen only).
     pub fn request_early_wake(&mut self, peer: SocketAddr, now: Instant) -> bool {
+        if self.pinned.is_some() {
+            return false;
+        }
         let Some(st) = self.peers.get_mut(&peer) else {
             return false;
         };
@@ -399,6 +458,10 @@ impl PathMtuDiscovery {
     }
 
     fn recalc_min(&mut self) {
+        if let Some(m) = self.pinned {
+            self.min_path_mtu = m;
+            return;
+        }
         self.min_path_mtu = self
             .peers
             .values()
@@ -410,9 +473,17 @@ impl PathMtuDiscovery {
     fn ensure_peer(&mut self, peer: SocketAddr, now: Instant) -> &mut PeerState {
         let raise_period = self.raise_period;
         let raise_step = self.raise_step;
-        self.peers
-            .entry(peer)
-            .or_insert_with(|| PeerState::new(now, raise_period, raise_step))
+        let pinned = self.pinned;
+        self.peers.entry(peer).or_insert_with(|| {
+            let mut st = PeerState::new(now, raise_period, raise_step);
+            if let Some(m) = pinned {
+                st.last_good = m;
+                st.stable = m;
+                st.first_bad = m.saturating_add(1).min(FIRST_BAD_SENTINEL);
+                st.phase = Phase::Frozen;
+            }
+            st
+        })
     }
 
     fn clamp_size(sz: usize) -> usize {
@@ -607,6 +678,9 @@ impl PathMtuDiscovery {
         peers: &[PeerTickInput],
     ) -> (Vec<ProbeIntent>, PmtudEventCounts) {
         let mut events = PmtudEventCounts::default();
+        if self.pinned.is_some() {
+            return (Vec::new(), events);
+        }
         let active: std::collections::HashSet<SocketAddr> = peers.iter().map(|p| p.addr).collect();
         let stale: Vec<SocketAddr> = self
             .peers
@@ -955,6 +1029,9 @@ impl PathMtuDiscovery {
         now: Instant,
     ) -> (bool, bool, PmtudEventCounts) {
         let mut events = PmtudEventCounts::default();
+        if self.pinned.is_some() {
+            return (false, false, events);
+        }
         let raise_period = self.raise_period;
         let raise_step = self.raise_step;
         let epsilon = self.resolve_epsilon;
@@ -1064,6 +1141,9 @@ impl PathMtuDiscovery {
         now: Instant,
     ) -> PmtudEventCounts {
         let mut events = PmtudEventCounts::default();
+        if self.pinned.is_some() {
+            return events;
+        }
         let Some(peer) = self.peers.get(&peer_addr) else {
             return events;
         };
@@ -1165,6 +1245,69 @@ mod tests {
             p.suggested_adapter_mtu(crate::net::packet::MENC_WIRE_OVERHEAD),
             1169
         );
+    }
+
+    #[test]
+    fn path_mtu_from_adapter_round_trips_suggestion() {
+        let enc = crate::net::packet::MENC_WIRE_OVERHEAD;
+        for adapter in [576usize, 1200, 1340, 1400] {
+            let path = PathMtuDiscovery::path_mtu_from_adapter(adapter, enc);
+            let mut p = PathMtuDiscovery::new();
+            p.min_path_mtu = path;
+            // Suggestion clamps to MIN_ADAPTER..=MAX; round-trip within that band.
+            let suggested = p.suggested_adapter_mtu(enc);
+            assert_eq!(
+                PathMtuDiscovery::path_mtu_from_adapter(suggested, enc),
+                path
+            );
+        }
+        let path_plain = PathMtuDiscovery::path_mtu_from_adapter(1340, 0);
+        assert_eq!(path_plain, 1340 + UNDERLAY_IPV4_UDP_OVERHEAD);
+    }
+
+    #[test]
+    fn pin_freezes_tick_and_ignores_ack() {
+        let mut p = PathMtuDiscovery::new();
+        let ep = peer();
+        let now = Instant::now();
+        tick_one(&mut p, now, ep);
+        let path = PathMtuDiscovery::path_mtu_from_adapter(1340, 0);
+        p.set_pinned(Some(path));
+        assert!(p.is_pinned());
+        assert_eq!(p.min_mtu(), path);
+        assert_eq!(p.peers.get(&ep).unwrap().phase, Phase::Frozen);
+        assert_eq!(p.peers.get(&ep).unwrap().last_good, path);
+
+        let (intents, _) = p.on_tick(
+            now + Duration::from_secs(120),
+            &[PeerTickInput {
+                addr: ep,
+                health: SizeHealth::default(),
+                rtt_ms: 20.0,
+            }],
+        );
+        assert!(intents.is_empty());
+        assert!(!p.request_revalidate(ep, now + Duration::from_secs(120)));
+        assert!(!p.request_early_wake(ep, now + Duration::from_secs(120)));
+
+        let (ok, min_changed, _) = p.on_ack(ep, path + 32, 1, 1, now);
+        assert!(!ok);
+        assert!(!min_changed);
+        assert_eq!(p.min_mtu(), path);
+    }
+
+    #[test]
+    fn unpin_restores_discovery_floor() {
+        let mut p = PathMtuDiscovery::new();
+        let ep = peer();
+        let now = Instant::now();
+        tick_one(&mut p, now, ep);
+        p.set_pinned(Some(1400));
+        p.set_pinned(None);
+        assert!(!p.is_pinned());
+        assert_eq!(p.min_mtu(), DEFAULT_MTU);
+        assert_eq!(p.peers.get(&ep).unwrap().last_good, DEFAULT_MTU);
+        assert_eq!(p.peers.get(&ep).unwrap().phase, Phase::Plateau);
     }
 
     #[test]
@@ -1336,6 +1479,7 @@ mod tests {
         let mut p = PathMtuDiscovery::new();
         p.max_probes_per_search = 3;
         p.confirm_count = 1;
+        p.resolve_epsilon = 1;
         let ep = peer();
         let mut now = Instant::now();
         p.ensure_peer(ep, now);

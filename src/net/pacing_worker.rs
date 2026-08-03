@@ -232,15 +232,14 @@ pub enum PacingEvent {
     },
 }
 
-pub struct PacingWorkerHandle {
+/// Cloneable pacing command ingress (cmd + obs). Does not own `event_rx` / join.
+#[derive(Clone)]
+pub struct PacingIngress {
     pub cmd_tx: mpsc::Sender<PacingCommand>,
-    pub event_rx: mpsc::UnboundedReceiver<PacingEvent>,
     pub obs: Arc<ArcSwap<PacingObs>>,
-    pub stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
 }
 
-impl PacingWorkerHandle {
+impl PacingIngress {
     pub fn load_obs(&self) -> arc_swap::Guard<Arc<PacingObs>> {
         self.obs.load()
     }
@@ -277,41 +276,6 @@ impl PacingWorkerHandle {
             .is_ok()
     }
 
-    pub async fn enqueue_data_async(
-        &self,
-        pkt: Bytes,
-        dest: SocketAddr,
-        rtt_hint: Option<f32>,
-        qd_hint: Option<f32>,
-    ) -> bool {
-        self.cmd_tx
-            .send(PacingCommand::EnqueueData {
-                pkt,
-                dest,
-                rtt_hint,
-                qd_hint,
-            })
-            .await
-            .is_ok()
-    }
-
-    /// Fire-and-forget control; spins if channel full. Returns whether delivered to channel.
-    pub fn enqueue_control(&self, pkt: Bytes, dest: SocketAddr) -> bool {
-        self.send_cmd_spin(PacingCommand::EnqueueControl { pkt, dest })
-    }
-
-    pub async fn enqueue_control_async(&self, pkt: Bytes, dest: SocketAddr) -> bool {
-        self.cmd_tx
-            .send(PacingCommand::EnqueueControl { pkt, dest })
-            .await
-            .is_ok()
-    }
-
-    /// Fire-and-forget retransmit; spins if channel full.
-    pub fn enqueue_retransmit(&self, pkt: Bytes, dest: SocketAddr) -> bool {
-        self.send_cmd_spin(PacingCommand::EnqueueRetransmit { pkt, dest })
-    }
-
     pub fn try_enqueue_peer_batch(
         &self,
         dest: SocketAddr,
@@ -331,6 +295,82 @@ impl PacingWorkerHandle {
             Err(_) => false,
         }
     }
+}
+
+pub struct PacingWorkerHandle {
+    pub ingress: PacingIngress,
+    pub event_rx: mpsc::UnboundedReceiver<PacingEvent>,
+    pub stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl PacingWorkerHandle {
+    pub fn load_obs(&self) -> arc_swap::Guard<Arc<PacingObs>> {
+        self.ingress.load_obs()
+    }
+
+    fn send_cmd_spin(&self, cmd: PacingCommand) -> bool {
+        self.ingress.send_cmd_spin(cmd)
+    }
+
+    /// Fire-and-forget data enqueue. Returns false if channel Full/Closed.
+    pub fn try_enqueue_data(
+        &self,
+        pkt: Bytes,
+        dest: SocketAddr,
+        rtt_hint: Option<f32>,
+        qd_hint: Option<f32>,
+    ) -> bool {
+        self.ingress.try_enqueue_data(pkt, dest, rtt_hint, qd_hint)
+    }
+
+    pub async fn enqueue_data_async(
+        &self,
+        pkt: Bytes,
+        dest: SocketAddr,
+        rtt_hint: Option<f32>,
+        qd_hint: Option<f32>,
+    ) -> bool {
+        self.ingress
+            .cmd_tx
+            .send(PacingCommand::EnqueueData {
+                pkt,
+                dest,
+                rtt_hint,
+                qd_hint,
+            })
+            .await
+            .is_ok()
+    }
+
+    /// Fire-and-forget control; spins if channel full. Returns whether delivered to channel.
+    pub fn enqueue_control(&self, pkt: Bytes, dest: SocketAddr) -> bool {
+        self.send_cmd_spin(PacingCommand::EnqueueControl { pkt, dest })
+    }
+
+    pub async fn enqueue_control_async(&self, pkt: Bytes, dest: SocketAddr) -> bool {
+        self.ingress
+            .cmd_tx
+            .send(PacingCommand::EnqueueControl { pkt, dest })
+            .await
+            .is_ok()
+    }
+
+    /// Fire-and-forget retransmit; spins if channel full.
+    pub fn enqueue_retransmit(&self, pkt: Bytes, dest: SocketAddr) -> bool {
+        self.send_cmd_spin(PacingCommand::EnqueueRetransmit { pkt, dest })
+    }
+
+    pub fn try_enqueue_peer_batch(
+        &self,
+        dest: SocketAddr,
+        pkts: Vec<Bytes>,
+        rtt_hint: Option<f32>,
+        qd_hint: Option<f32>,
+    ) -> bool {
+        self.ingress
+            .try_enqueue_peer_batch(dest, pkts, rtt_hint, qd_hint)
+    }
 
     pub async fn try_enqueue_peer_batch_async(
         &self,
@@ -340,13 +380,16 @@ impl PacingWorkerHandle {
         qd_hint: Option<f32>,
     ) -> bool {
         let (reply_tx, reply_rx) = reply_channel();
-        match self.cmd_tx.try_send(PacingCommand::TryEnqueuePeerBatch {
-            dest,
-            pkts,
-            rtt_hint,
-            qd_hint,
-            reply: reply_tx,
-        }) {
+        match self
+            .ingress
+            .cmd_tx
+            .try_send(PacingCommand::TryEnqueuePeerBatch {
+                dest,
+                pkts,
+                rtt_hint,
+                qd_hint,
+                reply: reply_tx,
+            }) {
             Ok(()) => {
                 tokio::task::yield_now().await;
                 wait_reply(reply_rx)
@@ -360,7 +403,11 @@ impl PacingWorkerHandle {
     }
 
     pub async fn remove_peer_async(&self, dest: SocketAddr) {
-        let _ = self.cmd_tx.send(PacingCommand::RemovePeer { dest }).await;
+        let _ = self
+            .ingress
+            .cmd_tx
+            .send(PacingCommand::RemovePeer { dest })
+            .await;
     }
 
     pub fn on_cc_sample(&self, dest: SocketAddr, qd_ms: f64, loss_ewma: f64) {
@@ -376,7 +423,11 @@ impl PacingWorkerHandle {
     }
 
     pub async fn set_config_async(&self, cfg: PacingConfig) {
-        let _ = self.cmd_tx.send(PacingCommand::SetConfig { cfg }).await;
+        let _ = self
+            .ingress
+            .cmd_tx
+            .send(PacingCommand::SetConfig { cfg })
+            .await;
     }
 
     pub fn set_drr_enabled(&self, enabled: bool) {
@@ -385,6 +436,7 @@ impl PacingWorkerHandle {
 
     pub async fn set_drr_enabled_async(&self, enabled: bool) {
         let _ = self
+            .ingress
             .cmd_tx
             .send(PacingCommand::SetDrrEnabled { enabled })
             .await;
@@ -399,7 +451,7 @@ impl PacingWorkerHandle {
     }
 
     pub async fn reset_session_async(&self) {
-        let _ = self.cmd_tx.send(PacingCommand::ResetSession).await;
+        let _ = self.ingress.cmd_tx.send(PacingCommand::ResetSession).await;
     }
 
     pub fn reset_observability_counters(&self) {
@@ -408,6 +460,7 @@ impl PacingWorkerHandle {
 
     pub async fn reset_observability_counters_async(&self) {
         let _ = self
+            .ingress
             .cmd_tx
             .send(PacingCommand::ResetObservabilityCounters)
             .await;
@@ -415,7 +468,7 @@ impl PacingWorkerHandle {
 
     pub fn request_stop(&mut self) -> Option<JoinHandle<()>> {
         self.stop.store(true, Ordering::Release);
-        let _ = self.cmd_tx.try_send(PacingCommand::Stop);
+        let _ = self.ingress.cmd_tx.try_send(PacingCommand::Stop);
         let _ = self.send_cmd_spin(PacingCommand::Stop);
         self.join.take()
     }
@@ -466,9 +519,8 @@ pub fn start_pacing_worker(
         .expect("mint-pacing thread");
     PacingWorkerSpawn {
         handle: PacingWorkerHandle {
-            cmd_tx,
+            ingress: PacingIngress { cmd_tx, obs },
             event_rx,
-            obs,
             stop,
             join: Some(join),
         },

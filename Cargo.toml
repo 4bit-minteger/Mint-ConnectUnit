@@ -58,5 +58,6 @@ strip = true
 debug = false
 lto = "fat"
 codegen-units = 1
+
 [profile.release.package."*"]
 opt-level = 3

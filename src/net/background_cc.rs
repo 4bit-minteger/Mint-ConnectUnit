@@ -5,14 +5,14 @@ use std::net::SocketAddr;
 
 use crate::routing::failover;
 
-pub const DEFAULT_BURST_CAP_BYTES: u64 = 12_000;
+pub const DEFAULT_BURST_CAP_BYTES: u64 = 16_000;
 pub const DEFAULT_GAIN: f64 = 0.1;
 pub const DEFAULT_MIN_DECREASE_FACTOR: f64 = 0.9;
-pub const DEFAULT_ADDITIVE_INCREASE_BPS: f64 = 8_000.0;
+pub const DEFAULT_ADDITIVE_INCREASE_BPS: f64 = 28_000.0;
 pub const DEFAULT_RATE_SMOOTHING_ALPHA: f64 = 0.9;
-pub const DEFAULT_MIN_RATE_BPS: f64 = 1_000_000.0;
-pub const DEFAULT_MAX_RATE_BPS: f64 = 12_000_000.0;
-pub const DEFAULT_INITIAL_RATE_BPS: f64 = 1_500_000.0;
+pub const DEFAULT_MIN_RATE_BPS: f64 = 1_800_000.0;
+pub const DEFAULT_MAX_RATE_BPS: f64 = 25_000_000.0;
+pub const DEFAULT_INITIAL_RATE_BPS: f64 = 2_000_000.0;
 pub const DEFAULT_LOSS_MD: f64 = 0.9;
 pub const DEFAULT_HOL_ESCAPE_MS: u32 = 12;
 pub const DEFAULT_TARGET_QUEUE_DELAY_MS: u32 = 15;

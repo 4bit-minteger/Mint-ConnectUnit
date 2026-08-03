@@ -61,6 +61,9 @@ pub struct NetworkConfig {
     pub udp_sndbuf: i32,
     pub udp_rcvbuf: i32,
     pub adapter_mtu: i32,
+    /// When true, freeze PLPMTUD and lock path + Wintun MTU from `adapter_mtu`.
+    #[serde(default)]
+    pub pin_mtu: bool,
     pub wintun_ring_bytes: u32,
 
     #[serde(default = "default_wintun_ipv4_interface_metric")]
@@ -230,7 +233,7 @@ fn default_parasitic_use_public() -> bool {
 }
 
 fn default_pace_rate_mode() -> String {
-    "bytes".to_string()
+    "pps".to_string()
 }
 
 fn default_pace_target_bps() -> i64 {
@@ -242,7 +245,7 @@ fn default_wintun_ipv4_interface_metric() -> u32 {
 }
 
 fn default_process_priority_level() -> u8 {
-    2
+    1
 }
 
 fn default_apd_enabled() -> bool {
@@ -403,7 +406,7 @@ pub fn effective_decentralized_trackers(cfg: &NetworkConfig) -> Vec<String> {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        const UDP_SNDBUF_DEFAULT: i32 = 256 * 1024;
+        const UDP_SNDBUF_DEFAULT: i32 = 2 * 1024 * 1024;
         const UDP_RCVBUF_DEFAULT: i32 = 2 * 1024 * 1024;
         Self {
             server_name: String::new(),
@@ -431,7 +434,8 @@ impl Default for NetworkConfig {
             udp_sndbuf: UDP_SNDBUF_DEFAULT,
             udp_rcvbuf: UDP_RCVBUF_DEFAULT,
             adapter_mtu: 1340,
-            wintun_ring_bytes: 4 * 1024 * 1024,
+            pin_mtu: false,
+            wintun_ring_bytes: 8 * 1024 * 1024,
             wintun_ipv4_interface_metric: default_wintun_ipv4_interface_metric(),
             pace_tick_us: crate::net::pacing_defaults::DEFAULT_PACE_TICK_US,
             pace_target_pps: crate::net::pacing_defaults::DEFAULT_PACE_TARGET_PPS,
@@ -499,6 +503,7 @@ impl NetworkConfig {
         self.udp_sndbuf = other.udp_sndbuf;
         self.udp_rcvbuf = other.udp_rcvbuf;
         self.adapter_mtu = other.adapter_mtu;
+        self.pin_mtu = other.pin_mtu;
         self.wintun_ring_bytes = other.wintun_ring_bytes;
         self.wintun_ipv4_interface_metric = other.wintun_ipv4_interface_metric;
         self.pace_tick_us = other.pace_tick_us;
@@ -1226,7 +1231,7 @@ mod tests {
             "keepalive_secs must not be a root key: {raw}"
         );
         assert!(
-            raw.contains("probe_timeout_ms = 1000"),
+            raw.contains("probe_timeout_ms = 500"),
             "pmtud probe_timeout_ms default missing: {raw}"
         );
         assert!(
@@ -1270,6 +1275,7 @@ crypto_key = "aa"
 udp_sndbuf = 262144
 udp_rcvbuf = 1048576
 adapter_mtu = 1340
+pin_mtu = false
 wintun_ring_bytes = 2097152
 
 [pacing]
@@ -1647,9 +1653,9 @@ pace_max_queue_packets = 64
     fn shed_fields_round_trip_and_defaults() {
         let cfg = NetworkConfig::default();
         assert!(cfg.shed_enabled);
-        assert_eq!(cfg.shed_max_sojourn_ms, 50);
-        assert!((cfg.shed_min_fill - 0.2).abs() < f32::EPSILON);
-        assert_eq!(cfg.shed_max_per_tick, 2);
+        assert_eq!(cfg.shed_max_sojourn_ms, 30);
+        assert!((cfg.shed_min_fill - 0.3).abs() < f32::EPSILON);
+        assert_eq!(cfg.shed_max_per_tick, 1);
 
         let raw = encode_network_config_toml(&cfg).expect("encode");
         let back = parse_network_config_toml(&raw).expect("decode");

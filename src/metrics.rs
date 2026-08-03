@@ -42,6 +42,7 @@ pub struct EngineMetrics {
     pub pacing_drop_data_normal: AtomicU64,
     pub pacing_shed_sojourn: AtomicU64,
     pub pacing_cmd_channel_full: AtomicU64,
+    pub fec_tx_cmd_channel_full: AtomicU64,
     pub pacing_drop_control: AtomicU64,
     pub rawperf_send_error_count: AtomicU64,
     pub retransmit_direct_count: AtomicU64,
@@ -147,6 +148,7 @@ impl Default for EngineMetrics {
             pacing_drop_data_normal: AtomicU64::new(0),
             pacing_shed_sojourn: AtomicU64::new(0),
             pacing_cmd_channel_full: AtomicU64::new(0),
+            fec_tx_cmd_channel_full: AtomicU64::new(0),
             pacing_drop_control: AtomicU64::new(0),
             rawperf_send_error_count: AtomicU64::new(0),
             retransmit_direct_count: AtomicU64::new(0),
@@ -272,6 +274,7 @@ impl EngineMetrics {
         self.pacing_drop_data_normal.store(0, Ordering::Relaxed);
         self.pacing_shed_sojourn.store(0, Ordering::Relaxed);
         self.pacing_cmd_channel_full.store(0, Ordering::Relaxed);
+        self.fec_tx_cmd_channel_full.store(0, Ordering::Relaxed);
         self.pacing_drop_control.store(0, Ordering::Relaxed);
         self.rawperf_send_error_count.store(0, Ordering::Relaxed);
         self.retransmit_direct_count.store(0, Ordering::Relaxed);
@@ -554,6 +557,13 @@ impl EngineMetrics {
             return;
         }
         self.pacing_cmd_channel_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_fec_tx_cmd_channel_full(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.fec_tx_cmd_channel_full.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_pacing_drop_data_normal(&self, v: u64) {

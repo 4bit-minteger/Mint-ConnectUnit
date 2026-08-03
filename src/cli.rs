@@ -51,15 +51,17 @@ const PORT_MIN: u16 = 1024;
 const PORT_MAX: u16 = 65535;
 const MAX_PEERS: usize = 253;
 
-/// Fixed line count for `paint_runtime_frame` (header + flags + traffic + metrics).
-const RUNTIME_DISPLAY_LINE_COUNT: usize = 82;
+/// Fixed line count for `paint_runtime_frame` (header + flags + traffic + 2-col metrics).
+const RUNTIME_DISPLAY_LINE_COUNT: usize = 53;
+/// Minimum width of the left metrics column (right column follows after 2 spaces).
+const RUNTIME_METRIC_COL_WIDTH: usize = 48;
 
-const DEFAULT_UDP_SOCKBUF: i32 = 256 * 1024;
+const DEFAULT_UDP_SOCKBUF: i32 = 2 * 1024 * 1024;
 const DEFAULT_UDP_RCVBUF: i32 = 2 * 1024 * 1024;
 const UDP_SOCKBUF_MIN: i32 = 128 * 1024;
 const UDP_SOCKBUF_MAX: i32 = 64 * 1024 * 1024;
 
-const DEFAULT_WINTUN_RING_BYTES: u32 = 4 * 1024 * 1024;
+const DEFAULT_WINTUN_RING_BYTES: u32 = 8 * 1024 * 1024;
 const WINTUN_RING_MIN_BYTES: u32 = 128 * 1024;
 const WINTUN_RING_MAX_BYTES: u32 = 32 * 1024 * 1024;
 const WINTUN_IPV4_METRIC_MAX: u32 = 999_999;
@@ -521,6 +523,18 @@ impl Cli {
             return Err(anyhow!(
                 "engine unavailable: cannot apply saved retransmit bypass"
             ));
+        }
+        let adapter_mtu = effective_adapter_mtu(snap.adapter_mtu) as u16;
+        if self
+            .cmd_tx
+            .send(EngineCmd::SetMtuPin {
+                pin_mtu: snap.pin_mtu,
+                adapter_mtu,
+            })
+            .await
+            .is_err()
+        {
+            return Err(anyhow!("engine unavailable: cannot apply saved MTU pin"));
         }
         Ok(())
     }
@@ -1599,6 +1613,11 @@ impl Cli {
         let _ = self
             .cmd_tx
             .try_send(EngineCmd::SetAdapterName(adapter_name));
+        let snap = self.config.snapshot();
+        let _ = self.cmd_tx.try_send(EngineCmd::SetMtuPin {
+            pin_mtu: snap.pin_mtu,
+            adapter_mtu: effective_adapter_mtu(snap.adapter_mtu) as u16,
+        });
     }
 
     /// First-run menu only (headless first open uses `crate::banner::render_banner_to_stdout`).
@@ -5301,6 +5320,21 @@ impl Cli {
         }
     }
 
+    /// Pack engine-metric KV rows into two side-by-side columns (left = first half).
+    fn runtime_push_metric_columns(lines: &mut Vec<String>, items: &[String]) {
+        let mid = items.len().div_ceil(2);
+        let col_w = RUNTIME_METRIC_COL_WIDTH;
+        for i in 0..mid {
+            let left = items[i].trim_start();
+            match items.get(mid + i) {
+                Some(right) => {
+                    lines.push(format!("  {left:<col_w$}  {}", right.trim_start()));
+                }
+                None => lines.push(format!("  {left}")),
+            }
+        }
+    }
+
     fn runtime_push_traffic_and_buffers(
         &self,
         lines: &mut Vec<String>,
@@ -5354,6 +5388,17 @@ impl Cli {
                 s.udp_sndbuf / 1024,
                 s.udp_rcvbuf / 1024
             ));
+            if s.pin_mtu {
+                lines.push(format!(
+                    "  pmtud                  : pinned path_mtu={} (adapter locked)",
+                    s.path_mtu
+                ));
+            } else {
+                lines.push(format!(
+                    "  pmtud                  : active min_path={}",
+                    s.path_mtu
+                ));
+            }
             if s.pmtud_peers.is_empty() {
                 lines.push("  pmtud_peers             : (none)".to_string());
             } else {
@@ -5373,6 +5418,7 @@ impl Cli {
             lines.push("  pacing fill (aggregate): —".to_string());
             lines.push("  tun inject broadcast   : —".to_string());
             lines.push("  udp sndbuf / rcvbuf    : —".to_string());
+            lines.push("  pmtud                  : —".to_string());
             lines.push("  pmtud_peers             : —".to_string());
         }
         let ring = effective_wintun_ring_bytes(self.config.snapshot().wintun_ring_bytes);
@@ -5424,319 +5470,326 @@ impl Cli {
         self.runtime_push_traffic_and_buffers(&mut lines, snap, rates);
 
         let na = |label: &str| format!("  {label:<22}: — (engine not running)");
+        let mut metric_items: Vec<String> = Vec::with_capacity(61);
         match &self.engine_metrics {
             Some(m) => {
-                lines.push(format!(
-                    "  apd_drain_activations  : {} (pace-adp entered drain)",
+                metric_items.push(format!(
+                    "  apd_drain_activations  : {}",
                     m.apd_drain_episodes.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
-                    "  apd_packets_sent       : {} (paced sends during drain)",
+                metric_items.push(format!(
+                    "  apd_packets_sent       : {}",
                     m.apd_packets_drained.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  apd_ramp_active_ticks  : {}",
                     m.apd_ramp_active_ticks.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  apd_ramp_pinned_ticks  : {}",
                     m.apd_ramp_pinned_ticks.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  apd_effective_burst    : {} pkt/tick",
                     m.apd_last_effective_burst.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  apd_drain_arm_fill     : {}",
                     m.apd_drain_arm_fill.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  apd_drain_arm_sojourn  : {}",
                     m.apd_drain_arm_sojourn.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  apd_max_sojourn_ms     : {}",
                     m.apd_last_max_sojourn_ms.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  apd_cc_headroom_suppressions: {}",
                     m.apd_cc_headroom_suppressions.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_rate_limited        : {}",
                     m.cc_rate_limited_events.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_rate_bps_min        : {}",
                     m.cc_rate_bps_min.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_rate_bps_avg        : {}",
                     m.cc_rate_bps_avg.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_rate_bps_max        : {}",
                     m.cc_rate_bps_max.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_delivery_bps_min    : {}",
                     m.cc_delivery_bps_min.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_delivery_bps_avg    : {}",
                     m.cc_delivery_bps_avg.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_delivery_bps_max    : {}",
                     m.cc_delivery_bps_max.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_increase_events     : {}",
                     m.cc_increase_events_total.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_decrease_events     : {}",
                     m.cc_decrease_events_total.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_loss_decrease_events: {}",
                     m.cc_loss_decrease_events_total.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_loss_ignored_random : {}",
                     m.cc_loss_ignored_random_events_total
                         .load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  owd_samples (app/rej)  : {} / {}",
                     m.owd_samples_applied_total.load(Ordering::Relaxed),
                     m.owd_samples_rejected_total.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  cc_delivery_anchor_events: {}",
                     m.cc_delivery_anchor_events_total.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  drr_small_priority_pops: {}",
                     m.drr_small_priority_pops.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  drr_bulk_force_pops    : {}",
                     m.drr_bulk_force_pops.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  drr_rtt_scale_applied  : {}",
                     m.drr_rtt_scale_applied.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_congestive_hold    : {}",
                     m.fec_congestive_hold_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_classifier_allow   : {}",
                     m.fec_classifier_allow_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_recovery_stepdown  : {}",
                     m.fec_recovery_stepdown_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pacing_dropped_packets : {}",
                     m.pacing_dropped_packets.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  relay_fallback_events  : {}",
                     m.relay_fallback_events.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  auth_failures          : {}",
                     m.auth_failures.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  tun_inject_drops       : {}",
                     m.tun_inject_drops.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_oversize_bypass    : {}",
                     m.fec_oversize_bypass_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_mtu_bypass         : {}",
                     m.fec_mtu_bypass_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_tx_oversize_drop : {}",
                     m.pmtud_tx_oversize_drop.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_revalidate_hints : {}",
                     m.pmtud_revalidate_hints.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_probes_sent      : {}",
                     m.pmtud_probes_sent.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_probe_acks       : {}",
                     m.pmtud_probe_acks.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_probe_timeouts   : {}",
                     m.pmtud_probe_timeouts.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_revalidate_fails : {}",
                     m.pmtud_revalidate_fail_events.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_recheck_recovered: {}",
                     m.pmtud_recheck_recovered_events.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_softdown_events  : {}",
                     m.pmtud_softdown_events.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_probe_anomaly    : {}",
                     m.pmtud_probe_anomaly_events.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_late_ack_events  : {}",
                     m.pmtud_late_ack_events.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pmtud_early_wake       : {}",
                     m.pmtud_early_wake_events.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_drain_passthrough  : {}",
                     m.fec_drain_passthrough_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_group_invalid      : {}",
                     m.fec_group_invalid_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_flush_passthrough  : {}",
                     m.fec_flush_sparse_passthrough_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_encoded_shards     : {}",
                     m.fec_encoded_shards_total.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_recovered_packets  : {}",
                     m.fec_recovered_packets_total.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  fec_decode_fail        : {}",
                     m.fec_decode_fail_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pacing_drop_data_fec   : {}",
                     m.pacing_drop_data_fec.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pacing_drop_data_norm  : {}",
                     m.pacing_drop_data_normal.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pacing_shed_sojourn    : {}",
                     m.pacing_shed_sojourn.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pacing_cmd_chan_full   : {}",
                     m.pacing_cmd_channel_full.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pacing_drop_control    : {}",
                     m.pacing_drop_control.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  pacing_ctrl_retx_evict : {}",
                     m.pacing_drop_control_retransmit.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  reli_unknown_inner_tag : {}",
                     m.reliable_unknown_inner_tag.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  rawperf_send_errors    : {}",
                     m.rawperf_send_error_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  retransmit_direct      : {}",
                     m.retransmit_direct_count.load(Ordering::Relaxed)
                 ));
-                lines.push(format!(
+                metric_items.push(format!(
                     "  retransmit_fallback    : {}",
                     m.retransmit_fallback_count.load(Ordering::Relaxed)
                 ));
             }
             None => {
-                lines.push(na("apd_drain_activations"));
-                lines.push(na("apd_packets_sent"));
-                lines.push(na("apd_ramp_active_ticks"));
-                lines.push(na("apd_ramp_pinned_ticks"));
-                lines.push(na("apd_effective_burst"));
-                lines.push(na("apd_drain_arm_fill"));
-                lines.push(na("apd_drain_arm_sojourn"));
-                lines.push(na("apd_max_sojourn_ms"));
-                lines.push(na("apd_cc_headroom_suppressions"));
-                lines.push(na("cc_rate_limited"));
-                lines.push(na("cc_rate_bps_min"));
-                lines.push(na("cc_rate_bps_avg"));
-                lines.push(na("cc_rate_bps_max"));
-                lines.push(na("cc_delivery_bps_min"));
-                lines.push(na("cc_delivery_bps_avg"));
-                lines.push(na("cc_delivery_bps_max"));
-                lines.push(na("cc_increase_events"));
-                lines.push(na("cc_decrease_events"));
-                lines.push(na("cc_loss_decrease_events"));
-                lines.push(na("cc_loss_ignored_random"));
-                lines.push(na("owd_samples (app/rej)"));
-                lines.push(na("cc_delivery_anchor_events"));
-                lines.push(na("drr_small_priority_pops"));
-                lines.push(na("drr_bulk_force_pops"));
-                lines.push(na("drr_rtt_scale_applied"));
-                lines.push(na("fec_congestive_hold"));
-                lines.push(na("fec_classifier_allow"));
-                lines.push(na("fec_recovery_stepdown"));
-                lines.push(na("pacing_dropped_packets"));
-                lines.push(na("relay_fallback_events"));
-                lines.push(na("auth_failures"));
-                lines.push(na("tun_inject_drops"));
-                lines.push(na("fec_oversize_bypass"));
-                lines.push(na("fec_mtu_bypass"));
-                lines.push(na("pmtud_tx_oversize_drop"));
-                lines.push(na("pmtud_revalidate_hints"));
-                lines.push(na("pmtud_probes_sent"));
-                lines.push(na("pmtud_probe_acks"));
-                lines.push(na("pmtud_probe_timeouts"));
-                lines.push(na("pmtud_revalidate_fails"));
-                lines.push(na("pmtud_recheck_recovered"));
-                lines.push(na("pmtud_softdown_events"));
-                lines.push(na("pmtud_probe_anomaly"));
-                lines.push(na("pmtud_late_ack_events"));
-                lines.push(na("pmtud_early_wake"));
-                lines.push(na("fec_drain_passthrough"));
-                lines.push(na("fec_group_invalid"));
-                lines.push(na("fec_flush_passthrough"));
-                lines.push(na("fec_encoded_shards"));
-                lines.push(na("fec_recovered_packets"));
-                lines.push(na("fec_decode_fail"));
-                lines.push(na("pacing_drop_data_fec"));
-                lines.push(na("pacing_drop_data_norm"));
-                lines.push(na("pacing_shed_sojourn"));
-                lines.push(na("pacing_cmd_chan_full"));
-                lines.push(na("pacing_drop_control"));
-                lines.push(na("pacing_ctrl_retx_evict"));
-                lines.push(na("reli_unknown_inner_tag"));
-                lines.push(na("rawperf_send_errors"));
-                lines.push(na("retransmit_direct"));
-                lines.push(na("retransmit_fallback"));
+                for label in [
+                    "apd_drain_activations",
+                    "apd_packets_sent",
+                    "apd_ramp_active_ticks",
+                    "apd_ramp_pinned_ticks",
+                    "apd_effective_burst",
+                    "apd_drain_arm_fill",
+                    "apd_drain_arm_sojourn",
+                    "apd_max_sojourn_ms",
+                    "apd_cc_headroom_suppressions",
+                    "cc_rate_limited",
+                    "cc_rate_bps_min",
+                    "cc_rate_bps_avg",
+                    "cc_rate_bps_max",
+                    "cc_delivery_bps_min",
+                    "cc_delivery_bps_avg",
+                    "cc_delivery_bps_max",
+                    "cc_increase_events",
+                    "cc_decrease_events",
+                    "cc_loss_decrease_events",
+                    "cc_loss_ignored_random",
+                    "owd_samples (app/rej)",
+                    "cc_delivery_anchor_events",
+                    "drr_small_priority_pops",
+                    "drr_bulk_force_pops",
+                    "drr_rtt_scale_applied",
+                    "fec_congestive_hold",
+                    "fec_classifier_allow",
+                    "fec_recovery_stepdown",
+                    "pacing_dropped_packets",
+                    "relay_fallback_events",
+                    "auth_failures",
+                    "tun_inject_drops",
+                    "fec_oversize_bypass",
+                    "fec_mtu_bypass",
+                    "pmtud_tx_oversize_drop",
+                    "pmtud_revalidate_hints",
+                    "pmtud_probes_sent",
+                    "pmtud_probe_acks",
+                    "pmtud_probe_timeouts",
+                    "pmtud_revalidate_fails",
+                    "pmtud_recheck_recovered",
+                    "pmtud_softdown_events",
+                    "pmtud_probe_anomaly",
+                    "pmtud_late_ack_events",
+                    "pmtud_early_wake",
+                    "fec_drain_passthrough",
+                    "fec_group_invalid",
+                    "fec_flush_passthrough",
+                    "fec_encoded_shards",
+                    "fec_recovered_packets",
+                    "fec_decode_fail",
+                    "pacing_drop_data_fec",
+                    "pacing_drop_data_norm",
+                    "pacing_shed_sojourn",
+                    "pacing_cmd_chan_full",
+                    "pacing_drop_control",
+                    "pacing_ctrl_retx_evict",
+                    "reli_unknown_inner_tag",
+                    "rawperf_send_errors",
+                    "retransmit_direct",
+                    "retransmit_fallback",
+                ] {
+                    metric_items.push(na(label));
+                }
             }
         }
+        debug_assert_eq!(metric_items.len(), 61);
+        Self::runtime_push_metric_columns(&mut lines, &metric_items);
         debug_assert_eq!(lines.len(), RUNTIME_DISPLAY_LINE_COUNT);
         lines
     }
@@ -6476,6 +6529,7 @@ impl Cli {
         } else {
             crate::cli_println!("  Saved adapter_mtu: (unset — 1340 used on adapter create)");
         }
+        crate::cli_println!("  Saved pin_mtu: {}", snap.pin_mtu);
         if eff_metric == 0 {
             crate::cli_println!("  Saved wintun_ipv4_interface_metric: 0 (off)");
         } else {
@@ -7542,6 +7596,7 @@ fn adapter_live_apply_plan(
             != effective_wintun_ring_bytes(next.wintun_ring_bytes),
         apply_netsh: effective_adapter_mtu(prev.adapter_mtu)
             != effective_adapter_mtu(next.adapter_mtu)
+            || prev.pin_mtu != next.pin_mtu
             || effective_wintun_ipv4_interface_metric(prev.wintun_ipv4_interface_metric)
                 != effective_wintun_ipv4_interface_metric(next.wintun_ipv4_interface_metric),
     }
@@ -7732,5 +7787,16 @@ mod adapter_live_apply_plan_tests {
                 apply_netsh: true,
             }
         );
+    }
+
+    #[test]
+    fn pin_mtu_flip_requests_netsh() {
+        let prev = NetworkConfig::default();
+        let mut next = prev.clone();
+        next.pin_mtu = true;
+        let plan = adapter_live_apply_plan(Some(&prev), &next);
+        assert!(plan.apply_netsh);
+        assert!(!plan.apply_socket_buffers);
+        assert!(!plan.recreate_wintun_ring);
     }
 }

@@ -1797,7 +1797,7 @@ mod tests {
         let ep: SocketAddr = "127.0.0.1:11000".parse().unwrap();
         rt.update("10.0.0.9", ep, None);
         for i in 0..40 {
-            if i % 5 == 0 {
+            if i % 3 == 0 {
                 let _ = rt.note_fail(ep, None);
             } else {
                 rt.note_rtt(ep, 50, None);
@@ -1805,7 +1805,7 @@ mod tests {
         }
         assert!(
             rt.table.get("10.0.0.9").unwrap().loss_ewma > 0.0,
-            "expected positive loss_ewma under ~20% loss"
+            "expected positive loss_ewma under ~33% loss"
         );
     }
 

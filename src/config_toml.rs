@@ -123,6 +123,8 @@ pub(crate) struct AdapterFile {
     pub udp_sndbuf: i32,
     pub udp_rcvbuf: i32,
     pub adapter_mtu: i32,
+    #[serde(default)]
+    pub pin_mtu: bool,
     pub wintun_ring_bytes: u32,
     pub wintun_ipv4_interface_metric: u32,
 }
@@ -134,6 +136,7 @@ impl Default for AdapterFile {
             udp_sndbuf: d.udp_sndbuf,
             udp_rcvbuf: d.udp_rcvbuf,
             adapter_mtu: d.adapter_mtu,
+            pin_mtu: d.pin_mtu,
             wintun_ring_bytes: d.wintun_ring_bytes,
             wintun_ipv4_interface_metric: d.wintun_ipv4_interface_metric,
         }
@@ -356,6 +359,7 @@ impl From<&NetworkConfig> for NetworkConfigFile {
                 udp_sndbuf: cfg.udp_sndbuf,
                 udp_rcvbuf: cfg.udp_rcvbuf,
                 adapter_mtu: cfg.adapter_mtu,
+                pin_mtu: cfg.pin_mtu,
                 wintun_ring_bytes: cfg.wintun_ring_bytes,
                 wintun_ipv4_interface_metric: cfg.wintun_ipv4_interface_metric,
             },
@@ -469,6 +473,7 @@ impl From<NetworkConfigFile> for NetworkConfig {
         cfg.udp_sndbuf = file.adapter.udp_sndbuf;
         cfg.udp_rcvbuf = file.adapter.udp_rcvbuf;
         cfg.adapter_mtu = file.adapter.adapter_mtu;
+        cfg.pin_mtu = file.adapter.pin_mtu;
         cfg.wintun_ring_bytes = file.adapter.wintun_ring_bytes;
         cfg.wintun_ipv4_interface_metric = file.adapter.wintun_ipv4_interface_metric;
         cfg.pace_tick_us = file.pacing.pace_tick_us;

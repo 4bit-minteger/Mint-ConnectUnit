@@ -35,7 +35,10 @@ use crate::net::decentralized::{
 };
 use crate::net::fec::{
     adaptive_fec_ratio_hyst_tuned, effective_shard_payload_size, fec_delay_is_congestive,
-    FecDecoder, FecEncoder, FecOutput,
+    FecDecoder,
+};
+use crate::net::fec_tx_worker::{
+    start_fec_tx_worker, FecTxEvent, FecTxHandle, FecTxTuning, NormalOfferKind,
 };
 use crate::net::msyn_sync::{
     build_msyn_delta_shards, build_msyn_full_shards, clear_pending_delivered, collect_removed_vips,
@@ -197,6 +200,11 @@ pub enum EngineCmd {
         reply: oneshot::Sender<Option<stun::PublicEndpoint>>,
     },
     SetAdapterName(String),
+    /// Freeze or unfreeze PMTUD from configured adapter MTU (`pin_mtu` + `adapter_mtu`).
+    SetMtuPin {
+        pin_mtu: bool,
+        adapter_mtu: u16,
+    },
     PingPeer {
         dest: SocketAddr,
         timeout_ms: u64,
@@ -270,6 +278,8 @@ pub struct RuntimeSnapshot {
     pub tun_inject_capacity: usize,
     pub tun_inject_receivers: usize,
     pub pmtud_peers: Vec<PeerMtuSnapshot>,
+    pub pin_mtu: bool,
+    pub path_mtu: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -504,7 +514,6 @@ pub(crate) type PunchStateView = Arc<RwLock<PunchState>>;
 
 #[derive(Default)]
 struct PeerFecSendState {
-    encoder: Option<FecEncoder>,
     backoff_until: Option<Instant>,
     ratio_last: Option<(u8, u8)>,
     ratio_last_change: Option<Instant>,
@@ -537,6 +546,8 @@ pub struct P2PEngine {
     fec_send_by_dest: HashMap<SocketAddr, PeerFecSendState>,
     fec_decoders: HashMap<SocketAddr, FecDecoder>,
     fec_enabled: bool,
+    fec_tx: FecTxHandle,
+    last_fec_effective_shard: Option<usize>,
     advanced_tuning: crate::advanced_tuning::AdvancedTuning,
     fec_forced_ratio: Option<(u8, u8)>,
     fec_shard_payload_size: usize,
@@ -550,6 +561,10 @@ pub struct P2PEngine {
     decrypt_scratch: BytesMut,
     rawperf_mode: bool,
     pub pmtud: PathMtuDiscovery,
+    /// Operator-requested MTU pin (`pin_mtu` config).
+    mtu_pin: bool,
+    /// Configured Wintun adapter MTU used when `mtu_pin` is true.
+    configured_adapter_mtu: u16,
     size_loss: SizeLossTable,
     pub bcast_dedup: BroadcastDeduplicator,
     pub tun_rx: mpsc::Receiver<Bytes>,
@@ -864,6 +879,16 @@ impl P2PEngine {
             outbound_udp.clone(),
             metrics.clone(),
         );
+        let fec_tx = start_fec_tx_worker(
+            pacing.ingress.clone(),
+            metrics.clone(),
+            FecTxTuning {
+                shard: crate::net::fec::FEC_SHARD_PAYLOAD_SIZE,
+                flush_std: crate::net::fec::FEC_FLUSH_TIMEOUT,
+                flush_agg: crate::net::fec::FEC_FLUSH_TIMEOUT_AGGRESSIVE,
+                frame_scratch: default_buffers.fec_frame_scratch_bytes,
+            },
+        );
         let mut stun_poll_interval = interval(Duration::from_millis(200));
         stun_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut stun_keepalive_interval = interval(Duration::from_secs(5));
@@ -903,19 +928,23 @@ impl P2PEngine {
             fec_send_by_dest: HashMap::new(),
             fec_decoders: HashMap::new(),
             fec_enabled: true,
+            fec_tx,
+            last_fec_effective_shard: None,
             advanced_tuning: crate::advanced_tuning::AdvancedTuning::default(),
             fec_forced_ratio: None,
-            fec_shard_payload_size: crate::net::fec::FEC_SHARD_PAYLOAD_SIZE,
+            fec_shard_payload_size: 1024,
             fec_flush_standard: crate::net::fec::FEC_FLUSH_TIMEOUT,
             fec_flush_aggressive: crate::net::fec::FEC_FLUSH_TIMEOUT_AGGRESSIVE,
             fec_adaptive_off_below: 0.015,
-            fec_adaptive_on_above: 0.05,
+            fec_adaptive_on_above: 0.03,
             encrypt_scratch: BytesMut::with_capacity(default_buffers.encrypt_scratch_bytes),
             control_scratch: BytesMut::with_capacity(default_buffers.control_scratch_bytes),
             plain_data_scratch: BytesMut::with_capacity(default_buffers.plain_data_scratch_bytes),
             decrypt_scratch: BytesMut::with_capacity(default_buffers.decrypt_scratch_bytes),
             rawperf_mode: false,
             pmtud: PathMtuDiscovery::new(),
+            mtu_pin: false,
+            configured_adapter_mtu: 1340,
             size_loss: SizeLossTable::new(),
             bcast_dedup: BroadcastDeduplicator::new(),
             tun_rx,
@@ -1719,6 +1748,7 @@ impl P2PEngine {
     }
 
     async fn stop_background_loops(&mut self) {
+        self.stop_fec_tx_worker().await;
         self.stop_pacing_thread().await;
         for (_, stop) in self.manual_punch_stops.drain() {
             stop.store(true, Ordering::Release);
@@ -1728,6 +1758,16 @@ impl P2PEngine {
         }
         for (_, stop) in self.peer_keepalive_stops.drain() {
             stop.store(true, Ordering::Release);
+        }
+    }
+
+    async fn stop_fec_tx_worker(&mut self) {
+        if let Some(join) = self.fec_tx.request_stop() {
+            self.drain_fec_tx_events();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = join.join();
+            })
+            .await;
         }
     }
 
@@ -1856,6 +1896,23 @@ impl P2PEngine {
         self.pacing = pacing;
         self.pacing_tick_tx = pacing_tick_tx;
         self.pacing_thread = pacing_thread;
+        self.fec_tx = start_fec_tx_worker(
+            self.pacing.ingress.clone(),
+            self.metrics.clone(),
+            self.fec_tx_tuning(),
+        );
+        self.last_fec_effective_shard = self.fec_effective_shard_payload_size();
+    }
+
+    fn fec_tx_tuning(&self) -> FecTxTuning {
+        FecTxTuning {
+            shard: self
+                .fec_effective_shard_payload_size()
+                .unwrap_or(self.fec_shard_payload_size),
+            flush_std: self.fec_flush_standard,
+            flush_agg: self.fec_flush_aggressive,
+            frame_scratch: self.advanced_tuning.buffers.fec_frame_scratch_bytes,
+        }
     }
 
     fn refresh_pacing_thread_metrics(&self) {
@@ -2047,9 +2104,7 @@ impl P2PEngine {
                         self.invalidate_fec_loss_ewma_cache(ep);
                         self.state.crypto_keys.unbind_peer(ep);
                         self.reliable.flush_dest(ep);
-                        self.remove_peer_endpoint(ep);
-                        self.fec_decoders.remove(&ep);
-                        self.fec_send_by_dest.remove(&ep);
+                        self.teardown_fec_peer(ep);
                     }
                     self.prune_orphan_per_peer_keys();
                     self.prune_fec_decoders();
@@ -2095,7 +2150,8 @@ impl P2PEngine {
                             .set_pacing_drop_control_retransmit(obs.dropped_control_retransmit);
                         self.refresh_pacing_thread_metrics();
                     }
-                    self.flush_fec_encoders();
+                    let drain = matches!(self.pacing.load_obs().apd_phase, ApdPhase::Drain);
+                    self.fec_tx.request_flush_due(drain);
                     self.reliable.tick_into(
                         &mut self.reliable_tick_buf,
                         &mut self.reliable_failure_buf,
@@ -2135,6 +2191,9 @@ impl P2PEngine {
                         self.retransmit_sender.sent_direct,
                         self.retransmit_sender.sent_fallback,
                     );
+                }
+                Some(ev) = self.fec_tx.event_rx.recv() => {
+                    self.apply_fec_tx_event(ev);
                 }
                 _ = self.stun_poll_interval.tick() => {
                     self.poll_stun_query();
@@ -2179,6 +2238,9 @@ impl P2PEngine {
 
     async fn apply_pmar_body(&mut self, from: SocketAddr, body: &[u8]) {
         if body.len() < 10 {
+            return;
+        }
+        if self.mtu_pin || self.pmtud.is_pinned() {
             return;
         }
         let sz = u16::from_be_bytes([body[0], body[1]]) as usize;
@@ -2939,9 +3001,7 @@ impl P2PEngine {
                     self.invalidate_fec_loss_ewma_cache(ep);
                     self.state.crypto_keys.unbind_peer(ep);
                     self.reliable.flush_dest(ep);
-                    self.remove_peer_endpoint(ep);
-                    self.fec_decoders.remove(&ep);
-                    self.fec_send_by_dest.remove(&ep);
+                    self.teardown_fec_peer(ep);
                 }
                 false
             }
@@ -2961,6 +3021,9 @@ impl P2PEngine {
                 let key = self.state.crypto_keys.set_primary(key);
                 self.clear_data_crypto_state();
                 self.state_view.write().crypto_key = Some(key);
+                if self.mtu_pin {
+                    self.apply_mtu_pin_policy();
+                }
                 if let Some(tx) = reply {
                     let _ = tx.send(());
                 }
@@ -2971,6 +3034,9 @@ impl P2PEngine {
                     let key = self.state.crypto_keys.set_primary(key);
                     self.clear_data_crypto_state();
                     self.state_view.write().crypto_key = Some(key);
+                    if self.mtu_pin {
+                        self.apply_mtu_pin_policy();
+                    }
                 } else {
                     let _ = self.state.crypto_keys.add_key(key);
                 }
@@ -3009,6 +3075,9 @@ impl P2PEngine {
                 self.state.join_tx = Some(join_tx);
                 let key = self.state.crypto_keys.set_primary(key);
                 self.state_view.write().crypto_key = Some(key);
+                if self.mtu_pin {
+                    self.apply_mtu_pin_policy();
+                }
                 self.state.owner_ep = Some(owner);
                 self.state.owner_ep_trusted = false;
                 let owner_vip_str = self.state.owner_vip_cached.clone();
@@ -3201,6 +3270,8 @@ impl P2PEngine {
                     tun_inject_capacity: self.tun_inject_capacity,
                     tun_inject_receivers: self.state.tun_inject_tx.receiver_count(),
                     pmtud_peers: self.pmtud.snapshot(),
+                    pin_mtu: self.mtu_pin,
+                    path_mtu: self.pmtud.min_mtu(),
                 };
                 let _ = reply.send(snap);
                 false
@@ -3260,8 +3331,11 @@ impl P2PEngine {
             }
             EngineCmd::SetFecEnabled(enabled) => {
                 if self.fec_enabled && !enabled {
-                    self.flush_all_fec_encoders();
+                    let _ = self.fec_tx.set_encode_enabled(false);
+                    self.fec_flush_all_and_drain();
                     self.fec_decoders.clear();
+                } else if !self.fec_enabled && enabled {
+                    let _ = self.fec_tx.set_encode_enabled(true);
                 }
                 self.fec_enabled = enabled;
                 false
@@ -3271,7 +3345,7 @@ impl P2PEngine {
                 parity_shards,
                 force_ratio,
             } => {
-                self.flush_all_fec_encoders();
+                self.fec_flush_all_and_drain();
                 if force_ratio {
                     let total = data_shards as usize + parity_shards as usize;
                     if data_shards == 0
@@ -3296,7 +3370,7 @@ impl P2PEngine {
                 let mut out = Vec::new();
                 let rt = self.routing.read();
                 for (dest, st) in &self.fec_send_by_dest {
-                    let Some(enc) = st.encoder.as_ref() else {
+                    let Some((ds, ps)) = st.ratio_last else {
                         continue;
                     };
                     let loss_ewma = rt
@@ -3305,7 +3379,6 @@ impl P2PEngine {
                         .and_then(|vip| rt.table.get(vip))
                         .map(|e| e.loss_ewma)
                         .unwrap_or(0.0);
-                    let (ds, ps) = enc.ratio();
                     out.push((*dest, ds, ps, loss_ewma));
                 }
                 let _ = reply.send(out);
@@ -3454,16 +3527,29 @@ impl P2PEngine {
                 } else if is_safe_interface_alias(&name) {
                     self.state.adapter_name = Some(name);
 
-                    let enc_overhead = if self.has_crypto() {
-                        MENC_WIRE_OVERHEAD
+                    if self.mtu_pin {
+                        self.apply_mtu_pin_policy();
                     } else {
-                        0
-                    };
-                    let suggested = self.pmtud.suggested_adapter_mtu(enc_overhead) as u16;
-                    if suggested >= 576 && suggested <= 1500 {
-                        self.try_apply_adapter_mtu(suggested);
+                        let enc_overhead = if self.has_crypto() {
+                            MENC_WIRE_OVERHEAD
+                        } else {
+                            0
+                        };
+                        let suggested = self.pmtud.suggested_adapter_mtu(enc_overhead) as u16;
+                        if suggested >= 576 && suggested <= 1500 {
+                            self.try_apply_adapter_mtu(suggested);
+                        }
                     }
                 }
+                false
+            }
+            EngineCmd::SetMtuPin {
+                pin_mtu,
+                adapter_mtu,
+            } => {
+                self.mtu_pin = pin_mtu;
+                self.configured_adapter_mtu = adapter_mtu;
+                self.apply_mtu_pin_policy();
                 false
             }
             EngineCmd::PingPeer {
@@ -4271,9 +4357,7 @@ impl P2PEngine {
                     self.invalidate_fec_loss_ewma_cache(ep);
                     self.state.crypto_keys.unbind_peer(ep);
                     self.reliable.flush_dest(ep);
-                    self.remove_peer_endpoint(ep);
-                    self.fec_decoders.remove(&ep);
-                    self.fec_send_by_dest.remove(&ep);
+                    self.teardown_fec_peer(ep);
                 }
                 if self.state.is_owner {
                     self.peer_sync_state.remove(vip);
@@ -4796,15 +4880,47 @@ impl P2PEngine {
     /// Flush in-flight FEC groups when the path-MTU-derived shard ceiling changes.
     fn sync_fec_shard_ceiling_to_path_mtu(&mut self) {
         let effective = self.fec_effective_shard_payload_size();
-        let needs_flush = self.fec_send_by_dest.values().any(|st| {
-            st.encoder.as_ref().is_some_and(|enc| match effective {
-                None => true,
-                Some(e) => enc.shard_payload_size() != e,
-            })
-        });
-        if needs_flush {
-            self.flush_all_fec_encoders();
+        if self.last_fec_effective_shard == effective {
+            return;
         }
+        let _ = self.fec_tx.retune_barrier(self.fec_tx_tuning());
+        self.drain_fec_tx_events();
+        self.last_fec_effective_shard = effective;
+    }
+
+    fn teardown_fec_peer(&mut self, ep: SocketAddr) {
+        self.fec_send_by_dest.remove(&ep);
+        let _ = self.fec_tx.remove_peer_barrier(ep);
+        self.fec_decoders.remove(&ep);
+        self.remove_peer_endpoint(ep);
+    }
+
+    fn drain_fec_tx_events(&mut self) {
+        while let Ok(ev) = self.fec_tx.event_rx.try_recv() {
+            self.apply_fec_tx_event(ev);
+        }
+    }
+
+    fn apply_fec_tx_event(&mut self, ev: FecTxEvent) {
+        let FecTxEvent::EnqueueNormal { dest, pkts, kind } = ev;
+        match kind {
+            NormalOfferKind::Passthrough => {
+                self.metrics
+                    .inc_fec_flush_sparse_passthrough(pkts.len() as u64);
+            }
+            NormalOfferKind::BatchFallback => {}
+            NormalOfferKind::DrainPassthrough => {
+                self.metrics.inc_fec_drain_passthrough(pkts.len() as u64);
+            }
+        }
+        for p in pkts {
+            self.enqueue_normal_packet(p, dest);
+        }
+    }
+
+    fn fec_flush_all_and_drain(&mut self) {
+        let _ = self.fec_tx.flush_all_barrier();
+        self.drain_fec_tx_events();
     }
 
     fn fec_send(&mut self, dest: SocketAddr, pkt: Bytes) {
@@ -4873,7 +4989,7 @@ impl P2PEngine {
             }
         };
         let cg = self.advanced_tuning.congestion;
-        let (size_flush, ratio_flush, out, ratio_flushed) = {
+        let (ds, ps) = {
             let st = self.fec_send_by_dest.entry(dest).or_default();
             let proposed = self.fec_forced_ratio.unwrap_or_else(|| {
                 adaptive_fec_ratio_hyst_tuned(
@@ -4959,134 +5075,27 @@ impl P2PEngine {
                 st.ratio_last = Some((ds, ps));
                 st.ratio_last_change = Some(now);
             }
-            let (ds, ps) = applied;
-            let total = ds as usize + ps as usize;
-            if ds == 0 || ps == 0 || total > self.advanced_tuning.fec.fec_max_total_shards {
-                return self.enqueue_normal_packet(pkt, dest);
-            }
-            let queue_depth = self.pacing.load_obs().peer_data_queue_len(dest);
-            let queue_cap = self.pacing.load_obs().max_data_queue_packets.max(1);
-            let enc = st.encoder.get_or_insert_with(|| {
-                let mut enc = FecEncoder::with_flush(
-                    ds,
-                    ps,
-                    effective,
-                    self.fec_flush_standard,
-                    self.fec_flush_aggressive,
-                );
-                enc.set_frame_scratch_capacity(
-                    self.advanced_tuning.buffers.fec_frame_scratch_bytes,
-                );
-                enc
-            });
-            enc.set_frame_scratch_capacity(self.advanced_tuning.buffers.fec_frame_scratch_bytes);
-            let b_size = Some((queue_depth, queue_cap));
-            let size_flush = if enc.shard_payload_size() != effective {
-                let flushed = enc.flush(b_size);
-                enc.apply_tuning(
-                    effective,
-                    self.fec_flush_standard,
-                    self.fec_flush_aggressive,
-                );
-                flushed
-            } else {
-                enc.apply_tuning(
-                    effective,
-                    self.fec_flush_standard,
-                    self.fec_flush_aggressive,
-                );
-                FecOutput::Buffered
-            };
-            let b1 = Some((queue_depth, queue_cap));
-            let ratio_flush = enc.update_ratio_with_flush(ds, ps, b1);
-            let b2 = Some((queue_depth, queue_cap));
-            let out = enc.push_output(pkt, b2);
-            let ratio_flushed = !matches!(ratio_flush, FecOutput::Buffered);
-            (size_flush, ratio_flush, out, ratio_flushed)
+            applied
         };
-        if ratio_flushed {
-            self.metrics.inc_fec_ratio_flush();
+        let total = ds as usize + ps as usize;
+        if ds == 0 || ps == 0 || total > self.advanced_tuning.fec.fec_max_total_shards {
+            self.enqueue_normal_packet(pkt, dest);
+            return;
         }
-        self.handle_fec_output(dest, size_flush);
-        self.handle_fec_output(dest, ratio_flush);
-        self.handle_fec_output(dest, out);
-    }
-
-    fn handle_fec_output(&mut self, dest: SocketAddr, out: FecOutput) {
-        match out {
-            FecOutput::Buffered => {}
-            FecOutput::Encoded(pkts) => {
-                self.metrics.inc_fec_encoded_shards(pkts.len() as u64);
-                let (rtt, qd) = self.pacing_enqueue_hints(dest);
-                if self
-                    .pacing
-                    .try_enqueue_peer_batch(dest, pkts.to_vec(), rtt, qd)
-                {
-                    if let Some(st) = self.fec_send_by_dest.get_mut(&dest) {
-                        st.backoff_until = None;
-                    }
-                } else {
-                    for p in pkts {
-                        self.enqueue_normal_packet(p, dest);
-                    }
-                    if let Some(st) = self.fec_send_by_dest.get_mut(&dest) {
-                        st.backoff_until = None;
-                    }
-                }
-            }
-            FecOutput::Passthrough(pkts) => {
-                self.metrics
-                    .inc_fec_flush_sparse_passthrough(pkts.len() as u64);
-                for p in pkts {
-                    self.enqueue_normal_packet(p, dest);
-                }
-            }
-        }
-    }
-
-    fn flush_fec_encoders(&mut self) {
-        let obs = self.pacing.load_obs();
-        let drain = matches!(obs.apd_phase, ApdPhase::Drain);
-        let queue_cap = obs.max_data_queue_packets.max(1);
-        let mut pending: SmallVec<[(SocketAddr, FecOutput); 4]> = SmallVec::new();
-        for (dest, st) in self.fec_send_by_dest.iter_mut() {
-            if let Some(enc) = st.encoder.as_mut() {
-                if enc.needs_flush() {
-                    let out = if drain {
-                        enc.flush_passthrough()
-                    } else {
-                        let b = Some((obs.peer_data_queue_len(*dest), queue_cap));
-                        enc.flush(b)
-                    };
-                    pending.push((*dest, out));
-                }
-            }
-        }
-        for (dest, out) in pending {
-            if drain {
-                if let FecOutput::Passthrough(ref pkts) = out {
-                    self.metrics.inc_fec_drain_passthrough(pkts.len() as u64);
-                }
-            }
-            self.handle_fec_output(dest, out);
-        }
-    }
-
-    fn flush_all_fec_encoders(&mut self) {
-        let obs = self.pacing.load_obs();
-        let queue_cap = obs.max_data_queue_packets.max(1);
-        let mut pending: SmallVec<[(SocketAddr, FecOutput); 4]> = SmallVec::new();
-        for (dest, st) in self.fec_send_by_dest.iter_mut() {
-            if let Some(enc) = st.encoder.as_mut() {
-                let b = Some((obs.peer_data_queue_len(*dest), queue_cap));
-                pending.push((*dest, enc.flush(b)));
-            }
-        }
-        for (_, st) in self.fec_send_by_dest.iter_mut() {
-            st.encoder = None;
-        }
-        for (dest, out) in pending {
-            self.handle_fec_output(dest, out);
+        let queue_depth = self.pacing.load_obs().peer_data_queue_len(dest);
+        let queue_cap = self.pacing.load_obs().max_data_queue_packets.max(1);
+        let (rtt, qd) = self.pacing_enqueue_hints(dest);
+        if !self.fec_tx.try_push(
+            dest,
+            pkt.clone(),
+            ds,
+            ps,
+            Some((queue_depth, queue_cap)),
+            rtt,
+            qd,
+        ) {
+            self.metrics.inc_fec_tx_cmd_channel_full();
+            self.enqueue_normal_packet(pkt, dest);
         }
     }
 
@@ -5160,24 +5169,17 @@ impl P2PEngine {
         // FEC: if shard size / flush timeouts changed, flush encoders first.
         let fec_changed = old.fec.shard_payload_size != t.fec.shard_payload_size
             || old.fec.flush_ms != t.fec.flush_ms
-            || old.fec.flush_aggressive_ms != t.fec.flush_aggressive_ms;
+            || old.fec.flush_aggressive_ms != t.fec.flush_aggressive_ms
+            || old.buffers.fec_frame_scratch_bytes != t.buffers.fec_frame_scratch_bytes;
         self.fec_shard_payload_size = t.fec.shard_payload_size;
         self.fec_flush_standard = Duration::from_millis(t.fec.flush_ms);
         self.fec_flush_aggressive = Duration::from_millis(t.fec.flush_aggressive_ms);
         self.fec_adaptive_off_below = t.fec.adaptive_off_below;
         self.fec_adaptive_on_above = t.fec.adaptive_on_above;
         if fec_changed {
-            self.flush_all_fec_encoders();
-            for st in self.fec_send_by_dest.values_mut() {
-                if let Some(enc) = st.encoder.as_mut() {
-                    enc.apply_tuning(
-                        self.fec_shard_payload_size,
-                        self.fec_flush_standard,
-                        self.fec_flush_aggressive,
-                    );
-                    enc.set_frame_scratch_capacity(t.buffers.fec_frame_scratch_bytes);
-                }
-            }
+            let _ = self.fec_tx.retune_barrier(self.fec_tx_tuning());
+            self.drain_fec_tx_events();
+            self.last_fec_effective_shard = self.fec_effective_shard_payload_size();
         }
 
         // PMTUD: invalidate in-flight probes and apply new knobs.
@@ -5195,6 +5197,9 @@ impl P2PEngine {
 
     fn note_pmtud_tx_oversize(&mut self, dest: SocketAddr) {
         self.metrics.inc_pmtud_tx_oversize_drop();
+        if self.mtu_pin || self.pmtud.is_pinned() {
+            return;
+        }
         // Adapter suggestion is the primary cure; re-apply even when min_path_mtu
         // is unchanged (config/formula lag vs live TUN MTU).
         let enc_overhead = if self.has_crypto() {
@@ -5527,14 +5532,16 @@ impl P2PEngine {
             }
         }
         if self.pmtud.min_mtu() != old_min {
-            let enc_overhead = if self.has_crypto() {
-                MENC_WIRE_OVERHEAD
-            } else {
-                0
-            };
-            let suggested = self.pmtud.suggested_adapter_mtu(enc_overhead) as u16;
-            self.try_apply_adapter_mtu(suggested);
-            self.sync_fec_shard_ceiling_to_path_mtu();
+            if !self.mtu_pin && !self.pmtud.is_pinned() {
+                let enc_overhead = if self.has_crypto() {
+                    MENC_WIRE_OVERHEAD
+                } else {
+                    0
+                };
+                let suggested = self.pmtud.suggested_adapter_mtu(enc_overhead) as u16;
+                self.try_apply_adapter_mtu(suggested);
+                self.sync_fec_shard_ceiling_to_path_mtu();
+            }
         }
         self.reschedule_pmtud_interval();
     }
@@ -5646,9 +5653,7 @@ impl P2PEngine {
                 self.invalidate_fec_loss_ewma_cache(ep);
                 self.state.crypto_keys.unbind_peer(ep);
                 self.reliable.flush_dest(ep);
-                self.remove_peer_endpoint(ep);
-                self.fec_decoders.remove(&ep);
-                self.fec_send_by_dest.remove(&ep);
+                self.teardown_fec_peer(ep);
             }
         }
 
@@ -5756,9 +5761,7 @@ impl P2PEngine {
                 self.invalidate_fec_loss_ewma_cache(ep);
                 self.state.crypto_keys.unbind_peer(ep);
                 self.reliable.flush_dest(ep);
-                self.remove_peer_endpoint(ep);
-                self.fec_decoders.remove(&ep);
-                self.fec_send_by_dest.remove(&ep);
+                self.teardown_fec_peer(ep);
             }
         }
         self.msyn_applied_to_rev = self.msyn_applied_to_rev.max(to_rev);
@@ -6050,6 +6053,33 @@ impl P2PEngine {
                 let _ = (adapter_name, mtu);
             }
         });
+    }
+
+    /// Apply or clear MTU pin from `mtu_pin` + `configured_adapter_mtu`.
+    fn apply_mtu_pin_policy(&mut self) {
+        if self.mtu_pin {
+            let enc_overhead = if self.has_crypto() {
+                MENC_WIRE_OVERHEAD
+            } else {
+                0
+            };
+            let path = PathMtuDiscovery::path_mtu_from_adapter(
+                self.configured_adapter_mtu as usize,
+                enc_overhead,
+            );
+            self.pmtud.set_pinned(Some(path));
+            let adapter = self.configured_adapter_mtu.clamp(576, 1500);
+            // Bypass netsh rate-limit so pin takes effect immediately.
+            self.state.last_applied_adapter_mtu = 0;
+            self.last_pmtud_netsh_at = None;
+            self.try_apply_adapter_mtu(adapter);
+            self.sync_fec_shard_ceiling_to_path_mtu();
+            self.reschedule_pmtud_interval();
+        } else {
+            self.pmtud.set_pinned(None);
+            self.sync_fec_shard_ceiling_to_path_mtu();
+            self.reschedule_pmtud_interval();
+        }
     }
 
     fn allocate_owner_vip_fallback(&self, node_id: &str) -> Option<String> {
@@ -6374,9 +6404,10 @@ impl P2PEngine {
                 self.invalidate_fec_loss_ewma_cache(ep);
                 self.peer_sync_state.remove(vip);
                 self.state.crypto_keys.unbind_peer(prev);
-                self.remove_peer_endpoint(prev);
-                self.fec_decoders.remove(&prev);
                 self.fec_send_by_dest.remove(&prev);
+                let _ = self.fec_tx.remove_peer_barrier(prev);
+                self.fec_decoders.remove(&prev);
+                self.remove_peer_endpoint(prev);
             }
         } else {
             self.invalidate_fec_loss_ewma_cache(ep);

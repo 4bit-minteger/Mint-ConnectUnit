@@ -9,8 +9,8 @@ use crate::net::packet::{CompactPacketType, FEC_COMPACT_HEADER_LEN};
 pub const FEC_SHARD_PAYLOAD_SIZE: usize = 1279;
 /// Floor for configured and runtime-effective shard payload size.
 pub const FEC_SHARD_PAYLOAD_MIN: usize = 512;
-pub const FEC_FLUSH_TIMEOUT: Duration = Duration::from_millis(4);
-pub const FEC_FLUSH_TIMEOUT_AGGRESSIVE: Duration = Duration::from_millis(2);
+pub const FEC_FLUSH_TIMEOUT: Duration = Duration::from_millis(2);
+pub const FEC_FLUSH_TIMEOUT_AGGRESSIVE: Duration = Duration::from_millis(1);
 pub const FEC_MAX_TOTAL_SHARDS: usize = 64;
 
 /// Max FEC shard payload that fits under an IP-total path MTU (probe ladder units).
@@ -1106,26 +1106,25 @@ mod tests {
     }
 
     #[test]
-    fn aggressive_packet_flush_timeout_2ms() {
+    fn aggressive_packet_flush_timeout_1ms() {
         let mut enc = FecEncoder::new(4, 1);
         assert!(matches!(
             enc.push_output(Bytes::from(vec![2u8; 300]), None),
             FecOutput::Buffered
         ));
-        std::thread::sleep(Duration::from_millis(1));
         assert!(!enc.needs_flush());
         std::thread::sleep(Duration::from_millis(2));
         assert!(enc.needs_flush());
     }
 
     #[test]
-    fn standard_packet_keeps_4ms_flush() {
+    fn standard_packet_keeps_2ms_flush() {
         let mut enc = FecEncoder::new(4, 1);
         assert!(matches!(
             enc.push_output(Bytes::from(vec![3u8; 900]), None),
             FecOutput::Buffered
         ));
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(1));
         assert!(!enc.needs_flush());
         std::thread::sleep(FEC_FLUSH_TIMEOUT);
         assert!(enc.needs_flush());

@@ -51,10 +51,15 @@ flowchart TB
     ENG["P2PEngine::run — tokio::select!"]
     CLK["pace_clock OS thread"]
     PACW["mint-pacing OS thread — PacingEngine tick + UDP send"]
+    FECTX["mint-fec-tx OS thread — RS encode + batch enqueue"]
     CLI --> CMD --> ENG
     CLK -->|"tick ch(1)"| PACW
-    ENG -->|"enqueue cmds FF / FEC batch ack"| PACW
+    ENG -->|"Push try_send / control barriers"| FECTX
+    FECTX -->|"Encoded batch ack"| PACW
+    FECTX -->|"EnqueueNormal events"| ENG
+    ENG -->|"enqueue cmds FF"| PACW
     PACW -->|"TickDone + ArcSwap PacingObs"| ENG
+    ENG -->|"flush AtomicU8"| FECTX
   end
   subgraph io["I/O"]
     UDP["UDP socket listen ≥7878"]
@@ -77,7 +82,7 @@ flowchart TB
   ENG --> STUN_UPnP
 ```
 
-**Central idea:** one **`P2PEngine`** task owns RX, decrypt, routing/session state, and encrypt; a dedicated **`mint-pacing`** OS thread owns **`PacingEngine`** (queues, tick, paced UDP send). The **`Cli`** mutates configuration and sends **`EngineCmd`** messages. **`RoutingTable`** (shared `Arc<RwLock<>>`) maps **virtual IPs (VIP)** to endpoints and path quality. The **owner** allocates VIPs, holds the canonical peer list, and relays traffic when peers cannot talk directly.
+**Central idea:** one **`P2PEngine`** task owns RX, decrypt, routing/session state, and encrypt; a dedicated **`mint-fec-tx`** OS thread owns per-dest Reed–Solomon encode; a dedicated **`mint-pacing`** OS thread owns **`PacingEngine`** (queues, tick, paced UDP send). The **`Cli`** mutates configuration and sends **`EngineCmd`** messages. **`RoutingTable`** (shared `Arc<RwLock<>>`) maps **virtual IPs (VIP)** to endpoints and path quality. The **owner** allocates VIPs, holds the canonical peer list, and relays traffic when peers cannot talk directly.
 
 ---
 
@@ -87,13 +92,14 @@ flowchart TB
 |--------|--------|
 | Async runtime | `#[tokio::main(flavor = "current_thread")]` |
 | Concurrency | `tokio::task::LocalSet`: `engine.run()` and `cli.run()` on the same runtime |
-| Wintun read | Blocking read on a dedicated thread → `mpsc::Sender<Bytes>` (capacity from `tun_from_adapter_queue_packets`, default 2048) |
+| Wintun read | Blocking read on a dedicated thread → `mpsc::Sender<Bytes>` (capacity from `tun_from_adapter_queue_packets`, default 256) |
 | TUN inject | `broadcast::channel` from engine to Wintun writer (size from `tun_inject_queue_packets`) |
 | Pacing clock | Separate **OS thread** (`mint-pacing-clock`) → `mpsc` (capacity 1) into **pacing worker** |
 | Pacing send | Separate **OS thread** (`mint-pacing`) owns `PacingEngine`; paced `try_send_to`; publishes `PacingObs` / `TickDone` to engine |
+| FEC TX encode | Separate **OS thread** (`mint-fec-tx`) owns per-dest `FecEncoder`; Encoded batches → pacing; Passthrough / batch-fallback → engine `EnqueueNormal` events |
 | Config reads | `ConfigManager` with `arc_swap` snapshot (lock-free read hot path) |
 
-**Why current_thread:** predictable single-threaded engine logic with explicit `RwLock` on routing. **Pace clock** offloads timer precision (`NtSetTimerResolution` via `windows_timer.rs`); **pacing worker** offloads queue dequeue + UDP send so RX/decrypt on the engine loop is not blocked by paced TX bursts.
+**Why current_thread:** predictable single-threaded engine logic with explicit `RwLock` on routing. **Pace clock** offloads timer precision (`NtSetTimerResolution` via `windows_timer.rs`); **fec-tx** offloads Reed–Solomon encode; **pacing worker** offloads queue dequeue + UDP send so RX/decrypt on the engine loop is not blocked by encode or paced TX bursts.
 
 ---
 
@@ -110,6 +116,7 @@ flowchart TB
 | `src/net/pacing_worker.rs` | OS thread owning `PacingEngine`: command FIFO, tick, UDP send, `PacingObs` / `TickDone` |
 | `src/net/pace_clock.rs` | Pacing tick thread, FAB adaptive tick, `clamp_tick_us` |
 | `src/net/fec.rs` | Reed–Solomon encode/decode, adaptive ratios |
+| `src/net/fec_tx_worker.rs` | OS thread owning TX `FecEncoder`s: Push/control, Encoded→pacing, Passthrough events |
 | `src/net/reliable.rs` | MREL / MACK state machine |
 | `src/net/retransmit.rs` | Direct retransmit bypass rate limiter (`rtrx-s`) |
 | `src/net/msyn_sync.rs` | Pure MSYN v4 body builders, sharding, assemble helpers, and sync advance rules |
@@ -262,7 +269,7 @@ Important internal state (non-exhaustive):
 - `peer_sync_state`, `peer_pending_removals`, `msyn_applied_to_rev`
 - STUN query maps, pending pings/heal cooldowns, parasitic notify channels
 
-**Session reset** (e.g. after kick): clears routing, crypto, reliable, FEC, dedup, restarts pace-clock + pacing worker.
+**Session reset** (e.g. after kick): clears routing, crypto, reliable, FEC, dedup, restarts pace-clock + pacing worker + fec-tx worker.
 
 `EngineCmd` variants (CLI → engine) include: `SetPacing`, `SetCryptoKey`, `PrepareJoin` / `SendJoin`, `ManualPunch`, `SetPeerKeepalive`, `SetFecEnabled`, `SetRawPerf`, `Kick`, `Shutdown`, and more — see `src/net/engine.rs`.
 
@@ -274,7 +281,7 @@ Important internal state (non-exhaustive):
 
 - Multiple **`PathCandidate`** records: `Direct`, `OwnerRelay`, `IceSrflx`
 - EWMA: RTT, loss, bandwidth; **`quality_score`**; state `Candidate` / `Active` / `Degraded` / `Stale`
-- Optional delay telemetry: **`rtt_base_ms`** (windowed min-RTT) and **`queuing_delay_ms`** (`max(0, smoothed_rtt − base)`) for path quality / DRR fairness — fed by periodic compact **ping** probes (`probe_interval_ms`, default **25**; **0** = off). VIP-level RTT updates only from the **active** multipath endpoint; secondary-path samples stay path-local.
+- Optional delay telemetry: **`rtt_base_ms`** (windowed min-RTT) and **`queuing_delay_ms`** (`max(0, smoothed_rtt − base)`) for path quality / DRR fairness — fed by periodic compact **ping** probes (`probe_interval_ms`, default **40**; **0** = off). VIP-level RTT updates only from the **active** multipath endpoint; secondary-path samples stay path-local.
 - **Forward OWD** (same probes): peer reports `fwd_owd_sample_ms` in compact **pong**; sender tracks windowed min **`owd_base_ms`** (`Option`; cold = `None`) and **`fwd_queuing_delay_ms`**. **Background CC** and the **FEC loss classifier** use **`effective_queuing_delay_ms`**: forward QD when OWD warm, else RTT-QD, else `-1` (cold → conservative loss MD). Clock jump (`|sample − base| > owd_clock_jump_reject_ms`, default **30000**) invalidates OWD base (fallback to RTT-QD).
 - **Control path race** (default on with multipath): recovery **`MHOL`** (`direct_retry`) and predictive **heal ping** fan out to up to **3** live `PathSet` endpoints in parallel. Periodic CC ping probes stay single-endpoint.
 - **Tombstones** when peers leave (revision counters for MSYN)
@@ -347,7 +354,7 @@ The dedicated pace-clock thread emits ticks to the **`mint-pacing`** worker (not
 3. the per-tick CPU deadline (`max_tick_work_us`) has not expired; and
 4. a packet is available and the UDP socket accepts it.
 
-The engine encrypts (or frames) outbound data, then enqueues wire bytes to the worker via a bounded command channel (capacity **1024**). Ordinary data/control/retransmit commands are fire-and-forget; command-channel full drops **data** only (`pacing_cmd_channel_full`). FEC encoded batches keep a sync ack so all-or-nothing enqueue can fall back to per-packet enqueue. After each tick the worker publishes `PacingObs` (`ArcSwap`) and a `TickDone` event; the engine uses that arm for FEC flush, reliable retransmission scheduling, drop counter sync, and socket-dead heal.
+The engine encrypts (or frames) outbound data, runs adaptive FEC ratio policy, then `try_send`s a Push to **`mint-fec-tx`** (data channel capacity **1024**; full → uncoded bypass + `fec_tx_cmd_channel_full`). That worker owns per-dest encoders, RS-encodes, and offers Encoded batches to pacing via sync ack (all-or-nothing; failure → `EnqueueNormal` BatchFallback). Passthrough / drain-passthrough return to the engine on an unbounded event channel so `enqueue_normal_packet` keeps size-loss + path-MTU gates. PMTUD / FEC flush-timeout retune is an atomic **`Retune`** barrier (flush-all + set worker tuning). Shutdown is **`Stop`** (flush) → drain-apply events → join. Ordinary pacing data/control/retransmit commands remain fire-and-forget; pacing command-channel full drops **data** only (`pacing_cmd_channel_full`). After each tick the pacing worker publishes `PacingObs` (`ArcSwap`) and a `TickDone` event; the engine uses that arm to `fetch_max` a FEC flush-due atomic (APD Drain → passthrough flush), schedule reliable retransmission, sync drop counters, and socket-dead heal.
 
 Scheduler packet capacity with defaults:
 
@@ -411,7 +418,7 @@ Field-level defaults and ↑/↓ semantics: [Operational defaults](#operational-
 - **Reed–Solomon** over shards (**1279 B** payload per shard default).
 - Encoder per destination; decoder map keyed by source address.
 - **Adaptive** parity from loss EWMA (thresholds via `adaptive_off_below` / `adaptive_on_above`) or **forced ratio** via `fec_force_*` fields.
-- **Loss classifier** (default **on**): when `loss_classifier_enabled = true`, adaptive FEC will **not increase** parity if `effective_queuing_delay / target_queue_delay_ms` exceeds `congestion_loss_threshold` (forward OWD when warm, else RTT-QD). Decreasing or turning FEC off still follows loss hysteresis. After delay recovers, a **recovery step-down** may lower parity while loss EWMA is sticky, within `fec_recovery_recency_ms` (default **3000**, **0** = disable step-down only) of the last congestive sample. The same predicate also gates **Background CC** loss multiplicative decrease and loss-driven delivery anchoring: a rising loss edge cuts rate only when delay is congestive (or when QD telemetry is untrusted — `rtt_base_tracking = false` or `qd_ms < 0` — in which case loss MD stays conservative). Non-congestive loss is left to FEC.
+- **Loss classifier** (default **on**): when `loss_classifier_enabled = true`, adaptive FEC will **not increase** parity if `effective_queuing_delay / target_queue_delay_ms` exceeds `congestion_loss_threshold` (forward OWD when warm, else RTT-QD). Decreasing or turning FEC off still follows loss hysteresis. After delay recovers, a **recovery step-down** may lower parity while loss EWMA is sticky, within `fec_recovery_recency_ms` (default **1200**, **0** = disable step-down only) of the last congestive sample. The same predicate also gates **Background CC** loss multiplicative decrease and loss-driven delivery anchoring: a rising loss edge cuts rate only when delay is congestive (or when QD telemetry is untrusted — `rtt_base_tracking = false` or `qd_ms < 0` — in which case loss MD stays conservative). Non-congestive loss is left to FEC.
 - **Background CC (LEDBAT)** (`congestion_enabled`, default **on**): per-peer byte rate via token bucket; delay gradient updates rate from effective queuing delay (forward OWD preferred). With `congestion_enabled = false`, pacing CC actuation is off.
 - Flush timers **2 ms / 4 ms** (aggressive vs default); small packets may flush immediately. While APD is in **Drain**, timer flush emits **passthrough only** (no parity).
 - `shard_payload_size` is a **local send ceiling** (512–1279); at runtime also capped so `12 + shard ≤ min_path_mtu − 28` (IPv4+UDP); below the 512 floor FEC bypasses. Disabled in **`rawperf-on`** mode.
@@ -431,14 +438,15 @@ Full congestion / FEC field table: [Operational defaults](#operational-defaults-
 ## PMTUD
 
 - **`PathMtuDiscovery`** in engine + **`pmtud_probe`** socket (DF / don't-fragment).
-- Per-peer **search+confirm** PLPMTUD: exponential raise from ACK-proven `last_good`, then binary search until window ≤ `resolve_epsilon` (default **1** byte). Probe ladder sizes are **IPv4 IP totals**. `min_path_mtu` tracks ACK-proven `last_good` only (never in-flight probe size).
+- Per-peer **search+confirm** PLPMTUD: exponential raise from ACK-proven `last_good`, then binary search until window ≤ `resolve_epsilon` (default **8** bytes). Probe ladder sizes are **IPv4 IP totals**. `min_path_mtu` tracks ACK-proven `last_good` only (never in-flight probe size).
 - **Phases:** Plateau → Raise or Revalidate; Raise fail → Binary; Revalidate timeout fail → **Recheck** (or **anomaly** when size-bucketed RX shows large packets still alive); Recheck fail → **soft-down** `last_good = max(576, stable/2)` (later soft-downs halve `last_good`) then DownSearch. Local `EMSGSIZE`/`WSAEMSGSIZE` on Revalidate/Recheck soft-downs immediately (skips anomaly/Recheck). DownSearch that closes with **no ACK** resets `first_bad` to the raise sentinel so Raise can climb again.
 - **Probe timeout:** adaptive `clamp(max(probe_timeout_ms, 4×RTT_EWMA_ms), probe_timeout_ms, 5000)`; config `probe_timeout_ms` is the **floor**. After the final confirm timeout in Revalidate/Recheck, a one-timeout **late-ACK grace** can still recover to Plateau.
 - **Data-plane corroboration:** per-VIP size-bucketed RX rate/gap tracker (`SizeLossTable`); anomaly and early-wake require a warm tracker. Early-wake (Plateau/Frozen only, 10s cooldown) when large RX collapsed, small RX alive, recent large TX offer, and queuing delay is trusted non-congestive — no inflight abort, no Background CC change, `fec_mtu_bypass` is not used as proof.
 - Adapter MTU suggestion: `adapter = path_mtu − 28 − enc_overhead`, clamped to **`MIN_ADAPTER_PAYLOAD_MTU` (280)**..=1500. Default config adapter **1340**; live netsh apply accepts the same floor.
-- Data-plane **TX guard**: UDP payload must fit `last_good − 28` (fallback global min). Oversized drops (`pmtud_tx_oversize_drop`) re-apply adapter MTU and, on Plateau/Frozen, early-wake via `pmtud_revalidate_hints` (5s cooldown). Control / reliable / PMTUD probes / FEC shards are not gated this way.
+- **`pin_mtu`** (`[adapter]`, default **false**): when **true**, freezes outbound PLPMTUD and locks both Wintun MTU and path budget from configured `adapter_mtu`. Derived IP-total: `path_mtu = clamp(adapter_mtu + 28 + enc_overhead, 576, 1500)` (`adapter_mtu` first clamped to `576..=1500`; `enc_overhead` is `MENC_WIRE_OVERHEAD` when crypto is on else `0`). Inbound `MPMT` probes are still answered; inbound `MPAR` is ignored for local state. Pinning above the true path can blackhole oversized datagrams. Live via **`config reload`** / bootstrap (`EngineCmd::SetMtuPin`); unpin resets peers to the discovery floor (**1220**) and resumes search.
+- Data-plane **TX guard**: UDP payload must fit `last_good − 28` (fallback global min). Oversized drops (`pmtud_tx_oversize_drop`) re-apply adapter MTU and, on Plateau/Frozen, early-wake via `pmtud_revalidate_hints` (5s cooldown) — skipped while pinned. Control / reliable / PMTUD probes / FEC shards are not gated this way.
 - Tunables: `probe_timeout_ms` (floor), `confirm_count`, `resolve_epsilon`, `raise_step`, `max_probes_per_search`, `max_concurrent_peers`, `stable_downgrade_batches`; timers `pmtud_tick_ms` / `pmtud_raise_secs`. Budget exceed → Frozen at `last_good`.
-- When `min_path_mtu` changes, the engine retunes/flushes FEC encoders to the path-derived shard ceiling (config `shard_payload_size` is not rewritten).
+- When `min_path_mtu` changes, the engine issues an atomic FEC **`Retune`** (flush in-flight groups + set path-derived shard ceiling on `mint-fec-tx`; config `shard_payload_size` is not rewritten).
 - CLI `config reload` may apply saved MTU/metric via netsh when a profile is active. Runtime report includes PMTUD peer snapshot and probe/anomaly/softdown counters.
 
 ---
@@ -581,7 +589,8 @@ Factory defaults below match `NetworkConfig::default` / `pacing_defaults` / `Adv
 | Item | Default | Meaning | If ↑ | If ↓ |
 |------|--------:|---------|------|------|
 | `adapter_mtu` | **1340** | Wintun interface MTU (payload limit per frame on TAP) | Larger packets per datagram; more fragmentation risk on Internet path if PMTUD lags | Smaller frames; safer on lossy paths; more overhead |
-| PMTUD floor | **1220** | Minimum path MTU used when discovery incomplete | — | — |
+| `pin_mtu` | **false** | Freeze PLPMTUD; lock path + adapter from `adapter_mtu` | — | — |
+| PMTUD floor | **1220** | Minimum path MTU used when discovery incomplete (unpinned) | — | — |
 
 ### Advanced tuning (sectioned tables in config.toml)
 
@@ -591,46 +600,46 @@ Failover thresholds, engine timers, reliable RTO/retry bounds, FEC shard size + 
 
 | Field | Default | Meaning | If ↑ | If ↓ |
 |-------|--------:|---------|------|------|
-| `udp_sndbuf` | 256 KiB (`262144`) | OS send socket queue bytes | Absorbs bursts without drop; more RAM | Drops under burst; lower RAM; less send-side bufferbloat |
+| `udp_sndbuf` | 2 MiB (`2097152`) | OS send socket queue bytes | Absorbs bursts without drop; more RAM | Drops under burst; lower RAM; less send-side bufferbloat |
 | `udp_rcvbuf` | 2 MiB (`2097152`) | OS receive socket queue bytes | Absorbs inbound bursts; more RAM | Drops under burst; lower RAM |
-| `wintun_ring_bytes` | 4 MiB (`4194304`) | Wintun ring between kernel driver and reader | Fewer drops when engine busy; more RAM | Reader may lag; TUN backpressure |
+| `wintun_ring_bytes` | 8 MiB (`8388608`) | Wintun ring between kernel driver and reader | Fewer drops when engine busy; more RAM | Reader may lag; TUN backpressure |
 | `wintun_ipv4_interface_metric` | 1 | Windows route preference for VPN NIC (lower = preferred) | VPN less preferred vs other interfaces | VPN more preferred |
 
 ### Pacing (`pace`)
 
 Scheduler capacity (packets/s) is approximately `base_max_burst × (1_000_000 / pace_tick_us)`. Token-bucket refill and balance units follow `pace_rate_mode`:
 
-- `"pps"`: refill at `pace_target_pps`; balance capped at `pace_budget_cap_packets` (tokens = packets).
-- `"bytes"` (default): refill at `pace_target_bps` (or `pace_target_pps×1300` when `pace_target_bps` is **0**); consume `pkt_len` per send; balance capped at **`pace_budget_cap_packets × 1300`** bytes.
+- `"pps"` (default): refill at `pace_target_pps`; balance capped at `pace_budget_cap_packets` (tokens = packets).
+- `"bytes"`: refill at `pace_target_bps` (or `pace_target_pps×1300` when `pace_target_bps` is **0**); consume `pkt_len` per send; balance capped at **`pace_budget_cap_packets × 1300`** bytes.
 
 `pace_budget_cap_packets` is **always** configured in packet units (`1..=4096`), never as raw bytes. Do not enter a byte count when using `pace_rate_mode=bytes` — the engine applies the ×1300 scale at runtime.
 
 | Field | Default | Meaning | If ↑ | If ↓ |
 |-------|--------:|---------|------|------|
-| `pace_tick_us` | 500 | Engine send scheduler period | Slower tick → lower CPU, higher queue latency | Faster tick → lower latency, higher CPU |
-| `pace_target_pps` | 10000 | Token refill rate when `pace_rate_mode=pps` (packets/s) | Higher throughput ceiling; more bandwidth | Lower cap; may queue or drop |
-| `pace_rate_mode` | `"bytes"` | Global bucket units: `"pps"` or `"bytes"` | `bytes`: refill/consume/cap in bandwidth units | Packet-count bucket |
+| `pace_tick_us` | 300 | Engine send scheduler period | Slower tick → lower CPU, higher queue latency | Faster tick → lower latency, higher CPU |
+| `pace_target_pps` | 8000 | Token refill rate when `pace_rate_mode=pps` (packets/s) | Higher throughput ceiling; more bandwidth | Lower cap; may queue or drop |
+| `pace_rate_mode` | `"pps"` | Global bucket units: `"pps"` or `"bytes"` | `bytes`: refill/consume/cap in bandwidth units | Packet-count bucket |
 | `pace_target_bps` | `50000000` (~400 Mbit/s) | Refill rate when `pace_rate_mode=bytes` (**0** = derived from `pace_target_pps×1300`) | Higher byte/s ceiling | Lower bandwidth cap |
-| `base_max_burst` | 3 | Base max sends per tick (also APD ramp floor) | Bigger micro-bursts; jitter on wire | Smoother; may underuse link |
+| `base_max_burst` | 2 | Base max sends per tick (also APD ramp floor) | Bigger micro-bursts; jitter on wire | Smoother; may underuse link |
 | `pace_budget_cap_packets` | 32 | Max token-bucket balance in **packet units** (bytes mode: effective cap = value×1300) | Allows longer bursts after idle | Tighter burst control |
-| `pace_max_queue_packets` | 128 | Queue **basis** (splits into per-peer data cap + global control/retransmit caps) | More buffering per peer; higher latency under load | Earlier drop; lower delay |
+| `pace_max_queue_packets` | 192 | Queue **basis** (splits into per-peer data cap + global control/retransmit caps) | More buffering per peer; higher latency under load | Earlier drop; lower delay |
 | `pace_clock_mode` | `"hybrid"` | `""`/`auto`/`hybrid`: use `pace_spin_window_us`; `"spin"`: force spin window; `"hr"`: hybrid HR sleep (`spin_window=0`) | — | — |
 | `pace_spin_window_us` | 50 | Busy-wait within tick before sleep | Lower timer jitter; more CPU | Less CPU; coarser timing |
-| `pace_fab_enabled` | false | Lengthen tick after repeated overshoots | On: recovers from backlog spikes; tick less stable | Off: steady tick only |
-| `pace_fab_fallback_tick_us` | 700 | Tick used during FAB recovery | Slower drain during overload; less CPU | Faster FAB ticks; more CPU |
+| `pace_fab_enabled` | true | Lengthen tick after repeated overshoots | On: recovers from backlog spikes; tick less stable | Off: steady tick only |
+| `pace_fab_fallback_tick_us` | 500 | Tick used during FAB recovery | Slower drain during overload; less CPU | Faster FAB ticks; more CPU |
 | `tun_inject_queue_packets` | 512 | Broadcast channel for inject to TUN reader | Survives spikes from engine to adapter | Drops/lag on inject burst |
-| `tun_from_adapter_queue_packets` | 2048 | mpsc capacity Wintun reader → engine (**startup-only**) | Absorbs TUN bursts before adapter ring fills | Earlier reader block; drops from adapter sooner |
+| `tun_from_adapter_queue_packets` | 256 | mpsc capacity Wintun reader → engine (**startup-only**) | Absorbs TUN bursts before adapter ring fills | Earlier reader block; drops from adapter sooner |
 
 | Session | Default | Meaning | If ↑ | If ↓ |
 |---------|--------:|---------|------|------|
 | `drr_enabled` | true | Deficit round-robin across peers/queues | Fairer mix; slightly more CPU | FIFO-like; one peer can starve others |
 | `drr_small_packet_priority` | true | Prefer sub-threshold data packets per peer before bulk | Lower latency for small tunnel frames | Strict enqueue FIFO within peer |
-| `drr_small_packet_threshold_bytes` | 450 | Max length (bytes) for small-packet lane (**64–512**) | Larger frames count as “small” | Only smaller frames get priority |
+| `drr_small_packet_threshold_bytes` | 384 | Max length (bytes) for small-packet lane (**64–512**) | Larger frames count as “small” | Only smaller frames get priority |
 | `drr_rtt_aware` | true | Scale per-peer DRR quantum by **base RTT** (`rtt_base_ms`) vs median base among non-empty peers; missing base → no scale for that peer | High-base-RTT peers get larger byte slices per round | Fixed `drr_quantum` for all peers |
 | `drr_rtt_scale_min` | 0.5 | Lower clamp on RTT/ref ratio (**0.1–1.0**) | Low-RTT peers may get smaller quantum | Less differentiation for fast peers |
 | `drr_rtt_scale_max` | 2.5 | Upper clamp on RTT/ref ratio (**1.0–4.0**) | High-RTT peers may get larger quantum | Less compensation for slow peers |
-| `min_control_reserved_bytes_per_tick` | 200 | Per-tick byte budget reserved for control before bulk (`0` = off; clamp ≤8192) | Control less starved under load | More bytes available for data |
-| `min_retransmit_reserved_bytes_per_tick` | 200 | Per-tick byte budget reserved for retransmit prefix (`0` = off; clamp ≤8192) | MREL retries less starved | More bytes available for data |
+| `min_control_reserved_bytes_per_tick` | 256 | Per-tick byte budget reserved for control before bulk (`0` = off; clamp ≤8192) | Control less starved under load | More bytes available for data |
+| `min_retransmit_reserved_bytes_per_tick` | 256 | Per-tick byte budget reserved for retransmit prefix (`0` = off; clamp ≤8192) | MREL retries less starved | More bytes available for data |
 | `drr_quantum` | 1500 (code) | Bytes of “deficit” per scheduling round | Larger peer slices per turn | Finer fairness; more scheduler overhead |
 | `max_tick_work_us` | 150 (code) | CPU time cap per pacing tick on the **pacing worker** | More work per tick; can delay the next paced send burst | Stricter cap; may leave work queued |
 
@@ -643,17 +652,17 @@ When `apd_require_cc_headroom` is **true** and `congestion_enabled` is on, APD d
 | Field | Default | Meaning | If ↑ | If ↓ |
 |-------|--------:|---------|------|------|
 | `apd_enabled` | true | Queue-pressure ramp + drain | On: fights backlog | Off: pacing only |
-| `apd_high_watermark` | 0.6 | Queue fill ratio for ramp upper bound / drain arm (user range **0.2–0.95**; must be ≥ low + **0.1** unless cap mode) | Triggers later; less aggressive drain | Triggers sooner; more drain episodes |
+| `apd_high_watermark` | 0.4 | Queue fill ratio for ramp upper bound / drain arm (user range **0.2–0.95**; must be ≥ low + **0.1** unless cap mode) | Triggers later; less aggressive drain | Triggers sooner; more drain episodes |
 | `apd_low_watermark` | 0.1 | Fill ratio to exit drain (user range **0.1–0.8**) | Stays in drain longer | Exits drain sooner; queue may refill |
 | `apd_sojourn_enabled` | true | Dual-gate drain arm/exit via HOL sojourn | Catches stale packets when fill is low | Fill-only arm/exit |
-| `apd_max_sojourn_ms` | 6 | Arm drain when HOL age exceeds this (ms, **2–500**) | Less sensitive to latency | Arms drain sooner on old HOL |
+| `apd_max_sojourn_ms` | 10 | Arm drain when HOL age exceeds this (ms, **2–500**) | Less sensitive to latency | Arms drain sooner on old HOL |
 | `apd_target_sojourn_ms` | 2 | Exit drain only when HOL age below this (ms, **1–200**, must be &lt; max − 2) | Exit drain sooner | Hold drain until queue is fresher |
 | `apd_require_cc_headroom` | **true** | Gate APD ramp-up / Drain arm / mid-Drain on data CC sendability | On: no false Drain/spin while CC starves all data HOL | Off: APD reacts to fill/sojourn even when CC blocks pops |
-| `ramp_max_burst` | 8 | **Absolute** max packets/tick for Tier-1 ramp ceiling (must be ≥ `base_max_burst`) | Faster ramp; bigger wire bursts in Alert | Slower ramp; smoother |
-| `drain_max_burst` | 2 | Max packets/tick during Tier-2 drain (≤ `ramp_max_burst`) | Faster drain micro-bursts | Gentler on upstream routers |
-| `apd_spinloop_budget_ms` | 4 | Max pure-spin time per drain episode (user **0–100** ms; **`0` = unlimited** until fill &lt; low WM) | Longer spin cap; more CPU | Shorter cap; may exit drain before queue empties |
-| `apd_drain_tick_us` | 50 | Pacing tick override in drain (`0` = base tick) | Faster drain loop | Slower drain |
-| `apd_confirm_ticks` | 2 | Ticks with ramp pinned and fill above high WM before drain (user **0–10**; **`0` = no confirm**) | Less false drain | More false positives |
+| `ramp_max_burst` | 6 | **Absolute** max packets/tick for Tier-1 ramp ceiling (must be ≥ `base_max_burst`) | Faster ramp; bigger wire bursts in Alert | Slower ramp; smoother |
+| `drain_max_burst` | 3 | Max packets/tick during Tier-2 drain (≤ `ramp_max_burst`) | Faster drain micro-bursts | Gentler on upstream routers |
+| `apd_spinloop_budget_ms` | 3 | Max pure-spin time per drain episode (user **0–100** ms; **`0` = unlimited** until fill &lt; low WM) | Longer spin cap; more CPU | Shorter cap; may exit drain before queue empties |
+| `apd_drain_tick_us` | 100 | Pacing tick override in drain (`0` = base tick) | Faster drain loop | Slower drain |
+| `apd_confirm_ticks` | 4 | Ticks with ramp pinned and fill above high WM before drain (user **0–10**; **`0` = no confirm**) | Less false drain | More false positives |
 | `apd_cooldown_ms` | 2 | Min time after drain before re-arming spin (ramp continues) | Fewer drain oscillations | Can re-enter drain spin quickly |
 | `apd_drain_freeze_drr` | true | Round-robin (not byte-deficit DRR) while draining | Prioritizes emptying queue | DRR continues; mixed fairness |
 
@@ -666,9 +675,9 @@ When enabled, pacing may proactively drop stale **bulk** HOL packets before the 
 | Field | Default | Meaning | If ↑ | If ↓ |
 |-------|--------:|---------|------|------|
 | `shed_enabled` | true | Enable bulk HOL stale shedding | Backlog pressure can be trimmed earlier | No proactive stale bulk drop |
-| `shed_max_sojourn_ms` | 50 | Drop bulk HOL older than this (**2–500** ms) | More tolerant to queue age | Drops stale bulk sooner |
-| `shed_min_fill` | 0.2 | Shedding gate: require fill ≥ this (**0.1–0.95**) | Shedding activates only under heavier fill | Can shed earlier under moderate fill |
-| `shed_max_per_tick` | 2 | Per-tick cap on stale bulk drops (**1–64**) | Faster stale-bulk cleanup in one tick | Smaller per-tick shedding work |
+| `shed_max_sojourn_ms` | 30 | Drop bulk HOL older than this (**2–500** ms) | More tolerant to queue age | Drops stale bulk sooner |
+| `shed_min_fill` | 0.3 | Shedding gate: require fill ≥ this (**0.1–0.95**) | Shedding activates only under heavier fill | Can shed earlier under moderate fill |
+| `shed_max_per_tick` | 1 | Per-tick cap on stale bulk drops (**1–64**) | Faster stale-bulk cleanup in one tick | Smaller per-tick shedding work |
 
 Sanitize rule: when `shed_enabled && apd_enabled && apd_sojourn_enabled`, `shed_max_sojourn_ms` is clamped to be at least `apd_max_sojourn_ms` so APD drain gets first chance before stale-bulk shedding.
 
@@ -681,7 +690,7 @@ Sanitize rule: when `shed_enabled && apd_enabled && apd_sojourn_enabled`, `shed_
 | Adaptive thresholds (`advanced.fec`) | Loss % → shard layout | Earlier FEC on | Later FEC on / easier off |
 | Loss classifier (`advanced.congestion`) | Hold parity **increases** when queuing delay ratio is high; after delay recovers, optional one-step parity **step-down** if congestion was recent | On: avoids pumping parity into bufferbloat; sheds sticky FEC sooner post-bloat | Off: loss-only adaptive FEC |
 
-Shard **1279** B, flush **2/4 ms**: larger shards = fewer headers; longer flush = better grouping, higher latency.
+Shard **1024** B (wire max 1279), flush **1/2 ms**: larger shards = fewer headers; longer flush = better grouping, higher latency.
 
 ### Congestion telemetry / FEC classifier (`advanced.congestion`)
 
@@ -692,13 +701,13 @@ Tracks base RTT and queuing delay on each `RouteEntry`. Optional gate on adaptiv
 | `congestion_enabled` | **true** | LEDBAT background CC (token bucket + delay gradient) | On: per-peer rate limits from queuing delay | Off: telemetry/FEC only; no pacing CC actuation |
 | `gain` | 0.1 | Multiplicative decrease when `queuing_delay / target > 1` (**0.1–4.0**) | Drops peer rate faster under delay | Gentler decrease |
 | `hol_escape_ms` | 12 | Send despite empty tokens when peer HOL sojourn ≥ this (**4–100**); recommend ≤ `apd_max_sojourn_ms` when `apd_require_cc_headroom` is on | Escape starvation sooner | Longer throttle under backlog |
-| `initial_rate_bps` | 1.5M | New peer starting rate (**≤ max_rate_bps**) | Higher cold-start send cap | Lower initial cap |
-| `additive_increase_bps` | 8000 | Linear increase per probe when delay ≤ target (**4000–1e6**) | Faster headroom use | Slower ramp |
+| `initial_rate_bps` | 2M | New peer starting rate (**≤ max_rate_bps**) | Higher cold-start send cap | Lower initial cap |
+| `additive_increase_bps` | 28000 | Linear increase per probe when delay ≤ target (**4000–1e6**) | Faster headroom use | Slower ramp |
 | `min_decrease_factor` | 0.9 | Floor on one multiplicative decrease step (**0.1–0.9**) | Shallower single-step cuts | Deeper cuts |
 | `rate_smoothing_alpha` | 0.9 | EWMA on applied rate (**0–0.95**) | Smoother rates | Faster response |
-| `min_rate_bps` / `max_rate_bps` | 1M / 12M | Absolute per-peer rate clamps | Wider/narrower range | Tighter caps |
+| `min_rate_bps` / `max_rate_bps` | 1.8M / 25M | Absolute per-peer rate clamps | Wider/narrower range | Tighter caps |
 | `loss_multiplicative_decrease` | 0.9 | On rising `loss_ewma` past failover threshold (**0.3–0.9**) | Stronger loss reaction | Weaker loss reaction |
-| `burst_cap_bytes` | 12000 | Per-peer token burst cap (**512–262144**) | Larger micro-bursts | Tighter pacing |
+| `burst_cap_bytes` | 16000 | Per-peer token burst cap (**512–262144**) | Larger micro-bursts | Tighter pacing |
 | `delivery_rate_window_ms` | **750** | Accumulate TX bytes before one delivery-rate EWMA sample (**100–5000**) | Smoother delivery estimate | Faster delivery samples |
 | `delivery_rate_ewma_alpha` | **0.25** | Weight of each delivery window sample (**0.05–1.0**) | Tracks recent TX faster | More inertia |
 | `delivery_anchor_factor` | **0.95** | On hard-anchored decrease, set rate to `delivery_ewma ×` this (**0.5–0.99**) | Softer floor under delivery | Deeper cut toward delivery |
@@ -707,11 +716,11 @@ Tracks base RTT and queuing delay on each `RouteEntry`. Optional gate on adaptiv
 | `loss_classifier_enabled` | **true** | Gate adaptive FEC increases by delay ratio; gate Background CC loss-MD / loss-driven delivery anchor; enable post-congestion FEC recovery step-down | On: hold FEC parity up under congestion; CC ignores non-congestive loss edges; FEC step-down after QD recovers (see `fec_recovery_recency_ms`) | Off: loss-only adaptive FEC; CC always applies loss MD on rising edge |
 | `target_queue_delay_ms` | 15 | Denominator for `delay_ratio` (**10–150**) | Higher → less likely to classify as congestive | Lower → hold FEC increases sooner |
 | `congestion_loss_threshold` | 0.7 | Hold increase / mark congestive when `effective_qd / target >` this (**0.3–0.95**); recovery uses the same threshold for “delay recovered” | More tolerant of delay before hold | Holds sooner |
-| `base_rtt_window_secs` | 6 | Min-RTT / min-OWD window length (**1–60**) | Slower base adaptation | Faster base churn |
-| `base_rtt_stale_windows` | 2 | Consecutive windows before base may **rise** (**1–10**) | Base rises only after more confirmation | Base rises sooner when path worsens |
+| `base_rtt_window_secs` | 4 | Min-RTT / min-OWD window length (**1–60**) | Slower base adaptation | Faster base churn |
+| `base_rtt_stale_windows` | 3 | Consecutive windows before base may **rise** (**1–10**) | Base rises only after more confirmation | Base rises sooner when path worsens |
 | `owd_clock_jump_reject_ms` | **30000** | Invalidate forward OWD base when `|sample − base|` exceeds this (**1000–600000**) | More tolerant of clock steps | Rejects / resets OWD sooner |
-| `probe_interval_ms` | 25 | Periodic compact ping/pong for RTT + forward OWD samples (**0** = off, else **20–1000**) | Fresher queuing-delay telemetry | Less control traffic; sparser samples |
-| `fec_recovery_recency_ms` | **3000** | After last congestive sample, how long recovery may step parity down one ladder rung (**0** = off; else **100–60000**) | Longer sticky post-bloat shed window | Shorter / disable step-down (hold-increase only) |
+| `probe_interval_ms` | 40 | Periodic compact ping/pong for RTT + forward OWD samples (**0** = off, else **20–1000**) | Fresher queuing-delay telemetry | Less control traffic; sparser samples |
+| `fec_recovery_recency_ms` | **1200** | After last congestive sample, how long recovery may step parity down one ladder rung (**0** = off; else **100–60000**) | Longer sticky post-bloat shed window | Shorter / disable step-down (hold-increase only) |
 
 With defaults, `congestion_enabled = true` applies a per-peer token bucket (initial rate `initial_rate_bps`, burst `burst_cap_bytes`) in addition to the global pacing budget. Queuing-delay / loss-edge decreases use classic AIMD/MD when the permission rate is near measured TX delivery; when the ceiling sits clearly above the delivery EWMA (`delivery_decouple_ratio`), the first decrease hard-anchors to `delivery_ewma × delivery_anchor_factor` and snaps the smoothed bucket rate in the same update. When `loss_classifier_enabled` is on and QD telemetry is trusted (`rtt_base_tracking`), a rising loss edge only participates in that decrease path if delay is congestive (`queuing_delay / target > congestion_loss_threshold`); otherwise the edge is ignored for CC (`cc_loss_ignored_random` metric) and FEC remains the recovery tool. Delivery EWMA is send-side (successful data TX only); if true path rate is below `min_rate_bps`, the floor still applies (same as classic MD). APD is a local latency valve on top (see cascade hierarchy), gated by `apd_require_cc_headroom` so CC-induced backlog does not false-trigger Drain spin. Under-target paths may slowly increase rate via `additive_increase_bps`.
 
@@ -728,7 +737,7 @@ DRR RTT-aware fairness uses **base RTT** only (orthogonal to background CC’s q
 | `rawperf_enabled` / `rawperf-on` | false | Skip pacing+FEC on bulk data | Max throughput; unfair to control traffic | Normal pacing/FEC |
 | `retransmit_bypass_pps` / `rtrx-s` | 1000 | Rate limit for direct MREL retransmit bypass | More retry traffic | Fewer retries; slower recovery |
 | `low_latency_timer_enabled` | true | `NtSetTimerResolution` ~500 µs path when available | Sharper short sleeps | Coarser timer; less kernel load |
-| `process_priority_level` / `prio` | **2** (high) | Windows class: 1=realtime, 2=high, 3=normal | 1: lowest jitter; can starve system | 3: fairer OS share |
+| `process_priority_level` / `prio` | **1** (realtime) | Windows class: 1=realtime, 2=high, 3=normal | 1: lowest jitter; can starve system | 3: fairer OS share |
 | `cpu_affinity` / `core` | `""` (skip CPU 0–1) | Pin process to selected CPUs | Isolation; may miss best core | Empty = exclude housekeeping CPUs 0–1 |
 
 ### Punch (create/join)
@@ -780,9 +789,9 @@ real_ip = "..."
 
 [fec]
 fec_enabled = true
-shard_payload_size = 1279
-flush_ms = 4
-fec_max_total_shards = 64
+shard_payload_size = 1024
+flush_ms = 2
+fec_max_total_shards = 16
 
 [decentralized]
 
@@ -799,7 +808,7 @@ keepalive_secs = 5
 msyn_secs = 15
 stale_tick_secs = 30
 stale_mark_secs = 35
-stale_evict_secs = 90
+stale_evict_secs = 45
 
 [reliable]
 [congestion]
@@ -933,11 +942,11 @@ Owned exclusively by the **`mint-pacing`** OS thread (`src/net/pacing_worker.rs`
 | Parameter | Value | Meaning | If ↑ | If ↓ |
 |-----------|------:|---------|------|------|
 | `raise_step` | 32 | Initial exponential raise increment | Coarser early steps | Finer early steps |
-| `resolve_epsilon` | 1 | Stop binary when `first_bad - last_good ≤ ε` | Less precise ceiling | Byte-accurate (ε=1) |
+| `resolve_epsilon` | 8 | Stop binary when `first_bad - last_good ≤ ε` | Less precise ceiling | Byte-accurate (ε=1) |
 | `confirm_count` | 3 | Timeouts at same size before confirmed fail | More loss-tolerant | Faster fail on loss |
-| `probe_timeout_ms` | 1000 | Floor for adaptive probe timeout (cap 5s) | Longer minimum wait | Faster retries when RTT is low |
+| `probe_timeout_ms` | 500 | Floor for adaptive probe timeout (cap 5s) | Longer minimum wait | Faster retries when RTT is low |
 | `max_probes_per_search` | 64 | Campaign budget → Frozen (not applied to Recheck) | Longer search | Freeze sooner |
-| `stable_downgrade_batches` | 3 | Lower campaigns before `stable` drop | Slower to reduce MTU | Faster downgrade |
+| `stable_downgrade_batches` | 4 | Lower campaigns before `stable` drop | Slower to reduce MTU | Faster downgrade |
 | `MIN_ADAPTER_PAYLOAD_MTU` | 280 | Hard floor for suggested/applied adapter MTU | — | — |
 | `pmtud_tick_ms` / `pmtud_raise_secs` | 50 / 60 | Active tick vs raise/revalidate period | — | — |
 
@@ -968,7 +977,7 @@ Owned exclusively by the **`mint-pacing`** OS thread (`src/net/pacing_worker.rs`
 
 ## Metrics and observability
 
-**`EngineMetrics`** (Arc, shared CLI + engine): pacing overshoots, tick observations, queue/channel drop counters (`pacing_cmd_channel_full`, data/control drops), timer resolution, APD/DRR/FEC/CC counters surfaced in **`runtime`**. Terminal output uses **`term_style`** (colors, prompts).
+**`EngineMetrics`** (Arc, shared CLI + engine): pacing overshoots, tick observations, queue/channel drop counters (`pacing_cmd_channel_full`, `fec_tx_cmd_channel_full`, data/control drops), timer resolution, APD/DRR/FEC/CC counters surfaced in **`runtime`**. Terminal output uses **`term_style`** (colors, prompts).
 
 `runtime` highlights include: `apd_ramp_active_ticks`, `apd_ramp_pinned_ticks`, `apd_effective_burst`, `apd_drain_arm_fill` / `apd_drain_arm_sojourn`, `apd_max_sojourn_ms`, `apd_cc_headroom_suppressions`, `pacing_shed_sojourn`, `cc_rate_limited`, `drr_small_priority_pops` / `drr_bulk_force_pops`, `drr_rtt_scale_applied`, `fec_congestive_hold` / `fec_classifier_allow` / `fec_recovery_stepdown`, drain episode stats.
 

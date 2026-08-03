@@ -2373,16 +2373,16 @@ mod tests {
         let net = NetworkConfig::default();
         let apd = super::apd_config_from_network(&net);
         assert!(apd.enabled);
-        assert!((apd.high_watermark - 0.6).abs() < f32::EPSILON);
+        assert!((apd.high_watermark - 0.4).abs() < f32::EPSILON);
         assert!((apd.low_watermark - 0.1).abs() < f32::EPSILON);
-        assert_eq!(apd.ramp_max_burst, 8);
-        assert_eq!(apd.drain_max_burst, 2);
-        assert_eq!(apd.drain_tick_us, 50);
-        assert_eq!(apd.confirm_ticks, 2);
+        assert_eq!(apd.ramp_max_burst, 6);
+        assert_eq!(apd.drain_max_burst, 3);
+        assert_eq!(apd.drain_tick_us, 100);
+        assert_eq!(apd.confirm_ticks, 4);
         assert_eq!(apd.cooldown_ms, 2);
-        assert_eq!(apd.spinloop_budget_ms, 4);
+        assert_eq!(apd.spinloop_budget_ms, 3);
         assert!(apd.sojourn_enabled);
-        assert!((apd.max_sojourn_ms - 6.0).abs() < f32::EPSILON);
+        assert!((apd.max_sojourn_ms - 10.0).abs() < f32::EPSILON);
         assert!((apd.target_sojourn_ms - 2.0).abs() < f32::EPSILON);
         assert!(apd.require_cc_headroom);
     }

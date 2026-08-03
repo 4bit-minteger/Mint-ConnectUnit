@@ -57,7 +57,7 @@ impl Default for TimerTuning {
             ping_watchdog_ms: 100,
             stale_tick_secs: 30,
             stale_mark_secs: 35,
-            stale_evict_secs: 90,
+            stale_evict_secs: 45,
         }
     }
 }
@@ -76,7 +76,7 @@ pub struct ReliableTuning {
 impl Default for ReliableTuning {
     fn default() -> Self {
         Self {
-            rto_min_ms: 50,
+            rto_min_ms: 75,
             rto_max_ms: 400,
             max_pending: 256,
             retries_left: 1,
@@ -140,12 +140,12 @@ pub struct FecTuning {
 impl Default for FecTuning {
     fn default() -> Self {
         Self {
-            shard_payload_size: crate::net::fec::FEC_SHARD_PAYLOAD_SIZE,
-            flush_ms: 4,
-            flush_aggressive_ms: 2,
+            shard_payload_size: 1024,
+            flush_ms: 2,
+            flush_aggressive_ms: 1,
             adaptive_off_below: 0.015,
-            adaptive_on_above: 0.05,
-            fec_max_total_shards: crate::net::fec::FEC_MAX_TOTAL_SHARDS,
+            adaptive_on_above: 0.03,
+            fec_max_total_shards: 16,
         }
     }
 }
@@ -178,8 +178,8 @@ impl Default for RoutingEwmaTuning {
             rtt_ewma_new: 0.2,
             jitter_ewma_old: 0.8,
             jitter_ewma_new: 0.2,
-            loss_ewma_decay: 0.95,
-            loss_ewma_success_delta: 0.005,
+            loss_ewma_decay: 0.85,
+            loss_ewma_success_delta: 0.01,
             loss_ewma_fail_bump: 0.05,
             bw_ewma_old: 0.85,
             bw_ewma_new: 0.15,
@@ -242,11 +242,11 @@ pub struct EngineLimitsTuning {
 impl Default for EngineLimitsTuning {
     fn default() -> Self {
         Self {
-            max_direct_retry_per_tick: 32,
+            max_direct_retry_per_tick: 8,
             max_pending_heal_probes: 96,
             max_pending_stun_queries: 8,
             max_cc_probes_per_tick: 32,
-            max_secondary_retry_per_tick: 16,
+            max_secondary_retry_per_tick: 4,
             stun_cache_ttl_secs: 30,
             msyn_body_max: 524_288,
             msyn_shard_budget_bytes: 1200,
@@ -388,11 +388,11 @@ impl Default for CongestionTuning {
             loss_classifier_enabled: true,
             target_queue_delay_ms: crate::net::background_cc::DEFAULT_TARGET_QUEUE_DELAY_MS,
             congestion_loss_threshold: 0.7,
-            base_rtt_window_secs: 6,
-            base_rtt_stale_windows: 2,
+            base_rtt_window_secs: 4,
+            base_rtt_stale_windows: 3,
             owd_clock_jump_reject_ms: crate::routing::DEFAULT_OWD_CLOCK_JUMP_REJECT_MS,
-            probe_interval_ms: 25,
-            fec_recovery_recency_ms: 3_000,
+            probe_interval_ms: 40,
+            fec_recovery_recency_ms: 1_200,
             enabled: true,
             gain: crate::net::background_cc::DEFAULT_GAIN,
             hol_escape_ms: crate::net::background_cc::DEFAULT_HOL_ESCAPE_MS,
@@ -482,13 +482,13 @@ pub struct PmtudTuning {
 impl Default for PmtudTuning {
     fn default() -> Self {
         Self {
-            probe_timeout_ms: 1000,
+            probe_timeout_ms: 500,
             confirm_count: 3,
-            resolve_epsilon: 1,
+            resolve_epsilon: 8,
             raise_step: 32,
             max_probes_per_search: 64,
             max_concurrent_peers: 4,
-            stable_downgrade_batches: 3,
+            stable_downgrade_batches: 4,
         }
     }
 }
@@ -650,32 +650,26 @@ mod tests {
             crate::routing::failover::HOLD_DOWN_SECS
         );
 
-        assert_eq!(d.reliable.rto_min_ms, 50);
+        assert_eq!(d.reliable.rto_min_ms, 75);
         assert_eq!(d.reliable.rto_max_ms, 400);
         assert_eq!(d.reliable.max_pending, 256);
         assert_eq!(d.reliable.retries_left, 1);
         assert_eq!(d.reliable.send_scratch_bytes, 1500);
 
-        assert_eq!(
-            d.fec.shard_payload_size,
-            crate::net::fec::FEC_SHARD_PAYLOAD_SIZE
-        );
-        assert_eq!(d.fec.flush_ms, 4);
-        assert_eq!(d.fec.flush_aggressive_ms, 2);
+        assert_eq!(d.fec.shard_payload_size, 1024);
+        assert_eq!(d.fec.flush_ms, 2);
+        assert_eq!(d.fec.flush_aggressive_ms, 1);
         assert_eq!(d.fec.adaptive_off_below, 0.015);
-        assert_eq!(d.fec.adaptive_on_above, 0.05);
-        assert_eq!(
-            d.fec.fec_max_total_shards,
-            crate::net::fec::FEC_MAX_TOTAL_SHARDS
-        );
+        assert_eq!(d.fec.adaptive_on_above, 0.03);
+        assert_eq!(d.fec.fec_max_total_shards, 16);
 
-        assert_eq!(d.pmtud.probe_timeout_ms, 1000);
+        assert_eq!(d.pmtud.probe_timeout_ms, 500);
         assert_eq!(d.pmtud.confirm_count, 3);
-        assert_eq!(d.pmtud.resolve_epsilon, 1);
+        assert_eq!(d.pmtud.resolve_epsilon, 8);
         assert_eq!(d.pmtud.raise_step, 32);
         assert_eq!(d.pmtud.max_probes_per_search, 64);
         assert_eq!(d.pmtud.max_concurrent_peers, 4);
-        assert_eq!(d.pmtud.stable_downgrade_batches, 3);
+        assert_eq!(d.pmtud.stable_downgrade_batches, 4);
 
         assert_eq!(d.timers.keepalive_secs, 5);
         assert_eq!(d.timers.msyn_secs, 15);
@@ -684,31 +678,31 @@ mod tests {
         assert_eq!(d.timers.ping_watchdog_ms, 100);
         assert_eq!(d.timers.stale_tick_secs, 30);
         assert_eq!(d.timers.stale_mark_secs, 35);
-        assert_eq!(d.timers.stale_evict_secs, 90);
+        assert_eq!(d.timers.stale_evict_secs, 45);
 
         assert!(d.congestion.rtt_base_tracking);
         assert!(d.congestion.loss_classifier_enabled);
         assert_eq!(d.congestion.target_queue_delay_ms, 15);
         assert_eq!(d.congestion.congestion_loss_threshold, 0.7);
-        assert_eq!(d.congestion.base_rtt_window_secs, 6);
-        assert_eq!(d.congestion.base_rtt_stale_windows, 2);
+        assert_eq!(d.congestion.base_rtt_window_secs, 4);
+        assert_eq!(d.congestion.base_rtt_stale_windows, 3);
         assert_eq!(
             d.congestion.owd_clock_jump_reject_ms,
             crate::routing::DEFAULT_OWD_CLOCK_JUMP_REJECT_MS
         );
-        assert_eq!(d.congestion.probe_interval_ms, 25);
-        assert_eq!(d.congestion.fec_recovery_recency_ms, 3_000);
+        assert_eq!(d.congestion.probe_interval_ms, 40);
+        assert_eq!(d.congestion.fec_recovery_recency_ms, 1_200);
         assert!(d.congestion.enabled);
         assert_eq!(d.congestion.gain, 0.1);
         assert_eq!(d.congestion.hol_escape_ms, 12);
-        assert_eq!(d.congestion.initial_rate_bps, 1_500_000.0);
-        assert_eq!(d.congestion.additive_increase_bps, 8_000.0);
+        assert_eq!(d.congestion.initial_rate_bps, 2_000_000.0);
+        assert_eq!(d.congestion.additive_increase_bps, 28_000.0);
         assert_eq!(d.congestion.min_decrease_factor, 0.9);
         assert_eq!(d.congestion.rate_smoothing_alpha, 0.9);
         assert_eq!(d.congestion.loss_multiplicative_decrease, 0.9);
-        assert_eq!(d.congestion.min_rate_bps, 1_000_000.0);
-        assert_eq!(d.congestion.max_rate_bps, 12_000_000.0);
-        assert_eq!(d.congestion.burst_cap_bytes, 12_000);
+        assert_eq!(d.congestion.min_rate_bps, 1_800_000.0);
+        assert_eq!(d.congestion.max_rate_bps, 25_000_000.0);
+        assert_eq!(d.congestion.burst_cap_bytes, 16_000);
         assert_eq!(d.congestion.delivery_rate_window_ms, 750);
         assert_eq!(d.congestion.delivery_rate_ewma_alpha, 0.25);
         assert_eq!(d.congestion.delivery_anchor_factor, 0.95);
@@ -716,13 +710,15 @@ mod tests {
 
         assert_eq!(d.routing_ewma.rtt_ewma_old, 0.8);
         assert_eq!(d.routing_ewma.rtt_ewma_new, 0.2);
-        assert_eq!(d.routing_ewma.loss_ewma_decay, 0.95);
+        assert_eq!(d.routing_ewma.loss_ewma_decay, 0.85);
+        assert_eq!(d.routing_ewma.loss_ewma_success_delta, 0.01);
         assert_eq!(d.routing_ewma.loss_ewma_fail_bump, 0.05);
         assert_eq!(d.routing_ewma.bw_ewma_old, 0.85);
         assert_eq!(d.routing_ewma.quality_initial, 50);
         assert_eq!(d.routing_ewma.quality_loss_penalty_cap, 40.0);
 
-        assert_eq!(d.engine_limits.max_direct_retry_per_tick, 32);
+        assert_eq!(d.engine_limits.max_direct_retry_per_tick, 8);
+        assert_eq!(d.engine_limits.max_secondary_retry_per_tick, 4);
         assert_eq!(d.engine_limits.max_pending_heal_probes, 96);
         assert_eq!(d.engine_limits.msyn_body_max, 524_288);
         assert_eq!(d.engine_limits.msyn_shard_budget_bytes, 1200);
@@ -902,7 +898,7 @@ delivery_decouple_ratio = 1.5
         let parsed: AdvancedTuning = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.reliable.retries_left, 3);
         // Other reliable fields fall back to default.
-        assert_eq!(parsed.reliable.rto_min_ms, 50);
+        assert_eq!(parsed.reliable.rto_min_ms, 75);
         // Other groups fall back to default.
         assert_eq!(parsed.failover, FailoverTuning::default());
     }
