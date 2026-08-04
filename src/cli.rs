@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -32,6 +32,7 @@ use crate::net::pace_clock::{self, PaceClockApply};
 use crate::net::pacing::PacingConfig;
 use crate::net::packet::WIRE_PROTOCOL_VERSION;
 use crate::netinfo::{self, ensure_netinfo_dir};
+use crate::pmtud::is_rfc1918_private_ip;
 use crate::process_priority;
 use crate::routing::{owner_vip, RoutingTable};
 use crate::runtime_trace::RuntimeTrace;
@@ -6750,13 +6751,6 @@ async fn gather_local_para_candidates_inner(
     out
 }
 
-fn is_rfc1918_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_private(),
-        IpAddr::V6(_) => false,
-    }
-}
-
 fn local_only_para_candidates(snap: &crate::config::NetworkConfig) -> Vec<ParaCandidate> {
     vec![ParaCandidate {
         ip: get_local_ip(),
@@ -7681,7 +7675,8 @@ mod punch_route_ready_tests {
 
 #[cfg(test)]
 mod parasitic_lan_helpers_tests {
-    use super::{filter_private_socket_addrs, is_rfc1918_private_ip, para_lan_discovery_targets};
+    use super::{filter_private_socket_addrs, para_lan_discovery_targets};
+    use crate::pmtud::is_rfc1918_private_ip;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]

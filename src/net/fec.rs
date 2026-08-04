@@ -7,6 +7,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use crate::net::packet::{CompactPacketType, FEC_COMPACT_HEADER_LEN};
 
 pub const FEC_SHARD_PAYLOAD_SIZE: usize = 1279;
+pub const FEC_SHARD_LEN_PREFIX: usize = 2;
 /// Floor for configured and runtime-effective shard payload size.
 pub const FEC_SHARD_PAYLOAD_MIN: usize = 512;
 pub const FEC_FLUSH_TIMEOUT: Duration = Duration::from_millis(2);
@@ -95,8 +96,8 @@ pub fn fec_ratio_would_increase_parity(prev: Option<(u8, u8)>, proposed: (u8, u8
     prop_frac > prev_frac + 1e-9 || ((prop_frac - prev_frac).abs() < 1e-9 && proposed.1 > prev.1)
 }
 
-/// Default recovery recency window (matches `CongestionTuning::fec_recovery_recency_ms`).
-pub const FEC_RECOVERY_RECENCY: Duration = Duration::from_millis(3_000);
+/// Test/default-only recency window used by local FEC tests.
+pub const FEC_RECOVERY_RECENCY: Duration = Duration::from_millis(1_200);
 
 /// Adaptive parity ladder, highest overhead first (matches `adaptive_fec_ratio`).
 const FEC_RATIO_LADDER: [(u8, u8); 4] = [(4, 2), (5, 1), (7, 1), (10, 1)];
@@ -255,7 +256,6 @@ pub struct FecEncoder {
 struct PendingShard {
     original: Bytes,
     shard: Vec<u8>,
-    orig_len: u16,
 }
 
 impl FecEncoder {
@@ -382,7 +382,7 @@ impl FecEncoder {
         if self.data_shards == 0 || self.parity_shards == 0 {
             return FecOutput::Passthrough(vec![pkt]);
         }
-        if pkt.len() > self.shard_payload_size {
+        if pkt.len() + FEC_SHARD_LEN_PREFIX > self.shard_payload_size {
             return FecOutput::Passthrough(vec![pkt]);
         }
         let total = self.data_shards as usize + self.parity_shards as usize;
@@ -401,11 +401,12 @@ impl FecEncoder {
             self.first_at = Some(Instant::now());
         }
         let mut shard = self.take_shard_buf();
-        shard[..orig_len].copy_from_slice(&pkt[..orig_len]);
+        shard[..FEC_SHARD_LEN_PREFIX].copy_from_slice(&(orig_len as u16).to_le_bytes());
+        shard[FEC_SHARD_LEN_PREFIX..FEC_SHARD_LEN_PREFIX + orig_len]
+            .copy_from_slice(&pkt[..orig_len]);
         self.shard_buf.push(PendingShard {
             original: pkt,
             shard,
-            orig_len: orig_len as u16,
         });
         if self.shard_buf.len() >= self.data_shards as usize {
             let total = self.data_shards as usize + self.parity_shards as usize;
@@ -485,7 +486,6 @@ impl FecEncoder {
         if self.shard_buf.len() < n {
             return self.take_passthrough_packets();
         }
-        let orig_lens: Vec<u16> = self.shard_buf.iter().take(n).map(|s| s.orig_len).collect();
         let mut all_shards: Vec<Vec<u8>> = (0..n)
             .map(|i| std::mem::take(&mut self.shard_buf[i].shard))
             .collect();
@@ -515,14 +515,12 @@ impl FecEncoder {
         }
         let mut out = Vec::with_capacity(n + parity_shards);
         for (idx, shard) in all_shards.iter().enumerate() {
-            let orig_len = if idx < n { orig_lens[idx] } else { 0 };
             build_fec_packet_into(
                 group_id,
                 idx as u8,
                 data_shards as u8,
                 parity_shards as u8,
                 shard,
-                orig_len,
                 &mut self.frame_scratch,
             );
             out.push(self.frame_scratch.split().freeze());
@@ -619,7 +617,6 @@ struct PartialGroup {
     parity_shards: u8,
     shard_size: usize,
     received: Vec<Option<Vec<u8>>>,
-    orig_lens: Vec<u16>,
     received_count: u8,
     created_at: Instant,
 }
@@ -698,16 +695,14 @@ impl FecDecoder {
         let data_shards = raw[6];
         let parity_shards = raw[7];
         let shard_size = u16::from_le_bytes([raw[8], raw[9]]) as usize;
-        let orig_len = u16::from_le_bytes([raw[10], raw[11]]);
         let shard_data = &raw[FEC_COMPACT_HEADER_LEN..];
         let total = data_shards as usize + parity_shards as usize;
         if total == 0
             || total > FEC_MAX_TOTAL_SHARDS
             || shard_idx >= total
             || shard_data.len() < shard_size
-            || shard_size == 0
+            || shard_size < FEC_SHARD_LEN_PREFIX
             || shard_size > FEC_SHARD_PAYLOAD_SIZE
-            || (shard_idx < data_shards as usize && (orig_len as usize) > shard_size)
         {
             if let Some(g) = self.groups.remove(&group_id) {
                 shards_missing = shards_missing.saturating_add(group_shards_missing(&g));
@@ -723,7 +718,6 @@ impl FecDecoder {
             parity_shards,
             shard_size,
             received: vec![None; total],
-            orig_lens: vec![0u16; data_shards as usize],
             received_count: 0,
             created_at: Instant::now(),
         });
@@ -741,9 +735,6 @@ impl FecDecoder {
             return FecDecodeResult::ok(vec![], 0, shards_missing);
         }
         group.received[shard_idx] = Some(payload);
-        if shard_idx < group.data_shards as usize {
-            group.orig_lens[shard_idx] = orig_len;
-        }
         group.received_count = group.received_count.saturating_add(1);
         let data_count = group.received[..group.data_shards as usize]
             .iter()
@@ -816,13 +807,15 @@ impl FecDecoder {
         let missing = group_shards_missing(&group);
         let recovered = group.received[..group.data_shards as usize]
             .iter()
-            .zip(group.orig_lens.iter())
-            .filter_map(|(shard, &orig_len)| {
+            .filter_map(|shard| {
                 let s = shard.as_ref()?;
-                if orig_len == 0 || orig_len as usize > s.len() {
+                let orig_len = u16::from_le_bytes([s[0], s[1]]) as usize;
+                if orig_len > s.len().saturating_sub(FEC_SHARD_LEN_PREFIX) {
                     return None;
                 }
-                Some(Bytes::copy_from_slice(&s[..orig_len as usize]))
+                Some(Bytes::copy_from_slice(
+                    &s[FEC_SHARD_LEN_PREFIX..FEC_SHARD_LEN_PREFIX + orig_len],
+                ))
             })
             .collect();
         (recovered, missing)
@@ -889,7 +882,6 @@ fn build_fec_packet(
     data_shards: u8,
     parity_shards: u8,
     shard_data: &[u8],
-    orig_len: u16,
 ) -> Bytes {
     let mut buf = BytesMut::with_capacity(FEC_COMPACT_HEADER_LEN + shard_data.len());
     build_fec_packet_into(
@@ -898,7 +890,6 @@ fn build_fec_packet(
         data_shards,
         parity_shards,
         shard_data,
-        orig_len,
         &mut buf,
     );
     buf.freeze()
@@ -910,7 +901,6 @@ fn build_fec_packet_into(
     data_shards: u8,
     parity_shards: u8,
     shard_data: &[u8],
-    orig_len: u16,
     out: &mut BytesMut,
 ) {
     out.clear();
@@ -921,7 +911,6 @@ fn build_fec_packet_into(
     out.extend_from_slice(&[data_shards]);
     out.extend_from_slice(&[parity_shards]);
     out.extend_from_slice(&(shard_data.len() as u16).to_le_bytes());
-    out.extend_from_slice(&orig_len.to_le_bytes());
     out.extend_from_slice(shard_data);
 }
 
@@ -1139,8 +1128,11 @@ mod tests {
     fn encode_decode_recovers_one_missing_shard() {
         let mut enc = FecEncoder::new(4, 1);
         let mut out = Vec::new();
+        let expected: Vec<Bytes> = (0..4)
+            .map(|i| Bytes::from(vec![i as u8; FEC_BUFFER_TEST_LEN]))
+            .collect();
         for i in 0..4 {
-            if let Some(pkts) = enc.push(Bytes::from(vec![i as u8; FEC_BUFFER_TEST_LEN])) {
+            if let Some(pkts) = enc.push(expected[i].clone()) {
                 out = pkts;
             }
         }
@@ -1158,9 +1150,39 @@ mod tests {
                 recovered = r.recovered;
             }
         }
-        assert!(!recovered.is_empty());
+        assert_eq!(recovered, expected);
         // One data shard dropped on the wire → missing == 1 at group close.
         assert_eq!(total_missing, 1);
+    }
+
+    #[test]
+    fn encode_decode_recovers_two_missing_data_shards() {
+        let mut enc = FecEncoder::new(4, 2);
+        let mut out = Vec::new();
+        let expected: Vec<Bytes> = (0..4)
+            .map(|i| Bytes::from(vec![i as u8; FEC_BUFFER_TEST_LEN]))
+            .collect();
+        for p in &expected {
+            if let Some(pkts) = enc.push(p.clone()) {
+                out = pkts;
+            }
+        }
+        assert_eq!(out.len(), 6);
+        let mut dec = FecDecoder::new();
+        let mut recovered = Vec::new();
+        let mut total_missing = 0u16;
+        for (idx, pkt) in out.into_iter().enumerate() {
+            if idx == 1 || idx == 3 {
+                continue;
+            }
+            let r = dec.push_shard(&pkt);
+            total_missing = total_missing.saturating_add(r.shards_missing);
+            if !r.recovered.is_empty() {
+                recovered = r.recovered;
+            }
+        }
+        assert_eq!(recovered, expected);
+        assert_eq!(total_missing, 2);
     }
 
     #[test]
@@ -1192,7 +1214,13 @@ mod tests {
     fn decoder_evict_counts_missing_shards() {
         let mut dec = FecDecoder::new();
         // data=5, parity=1 → total 6; deliver 1 shard → missing 5 on TTL evict.
-        let p = build_fec_packet(9, 0, 5, 1, &[3u8; 16], 16);
+        let p = build_fec_packet(
+            9,
+            0,
+            5,
+            1,
+            &[16u8, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+        );
         let r = dec.push_shard(&p);
         assert!(!r.invalid);
         assert_eq!(r.shards_new, 1);
@@ -1321,8 +1349,20 @@ mod tests {
     #[test]
     fn decoder_rejects_invariant_mismatch_without_panic() {
         let mut dec = FecDecoder::new();
-        let p1 = build_fec_packet(7, 0, 5, 1, &[1u8; 16], 16);
-        let p2 = build_fec_packet(7, 1, 4, 2, &[2u8; 16], 16);
+        let p1 = build_fec_packet(
+            7,
+            0,
+            5,
+            1,
+            &[16u8, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        );
+        let p2 = build_fec_packet(
+            7,
+            1,
+            4,
+            2,
+            &[16u8, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+        );
         let r1 = dec.push_shard(&p1);
         assert!(!r1.invalid);
         let r2 = dec.push_shard(&p2);
@@ -1332,7 +1372,13 @@ mod tests {
     #[test]
     fn decoder_evict_expired_clears_idle_groups() {
         let mut dec = FecDecoder::new();
-        let p = build_fec_packet(9, 0, 5, 1, &[3u8; 16], 16);
+        let p = build_fec_packet(
+            9,
+            0,
+            5,
+            1,
+            &[16u8, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+        );
         assert!(!dec.push_shard(&p).invalid);
         assert!(!dec.is_empty());
         for group in dec.groups.values_mut() {
@@ -1345,28 +1391,28 @@ mod tests {
     #[test]
     fn effective_shard_payload_size_clamps_to_path_mtu() {
         use crate::net::packet::UNDERLAY_IPV4_UDP_OVERHEAD;
-        // min_path_mtu 1220 → max shard = 1220 - 28 - 12 = 1180
+        // min_path_mtu 1220 → max shard = 1220 - 28 - 10 = 1182
         assert_eq!(
             effective_shard_payload_size(FEC_SHARD_PAYLOAD_SIZE, 1220),
-            Some(1180)
+            Some(1182)
         );
         assert_eq!(
             effective_shard_payload_size(FEC_SHARD_PAYLOAD_SIZE, 1200),
-            Some(1160)
+            Some(1162)
         );
-        // Below floor 512 after underlay+header → None (need path < 512+28+12 = 552)
+        // Below floor 512 after underlay+header → None (need path < 512+28+10 = 550)
         assert_eq!(
-            effective_shard_payload_size(FEC_SHARD_PAYLOAD_SIZE, 550),
+            effective_shard_payload_size(FEC_SHARD_PAYLOAD_SIZE, 549),
             None
         );
         assert_eq!(
-            effective_shard_payload_size(FEC_SHARD_PAYLOAD_SIZE, 576),
-            Some(536)
+            effective_shard_payload_size(FEC_SHARD_PAYLOAD_SIZE, 550),
+            Some(512)
         );
         // Configured smaller than path budget wins
         assert_eq!(effective_shard_payload_size(900, 1500), Some(900));
         let max = 1220 - UNDERLAY_IPV4_UDP_OVERHEAD - FEC_COMPACT_HEADER_LEN;
-        assert_eq!(max, 1180);
+        assert_eq!(max, 1182);
     }
 
     #[test]

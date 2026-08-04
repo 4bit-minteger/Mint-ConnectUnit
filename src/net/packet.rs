@@ -6,8 +6,8 @@ pub const WIRE_PROTOCOL_VERSION: u64 = 7;
 pub const COMPACT_HEADER_LEN: usize = 1;
 pub const CONTROL_TAG_LEN: usize = 4;
 
-/// FEC compact header: type(1) + group_id(4 LE) + shard_idx(1) + data_shards(1) + parity_shards(1) + shard_size(2 LE) + orig_len(2 LE)
-pub const FEC_COMPACT_HEADER_LEN: usize = 12;
+/// FEC compact header: type(1) + group_id(4 LE) + shard_idx(1) + data_shards(1) + parity_shards(1) + shard_size(2 LE)
+pub const FEC_COMPACT_HEADER_LEN: usize = 10;
 
 pub const PKT_KPAL: &[u8; 4] = b"MKPL";
 pub const PKT_JOIN: &[u8; 4] = b"MPJN";

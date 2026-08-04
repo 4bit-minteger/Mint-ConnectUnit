@@ -35,7 +35,7 @@ use crate::net::decentralized::{
 };
 use crate::net::fec::{
     adaptive_fec_ratio_hyst_tuned, effective_shard_payload_size, fec_delay_is_congestive,
-    FecDecoder,
+    FecDecoder, FEC_SHARD_LEN_PREFIX,
 };
 use crate::net::fec_tx_worker::{
     start_fec_tx_worker, FecTxEvent, FecTxHandle, FecTxTuning, NormalOfferKind,
@@ -56,7 +56,8 @@ use crate::net::reliable::{ReliableChannel, SendResult};
 use crate::net::retransmit::RetransmitDirectSender;
 use crate::net::size_loss::{replay_gap, SizeLossTable};
 use crate::pmtud::{
-    PathMtuDiscovery, PeerMtuSnapshot, PeerTickInput, SizeHealth, MIN_ADAPTER_PAYLOAD_MTU,
+    is_rfc1918_private_ip, PathMtuDiscovery, PeerMtuSnapshot, PeerTickInput, SizeHealth,
+    MIN_ADAPTER_PAYLOAD_MTU,
 };
 use crate::routing::{
     owner_vip_with_prefix, same_subnet, should_relay, should_relay_snap, PathKind, RelaySelection,
@@ -4986,7 +4987,7 @@ impl P2PEngine {
             return;
         }
         let now = Instant::now();
-        if pkt.len() > self.fec_shard_payload_size {
+        if pkt.len() + FEC_SHARD_LEN_PREFIX > self.fec_shard_payload_size {
             self.metrics.inc_fec_oversize_bypass();
             self.enqueue_normal_packet(pkt, dest);
             return;
@@ -4996,7 +4997,7 @@ impl P2PEngine {
             self.enqueue_normal_packet(pkt, dest);
             return;
         };
-        if pkt.len() > effective {
+        if pkt.len() + FEC_SHARD_LEN_PREFIX > effective {
             self.metrics.inc_fec_mtu_bypass();
             self.enqueue_normal_packet(pkt, dest);
             return;
@@ -5505,6 +5506,14 @@ impl P2PEngine {
             .set_missed_tick_behavior(MissedTickBehavior::Delay);
     }
 
+    /// RFC1918 peers: main listen socket (same 5-tuple as data/punch). Public: DF probe socket.
+    fn pmtud_probe_send_socket(&self, peer: SocketAddr) -> &UdpSocket {
+        match pmtud_probe_send_path(peer) {
+            PmtudProbeSendPath::Main => self.socket.as_ref(),
+            PmtudProbeSendPath::Probe => self.pmtud_probe_socket.as_ref(),
+        }
+    }
+
     async fn drive_pmtud_tick(&mut self) {
         let now = Instant::now();
         let cong = &self.advanced_tuning.congestion;
@@ -5563,7 +5572,8 @@ impl P2PEngine {
             body.resize(10 + payload_len, 0xAB);
             let frame = frame_with_tag(PKT_PMTU, &body);
             self.metrics.inc_pmtud_probes_sent();
-            match self.pmtud_probe_socket.send_to(&frame, intent.peer).await {
+            let sock = self.pmtud_probe_send_socket(intent.peer);
+            match sock.send_to(&frame, intent.peer).await {
                 Ok(_) => {}
                 Err(e) if is_udp_message_too_long(&e) => {
                     let ev =
@@ -6888,6 +6898,20 @@ fn is_udp_message_too_long(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(10040) | Some(90))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PmtudProbeSendPath {
+    Main,
+    Probe,
+}
+
+fn pmtud_probe_send_path(peer: SocketAddr) -> PmtudProbeSendPath {
+    if is_rfc1918_private_ip(peer.ip()) {
+        PmtudProbeSendPath::Main
+    } else {
+        PmtudProbeSendPath::Probe
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6907,6 +6931,16 @@ mod tests {
         };
         assert!(!try_deliver_join_ack(&mut join_tx, ack));
         assert!(join_tx.is_none());
+    }
+
+    #[test]
+    fn pmtud_probe_send_path_private_main_public_probe() {
+        let lan: SocketAddr = "192.168.0.100:7878".parse().unwrap();
+        let pub_ep: SocketAddr = "198.51.100.1:7878".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:7878".parse().unwrap();
+        assert_eq!(pmtud_probe_send_path(lan), PmtudProbeSendPath::Main);
+        assert_eq!(pmtud_probe_send_path(pub_ep), PmtudProbeSendPath::Probe);
+        assert_eq!(pmtud_probe_send_path(loopback), PmtudProbeSendPath::Probe);
     }
 
     #[test]

@@ -1,9 +1,15 @@
 use crate::net::packet::UNDERLAY_IPV4_UDP_OVERHEAD;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_MTU: usize = 1220;
+
+/// RFC1918 IPv4 only (`10/8`, `172.16/12`, `192.168/16`). Used for LAN PMTUD
+/// probe routing and never-acked soft-down floor; not APIPA/CGNAT/IPv6 ULA.
+pub fn is_rfc1918_private_ip(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.is_private())
+}
 const MIN_MTU: usize = 576;
 const MAX_MTU: usize = 1500;
 /// Sentinel: one past the largest probeable IP MTU.
@@ -90,6 +96,8 @@ struct PeerState {
     /// Cached RTT for adaptive probe timeout (`< 0` = unknown).
     rtt_ms: f64,
     large_alive: bool,
+    /// At least one successful probe ACK for this peer (any phase).
+    ever_acked: bool,
 }
 
 impl PeerState {
@@ -112,6 +120,7 @@ impl PeerState {
             downsearch_got_ack: false,
             rtt_ms: -1.0,
             large_alive: false,
+            ever_acked: false,
         }
     }
 
@@ -623,12 +632,18 @@ impl PathMtuDiscovery {
         }
     }
 
-    fn apply_soft_down(&mut self, ep: SocketAddr, _now: Instant, events: &mut PmtudEventCounts) {
+    fn apply_soft_down(&mut self, ep: SocketAddr, now: Instant, events: &mut PmtudEventCounts) {
         let raise_step = self.raise_step;
+        let raise_period = self.raise_period;
+        let epsilon = self.resolve_epsilon;
+        let downgrade_batches = self.stable_downgrade_batches;
         let Some(peer) = self.peers.get_mut(&ep) else {
             return;
         };
-        let new_lg = Self::soft_down_last_good(peer);
+        let mut new_lg = Self::soft_down_last_good(peer);
+        if is_rfc1918_private_ip(ep.ip()) && !peer.ever_acked {
+            new_lg = new_lg.max(DEFAULT_MTU);
+        }
         peer.first_bad = peer.stable.max(new_lg + 1);
         peer.last_good = new_lg;
         peer.down_from_stable = Some(peer.stable);
@@ -640,7 +655,45 @@ impl PathMtuDiscovery {
         peer.inflight = None;
         peer.grace = None;
         events.softdown_events = events.softdown_events.saturating_add(1);
+        // Floor can close the window immediately; finish so Raise can retry
+        // (DownSearch is only scheduled when binary_target is Some).
+        if peer.window_closed(epsilon) {
+            Self::finish_downsearch_plateau(peer, now, raise_period, raise_step, downgrade_batches);
+        }
         self.recalc_min();
+    }
+
+    /// Lift stuck never-acked RFC1918 peers whose `last_good` fell below the
+    /// discovery floor (e.g. endpoint morph public → private after soft-downs).
+    fn heal_unacked_private_floor(&mut self, now: Instant) {
+        let raise_step = self.raise_step;
+        let mut healed = false;
+        let eps: Vec<SocketAddr> = self.peers.keys().copied().collect();
+        for ep in eps {
+            let Some(peer) = self.peers.get_mut(&ep) else {
+                continue;
+            };
+            if !is_rfc1918_private_ip(ep.ip()) || peer.ever_acked || peer.last_good >= DEFAULT_MTU {
+                continue;
+            }
+            peer.last_good = DEFAULT_MTU;
+            peer.stable = DEFAULT_MTU;
+            peer.first_bad = FIRST_BAD_SENTINEL;
+            peer.inflight = None;
+            peer.grace = None;
+            peer.search_gen = peer.search_gen.wrapping_add(1);
+            peer.phase = Phase::Plateau;
+            peer.next_raise_at = now;
+            peer.probes_used = 0;
+            peer.step = raise_step;
+            peer.down_from_stable = None;
+            peer.downsearch_got_ack = false;
+            peer.consecutive_lower_campaigns = 0;
+            healed = true;
+        }
+        if healed {
+            self.recalc_min();
+        }
     }
 
     fn apply_anomaly(&mut self, ep: SocketAddr, now: Instant, events: &mut PmtudEventCounts) {
@@ -681,6 +734,7 @@ impl PathMtuDiscovery {
         if self.pinned.is_some() {
             return (Vec::new(), events);
         }
+        self.heal_unacked_private_floor(now);
         let active: std::collections::HashSet<SocketAddr> = peers.iter().map(|p| p.addr).collect();
         let stale: Vec<SocketAddr> = self
             .peers
@@ -1052,6 +1106,7 @@ impl PathMtuDiscovery {
                 {
                     let was_recheck = peer.phase == Phase::Recheck;
                     peer.grace = None;
+                    peer.ever_acked = true;
                     Self::enter_plateau(peer, now, raise_period, raise_step, downgrade_batches);
                     events.late_ack_events = 1;
                     if was_recheck {
@@ -1078,6 +1133,7 @@ impl PathMtuDiscovery {
         }
         peer.inflight = None;
         peer.grace = None;
+        peer.ever_acked = true;
         let old_min = self.min_path_mtu;
         let phase = peer.phase;
 
@@ -1810,5 +1866,179 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].endpoint, ep);
         assert_eq!(snap[0].phase, "plateau");
+    }
+
+    fn private_peer() -> SocketAddr {
+        "192.168.0.100:7878".parse().unwrap()
+    }
+
+    #[test]
+    fn is_rfc1918_private_ip_predicate() {
+        assert!(is_rfc1918_private_ip("192.168.1.1".parse().unwrap()));
+        assert!(is_rfc1918_private_ip("10.0.0.1".parse().unwrap()));
+        assert!(is_rfc1918_private_ip("172.16.0.1".parse().unwrap()));
+        assert!(!is_rfc1918_private_ip("198.51.100.1".parse().unwrap()));
+        assert!(!is_rfc1918_private_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_rfc1918_private_ip("169.254.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn never_acked_private_softdown_floors_at_default_mtu() {
+        let mut p = PathMtuDiscovery::new();
+        let ep = private_peer();
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.last_good = DEFAULT_MTU;
+            st.stable = DEFAULT_MTU;
+            assert!(!st.ever_acked);
+        }
+        let mut ev = PmtudEventCounts::default();
+        p.apply_soft_down(ep, now, &mut ev);
+        assert_eq!(p.peers.get(&ep).unwrap().last_good, DEFAULT_MTU);
+        assert_eq!(ev.softdown_events, 1);
+    }
+
+    #[test]
+    fn public_softdown_still_reaches_min_mtu() {
+        let mut p = PathMtuDiscovery::new();
+        let ep = peer();
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.last_good = 700;
+            st.stable = 1400;
+        }
+        let mut ev = PmtudEventCounts::default();
+        p.apply_soft_down(ep, now, &mut ev);
+        assert_eq!(p.peers.get(&ep).unwrap().last_good, MIN_MTU);
+    }
+
+    #[test]
+    fn ever_acked_private_softdown_can_go_below_default() {
+        let mut p = PathMtuDiscovery::new();
+        let ep = private_peer();
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.ever_acked = true;
+            st.last_good = 1400;
+            st.stable = 1400;
+        }
+        let mut ev = PmtudEventCounts::default();
+        p.apply_soft_down(ep, now, &mut ev);
+        assert_eq!(p.peers.get(&ep).unwrap().last_good, 700);
+    }
+
+    #[test]
+    fn on_ack_sets_ever_acked() {
+        let mut p = PathMtuDiscovery::new();
+        p.confirm_count = 1;
+        let ep = private_peer();
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.next_raise_at = now;
+            st.first_bad = FIRST_BAD_SENTINEL;
+        }
+        let intents = tick_one(&mut p, now, ep);
+        assert!(!intents.is_empty());
+        let intent = intents[0];
+        let (ok, _, _) = p.on_ack(
+            intent.peer,
+            intent.size,
+            intent.probe_id,
+            intent.search_gen,
+            now,
+        );
+        assert!(ok);
+        assert!(p.peers.get(&ep).unwrap().ever_acked);
+    }
+
+    #[test]
+    fn never_acked_private_softdown_floor_then_raise_retries() {
+        let mut p = PathMtuDiscovery::new();
+        p.confirm_count = 1;
+        let ep = private_peer();
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.last_good = DEFAULT_MTU;
+            st.stable = DEFAULT_MTU;
+            st.first_bad = FIRST_BAD_SENTINEL;
+        }
+        let mut ev = PmtudEventCounts::default();
+        p.apply_soft_down(ep, now, &mut ev);
+        assert_eq!(p.peers.get(&ep).unwrap().last_good, DEFAULT_MTU);
+        // Floor closes the window → finish_downsearch immediately (Raise reopen).
+        let st = p.peers.get(&ep).unwrap();
+        assert!(matches!(st.phase, Phase::Plateau));
+        assert_eq!(st.first_bad, FIRST_BAD_SENTINEL);
+        assert_eq!(st.consecutive_lower_campaigns, 0);
+
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.next_raise_at = now;
+        }
+        let intents = tick_one(&mut p, now, ep);
+        assert!(!intents.is_empty());
+        assert!(intents[0].size > DEFAULT_MTU);
+    }
+
+    #[test]
+    fn heal_unacked_private_floor_restores_default() {
+        let mut p = PathMtuDiscovery::new();
+        let ep = private_peer();
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.last_good = MIN_MTU;
+            st.stable = MIN_MTU;
+            st.first_bad = MIN_MTU + 1;
+            st.phase = Phase::Plateau;
+            st.ever_acked = false;
+        }
+        p.recalc_min();
+        assert_eq!(p.min_mtu(), MIN_MTU);
+
+        let _ = tick_one(&mut p, now, ep);
+        let st = p.peers.get(&ep).unwrap();
+        assert_eq!(st.last_good, DEFAULT_MTU);
+        assert_eq!(st.stable, DEFAULT_MTU);
+        assert_eq!(st.first_bad, FIRST_BAD_SENTINEL);
+        assert!(matches!(
+            st.phase,
+            Phase::Raise | Phase::Plateau | Phase::Revalidate
+        ));
+        assert_eq!(p.min_mtu(), DEFAULT_MTU);
+    }
+
+    #[test]
+    fn heal_morph_shaped_stuck_private_after_public_like_softdowns() {
+        // Simulate endpoint that soft-downed to 576 before main-socket probes worked.
+        let mut p = PathMtuDiscovery::new();
+        let ep = private_peer();
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.last_good = MIN_MTU;
+            st.stable = 1400;
+            st.first_bad = 1401;
+            st.ever_acked = false;
+            st.phase = Phase::DownSearch;
+        }
+        p.heal_unacked_private_floor(now);
+        let st = p.peers.get(&ep).unwrap();
+        assert_eq!(st.last_good, DEFAULT_MTU);
+        assert_eq!(st.stable, DEFAULT_MTU);
+        assert!(matches!(st.phase, Phase::Plateau));
+        assert_eq!(st.next_raise_at, now);
     }
 }
