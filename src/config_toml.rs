@@ -18,7 +18,6 @@ pub(crate) struct NetworkConfigFile {
     pub session: SessionFile,
     #[serde(default)]
     pub peers: Vec<PeerInfo>,
-    pub parasitic: ParasiticFile,
     pub adapter: AdapterFile,
     pub pacing: PacingFile,
     pub apd: ApdFile,
@@ -45,12 +44,10 @@ impl Default for NetworkConfigFile {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub(crate) struct SessionFile {
-    pub server_name: String,
     pub network_id: String,
-    pub role: String,
     pub virtual_ip: String,
-    pub owner_real_ip: String,
-    pub owner_port: u16,
+    #[serde(default)]
+    pub vip_epoch: u64,
     pub listen_port: u16,
     pub node_id: String,
     pub crypto_key: String,
@@ -59,19 +56,15 @@ pub(crate) struct SessionFile {
     pub last_membership_hash: String,
     pub created_at: i64,
     pub subnet_prefix: u8,
-    pub owner_endpoints_cache: Vec<String>,
 }
 
 impl Default for SessionFile {
     fn default() -> Self {
         let d = NetworkConfig::default();
         Self {
-            server_name: d.server_name,
             network_id: d.network_id,
-            role: d.role,
             virtual_ip: d.virtual_ip,
-            owner_real_ip: d.owner_real_ip,
-            owner_port: d.owner_port,
+            vip_epoch: d.vip_epoch,
             listen_port: d.listen_port,
             node_id: d.node_id,
             crypto_key: d.crypto_key,
@@ -80,39 +73,6 @@ impl Default for SessionFile {
             last_membership_hash: d.last_membership_hash,
             created_at: d.created_at,
             subnet_prefix: d.subnet_prefix,
-            owner_endpoints_cache: d.owner_endpoints_cache,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct ParasiticFile {
-    pub parasitic_enabled: bool,
-    pub parasitic_peer_vip: String,
-    pub parasitic_self_vip: String,
-    pub parasitic_peer_port: u16,
-    pub parasitic_peer_node_id: String,
-    pub parasitic_self_is_owner: bool,
-    #[serde(default = "default_parasitic_use_public_toml")]
-    pub parasitic_use_public: bool,
-}
-
-fn default_parasitic_use_public_toml() -> bool {
-    true
-}
-
-impl Default for ParasiticFile {
-    fn default() -> Self {
-        let d = NetworkConfig::default();
-        Self {
-            parasitic_enabled: d.parasitic_enabled,
-            parasitic_peer_vip: d.parasitic_peer_vip,
-            parasitic_self_vip: d.parasitic_self_vip,
-            parasitic_peer_port: d.parasitic_peer_port,
-            parasitic_peer_node_id: d.parasitic_peer_node_id,
-            parasitic_self_is_owner: d.parasitic_self_is_owner,
-            parasitic_use_public: d.parasitic_use_public,
         }
     }
 }
@@ -329,12 +289,9 @@ impl From<&NetworkConfig> for NetworkConfigFile {
     fn from(cfg: &NetworkConfig) -> Self {
         Self {
             session: SessionFile {
-                server_name: cfg.server_name.clone(),
                 network_id: cfg.network_id.clone(),
-                role: cfg.role.clone(),
                 virtual_ip: cfg.virtual_ip.clone(),
-                owner_real_ip: cfg.owner_real_ip.clone(),
-                owner_port: cfg.owner_port,
+                vip_epoch: cfg.vip_epoch,
                 listen_port: cfg.listen_port,
                 node_id: cfg.node_id.clone(),
                 crypto_key: cfg.crypto_key.clone(),
@@ -343,18 +300,8 @@ impl From<&NetworkConfig> for NetworkConfigFile {
                 last_membership_hash: cfg.last_membership_hash.clone(),
                 created_at: cfg.created_at,
                 subnet_prefix: cfg.subnet_prefix,
-                owner_endpoints_cache: cfg.owner_endpoints_cache.clone(),
             },
             peers: cfg.peers.clone(),
-            parasitic: ParasiticFile {
-                parasitic_enabled: cfg.parasitic_enabled,
-                parasitic_peer_vip: cfg.parasitic_peer_vip.clone(),
-                parasitic_self_vip: cfg.parasitic_self_vip.clone(),
-                parasitic_peer_port: cfg.parasitic_peer_port,
-                parasitic_peer_node_id: cfg.parasitic_peer_node_id.clone(),
-                parasitic_self_is_owner: cfg.parasitic_self_is_owner,
-                parasitic_use_public: cfg.parasitic_use_public,
-            },
             adapter: AdapterFile {
                 udp_sndbuf: cfg.udp_sndbuf,
                 udp_rcvbuf: cfg.udp_rcvbuf,
@@ -447,12 +394,9 @@ impl From<&NetworkConfig> for NetworkConfigFile {
 impl From<NetworkConfigFile> for NetworkConfig {
     fn from(file: NetworkConfigFile) -> Self {
         let mut cfg = NetworkConfig::default();
-        cfg.server_name = file.session.server_name;
         cfg.network_id = file.session.network_id;
-        cfg.role = file.session.role;
         cfg.virtual_ip = file.session.virtual_ip;
-        cfg.owner_real_ip = file.session.owner_real_ip;
-        cfg.owner_port = file.session.owner_port;
+        cfg.vip_epoch = file.session.vip_epoch;
         cfg.listen_port = file.session.listen_port;
         cfg.node_id = file.session.node_id;
         cfg.crypto_key = file.session.crypto_key;
@@ -461,15 +405,7 @@ impl From<NetworkConfigFile> for NetworkConfig {
         cfg.last_membership_hash = file.session.last_membership_hash;
         cfg.created_at = file.session.created_at;
         cfg.subnet_prefix = file.session.subnet_prefix;
-        cfg.owner_endpoints_cache = file.session.owner_endpoints_cache;
         cfg.peers = file.peers;
-        cfg.parasitic_enabled = file.parasitic.parasitic_enabled;
-        cfg.parasitic_peer_vip = file.parasitic.parasitic_peer_vip;
-        cfg.parasitic_self_vip = file.parasitic.parasitic_self_vip;
-        cfg.parasitic_peer_port = file.parasitic.parasitic_peer_port;
-        cfg.parasitic_peer_node_id = file.parasitic.parasitic_peer_node_id;
-        cfg.parasitic_self_is_owner = file.parasitic.parasitic_self_is_owner;
-        cfg.parasitic_use_public = file.parasitic.parasitic_use_public;
         cfg.udp_sndbuf = file.adapter.udp_sndbuf;
         cfg.udp_rcvbuf = file.adapter.udp_rcvbuf;
         cfg.adapter_mtu = file.adapter.adapter_mtu;

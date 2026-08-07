@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -11,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config_toml::{encode_network_config_toml, parse_network_config_toml};
 
-/// Joiner-only durable peer roster cap (owner uses unbounded `add_peer`).
-pub const JOINER_ROSTER_MAX: usize = 64;
+/// Durable member peer roster cap (FIFO).
+pub const MEMBER_ROSTER_MAX: usize = 64;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 pub struct PeerInfo {
@@ -20,41 +19,24 @@ pub struct PeerInfo {
     pub name: String,
     pub virtual_ip: String,
     pub real_ip: String,
+    /// Last known claim epoch for this peer (serde default 0).
+    #[serde(default)]
+    pub vip_epoch: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct NetworkConfig {
-    pub server_name: String,
     pub network_id: String,
-    pub role: String,
     pub virtual_ip: String,
-    pub owner_real_ip: String,
-    pub owner_port: u16,
+    /// Monotonic claim epoch; bumped when this node loses a VIP conflict and rerolls.
+    #[serde(default)]
+    pub vip_epoch: u64,
     pub listen_port: u16,
     pub node_id: String,
     pub crypto_key: String,
     #[serde(default)]
     pub public_invite_code: String,
-    #[serde(default)]
-    pub parasitic_enabled: bool,
-    #[serde(default)]
-    pub parasitic_peer_vip: String,
-    #[serde(default)]
-    pub parasitic_self_vip: String,
-    #[serde(default)]
-    pub parasitic_peer_port: u16,
-
-    #[serde(default)]
-    pub parasitic_peer_node_id: String,
-
-    #[serde(default)]
-    pub parasitic_self_is_owner: bool,
-
-    /// `true` = Public parasitic (VIP + STUN); `false` = LAN parasitic (no STUN/UPnP).
-    #[serde(default = "default_parasitic_use_public")]
-    pub parasitic_use_public: bool,
     pub peers: Vec<PeerInfo>,
-    pub owner_endpoints_cache: Vec<String>,
     pub membership_version: u64,
     pub last_membership_hash: String,
     pub created_at: i64,
@@ -228,12 +210,8 @@ fn default_subnet_prefix() -> u8 {
     24
 }
 
-fn default_parasitic_use_public() -> bool {
-    true
-}
-
 fn default_pace_rate_mode() -> String {
-    "pps".to_string()
+    "bytes".to_string()
 }
 
 fn default_pace_target_bps() -> i64 {
@@ -409,25 +387,14 @@ impl Default for NetworkConfig {
         const UDP_SNDBUF_DEFAULT: i32 = 2 * 1024 * 1024;
         const UDP_RCVBUF_DEFAULT: i32 = 2 * 1024 * 1024;
         Self {
-            server_name: String::new(),
             network_id: String::new(),
-            role: String::new(),
             virtual_ip: String::new(),
-            owner_real_ip: String::new(),
-            owner_port: 0,
+            vip_epoch: 0,
             listen_port: 0,
             node_id: String::new(),
             crypto_key: String::new(),
             public_invite_code: String::new(),
-            parasitic_enabled: false,
-            parasitic_peer_vip: String::new(),
-            parasitic_self_vip: String::new(),
-            parasitic_peer_port: 0,
-            parasitic_peer_node_id: String::new(),
-            parasitic_self_is_owner: false,
-            parasitic_use_public: true,
             peers: Vec::new(),
-            owner_endpoints_cache: Vec::new(),
             membership_version: 0,
             last_membership_hash: String::new(),
             created_at: 0,
@@ -575,125 +542,6 @@ pub struct ConfigManager {
     disk_fp: Arc<Mutex<Option<u64>>>,
 }
 
-#[derive(Default)]
-pub struct IPPool {
-    prefix: Option<[u8; 3]>,
-    allocated: HashMap<String, String>,
-    vip_to_node: HashMap<String, String>,
-    used: HashSet<u8>,
-}
-
-impl IPPool {
-    pub fn new(owner_vip: &str) -> Self {
-        let mut pool = Self::default();
-        let octets: Vec<u8> = owner_vip
-            .split('.')
-            .filter_map(|v| v.parse::<u8>().ok())
-            .collect();
-        if octets.len() == 4 {
-            pool.prefix = Some([octets[0], octets[1], octets[2]]);
-            pool.used.insert(1);
-        }
-        pool
-    }
-
-    fn remove_octet_from_used(&mut self, vip: &str) {
-        if let Some(last) = vip
-            .split('.')
-            .next_back()
-            .and_then(|v| v.parse::<u8>().ok())
-        {
-            self.used.remove(&last);
-        }
-    }
-
-    fn remove_allocated_entries_for_vip(&mut self, vip: &str) {
-        let stale: Vec<String> = self
-            .allocated
-            .iter()
-            .filter(|(_, v)| v.as_str() == vip)
-            .map(|(n, _)| n.clone())
-            .collect();
-        for n in stale {
-            self.allocated.remove(&n);
-        }
-    }
-
-    pub fn allocate(&mut self, node_id: &str) -> Option<String> {
-        if node_id.trim().is_empty() {
-            return None;
-        }
-        if let Some(v) = self.allocated.get(node_id) {
-            self.vip_to_node
-                .entry(v.clone())
-                .or_insert_with(|| node_id.to_string());
-            return Some(v.clone());
-        }
-        let prefix = self.prefix?;
-        for h in 2..=254u8 {
-            if self.used.insert(h) {
-                let vip = format!("{}.{}.{}.{}", prefix[0], prefix[1], prefix[2], h);
-                self.allocated.insert(node_id.to_string(), vip.clone());
-                self.vip_to_node.insert(vip.clone(), node_id.to_string());
-                return Some(vip);
-            }
-        }
-        None
-    }
-
-    pub fn release(&mut self, vip: &str) {
-        let _ = self.vip_to_node.remove(vip);
-        self.remove_allocated_entries_for_vip(vip);
-        self.remove_octet_from_used(vip);
-    }
-
-    pub fn mark_used(&mut self, vip: &str) {
-        if let Some(last) = vip
-            .split('.')
-            .next_back()
-            .and_then(|v| v.parse::<u8>().ok())
-        {
-            self.used.insert(last);
-        }
-    }
-
-    pub fn ensure_allocated(&mut self, node_id: &str, vip: &str) {
-        let node_id = node_id.trim();
-        let vip = vip.trim();
-        if node_id.is_empty() || vip.is_empty() {
-            return;
-        }
-        let node_owned = node_id.to_string();
-        let vip_owned = vip.to_string();
-
-        if let Some(old_node) = self.vip_to_node.get(vip).cloned() {
-            if old_node != node_owned {
-                self.remove_allocated_entries_for_vip(vip);
-                self.vip_to_node.remove(vip);
-            }
-        }
-
-        if let Some(prev_vip) = self.allocated.get(&node_owned).cloned() {
-            if prev_vip != vip_owned {
-                if self
-                    .vip_to_node
-                    .get(&prev_vip)
-                    .map(|n| n == &node_owned)
-                    .unwrap_or(false)
-                {
-                    self.vip_to_node.remove(&prev_vip);
-                }
-                self.remove_allocated_entries_for_vip(&prev_vip);
-                self.remove_octet_from_used(&prev_vip);
-            }
-        }
-
-        self.allocated.insert(node_owned.clone(), vip_owned.clone());
-        self.vip_to_node.insert(vip_owned.clone(), node_owned);
-        self.mark_used(&vip_owned);
-    }
-}
-
 impl ConfigManager {
     pub fn new(path: PathBuf) -> Arc<Self> {
         let (save_tx, save_rx) = mpsc::channel::<NetworkConfig>();
@@ -779,9 +627,34 @@ impl ConfigManager {
         self.update(|cfg| cfg.peers.retain(|p| p.virtual_ip != vip));
     }
 
-    /// Joiner roster: VIP-keyed upsert with dirty no-op and FIFO cap.
-    pub fn upsert_joiner_roster_peer(&self, peer: PeerInfo) {
+    /// Member roster: VIP-keyed upsert with dirty no-op and FIFO cap.
+    pub fn upsert_member_roster_peer(&self, peer: PeerInfo) {
         let snap = self.snapshot();
+        // Prefer node_id as stable roster key so VIP rerolls replace the same row.
+        if !peer.node_id.is_empty() {
+            if let Some(existing) = snap.peers.iter().find(|p| p.node_id == peer.node_id) {
+                if existing == &peer {
+                    return;
+                }
+                let peer = peer.clone();
+                self.update(move |cfg| {
+                    if let Some(slot) = cfg.peers.iter_mut().find(|p| p.node_id == peer.node_id) {
+                        *slot = peer;
+                    }
+                });
+                return;
+            }
+            self.update(move |cfg| {
+                // Drop any stale VIP-keyed duplicate for this node.
+                cfg.peers
+                    .retain(|p| p.node_id != peer.node_id && p.virtual_ip != peer.virtual_ip);
+                while cfg.peers.len() >= MEMBER_ROSTER_MAX {
+                    cfg.peers.remove(0);
+                }
+                cfg.peers.push(peer);
+            });
+            return;
+        }
         if let Some(existing) = snap.peers.iter().find(|p| p.virtual_ip == peer.virtual_ip) {
             if existing == &peer {
                 return;
@@ -799,15 +672,15 @@ impl ConfigManager {
             return;
         }
         self.update(move |cfg| {
-            while cfg.peers.len() >= JOINER_ROSTER_MAX {
+            while cfg.peers.len() >= MEMBER_ROSTER_MAX {
                 cfg.peers.remove(0);
             }
             cfg.peers.push(peer);
         });
     }
 
-    /// Joiner roster remove; no-op if VIP absent.
-    pub fn remove_joiner_roster_vip(&self, vip: &str) {
+    /// Member roster remove; no-op if VIP absent.
+    pub fn remove_member_roster_vip(&self, vip: &str) {
         if !self.snapshot().peers.iter().any(|p| p.virtual_ip == vip) {
             return;
         }
@@ -873,10 +746,6 @@ impl ConfigManager {
         self.snapshot().network_id.clone()
     }
 
-    pub fn get_role(&self) -> String {
-        self.snapshot().role.clone()
-    }
-
     pub fn get_crypto_key_hex(&self) -> String {
         self.snapshot().crypto_key.clone()
     }
@@ -887,17 +756,13 @@ impl ConfigManager {
 
     pub fn set_network_basics(
         &self,
-        server_name: String,
         network_id: String,
-        role: String,
         virtual_ip: String,
         node_id: String,
         listen_port: u16,
     ) {
         self.update(|cfg| {
-            cfg.server_name = server_name;
             cfg.network_id = network_id;
-            cfg.role = role;
             cfg.virtual_ip = virtual_ip;
             cfg.node_id = node_id;
             cfg.listen_port = listen_port;
@@ -997,7 +862,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn joiner_roster_dirty_upsert_skips_unchanged() {
+    fn member_roster_dirty_upsert_skips_unchanged() {
         let path = std::env::temp_dir().join(format!(
             "mint-roster-dirty-{}-{}.toml",
             std::process::id(),
@@ -1012,15 +877,48 @@ mod tests {
             name: "n1".into(),
             virtual_ip: "10.0.0.5".into(),
             real_ip: "1.2.3.4:5000".into(),
+            vip_epoch: 0,
         };
-        mgr.upsert_joiner_roster_peer(peer.clone());
-        mgr.upsert_joiner_roster_peer(peer);
+        mgr.upsert_member_roster_peer(peer.clone());
+        mgr.upsert_member_roster_peer(peer);
         assert_eq!(mgr.snapshot().peers.len(), 1);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn joiner_roster_fifo_drops_oldest_on_new_vip() {
+    fn member_roster_upsert_replaces_same_node_id_on_vip_change() {
+        let path = std::env::temp_dir().join(format!(
+            "mint-roster-nodeid-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let mgr = ConfigManager::new(path.clone());
+        mgr.upsert_member_roster_peer(PeerInfo {
+            node_id: "n1".into(),
+            name: "n1".into(),
+            virtual_ip: "10.0.0.5".into(),
+            real_ip: "1.2.3.4:5000".into(),
+            vip_epoch: 0,
+        });
+        mgr.upsert_member_roster_peer(PeerInfo {
+            node_id: "n1".into(),
+            name: "n1".into(),
+            virtual_ip: "10.0.0.9".into(),
+            real_ip: "1.2.3.4:5000".into(),
+            vip_epoch: 1,
+        });
+        let snap = mgr.snapshot();
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(snap.peers[0].virtual_ip, "10.0.0.9");
+        assert_eq!(snap.peers[0].vip_epoch, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn member_roster_fifo_drops_oldest_on_new_vip() {
         let path = std::env::temp_dir().join(format!(
             "mint-roster-fifo-{}-{}.toml",
             std::process::id(),
@@ -1030,23 +928,25 @@ mod tests {
                 .unwrap_or(0)
         ));
         let mgr = ConfigManager::new(path.clone());
-        for i in 0..JOINER_ROSTER_MAX {
-            mgr.upsert_joiner_roster_peer(PeerInfo {
+        for i in 0..MEMBER_ROSTER_MAX {
+            mgr.upsert_member_roster_peer(PeerInfo {
                 node_id: format!("n{i}"),
                 name: format!("n{i}"),
                 virtual_ip: format!("10.0.0.{}", i + 2),
                 real_ip: format!("1.2.3.4:{i}"),
+                vip_epoch: 0,
             });
         }
-        assert_eq!(mgr.snapshot().peers.len(), JOINER_ROSTER_MAX);
-        mgr.upsert_joiner_roster_peer(PeerInfo {
+        assert_eq!(mgr.snapshot().peers.len(), MEMBER_ROSTER_MAX);
+        mgr.upsert_member_roster_peer(PeerInfo {
             node_id: "new".into(),
             name: "new".into(),
             virtual_ip: "10.0.0.99".into(),
             real_ip: "9.9.9.9:1".into(),
+            vip_epoch: 0,
         });
         let snap = mgr.snapshot();
-        assert_eq!(snap.peers.len(), JOINER_ROSTER_MAX);
+        assert_eq!(snap.peers.len(), MEMBER_ROSTER_MAX);
         assert!(!snap.peers.iter().any(|p| p.virtual_ip == "10.0.0.2"));
         assert!(snap.peers.iter().any(|p| p.virtual_ip == "10.0.0.99"));
         let _ = std::fs::remove_file(path);
@@ -1092,105 +992,6 @@ mod tests {
         }
         assert_eq!(persisted, Some(expected));
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn ippool_release_frees_mark_used_octet() {
-        let mut pool = IPPool::new("10.0.0.1");
-        pool.mark_used("10.0.0.5");
-        assert!(pool.used.contains(&5));
-        pool.release("10.0.0.5");
-        assert!(!pool.used.contains(&5));
-    }
-
-    #[test]
-    fn ippool_release_mark_used_then_allocate_reuses_octet() {
-        let mut pool = IPPool::new("10.0.0.1");
-        pool.allocate("a").expect("a");
-        pool.allocate("b").expect("b");
-        pool.allocate("c").expect("c");
-        pool.mark_used("10.0.0.5");
-        pool.release("10.0.0.5");
-        let vip = pool.allocate("n1").expect("alloc after release");
-        assert_eq!(vip, "10.0.0.5");
-    }
-
-    #[test]
-    fn ippool_release_frees_allocated_octet() {
-        let mut pool = IPPool::new("10.0.0.1");
-        let vip = pool.allocate("n1").expect("alloc");
-        pool.release(&vip);
-        let vip2 = pool.allocate("n2").expect("realloc");
-        assert_eq!(vip, vip2);
-    }
-
-    #[test]
-    fn ippool_duplicate_release_is_safe() {
-        let mut pool = IPPool::new("10.0.0.1");
-        let vip = pool.allocate("node-z").expect("alloc");
-        pool.release(&vip);
-        pool.release(&vip);
-        let vip2 = pool.allocate("node-y").expect("realloc");
-        assert_eq!(vip, vip2);
-    }
-
-    #[test]
-    fn ippool_ensure_allocated_updates_all_maps() {
-        let mut pool = IPPool::new("10.0.0.1");
-        pool.ensure_allocated("node-a", "10.0.0.7");
-        assert_eq!(pool.allocated.get("node-a"), Some(&"10.0.0.7".to_string()));
-        assert_eq!(
-            pool.vip_to_node.get("10.0.0.7"),
-            Some(&"node-a".to_string())
-        );
-        assert!(pool.used.contains(&7));
-        pool.release("10.0.0.7");
-        assert!(!pool.used.contains(&7));
-        assert!(pool.allocated.get("node-a").is_none());
-        assert!(pool.vip_to_node.get("10.0.0.7").is_none());
-    }
-
-    #[test]
-    fn ippool_ensure_allocated_evicts_prior_owner_same_vip() {
-        let mut pool = IPPool::new("10.0.0.1");
-        let vip = pool.allocate("node-a").expect("alloc a");
-        assert_eq!(vip, "10.0.0.2");
-        pool.ensure_allocated("node-b", "10.0.0.2");
-        assert!(pool.allocated.get("node-a").is_none());
-        assert_eq!(pool.allocated.get("node-b"), Some(&"10.0.0.2".to_string()));
-        assert_eq!(
-            pool.vip_to_node.get("10.0.0.2"),
-            Some(&"node-b".to_string())
-        );
-        assert_eq!(pool.allocate("node-a").expect("re-a"), "10.0.0.3");
-    }
-
-    #[test]
-    fn ippool_ensure_allocated_node_changes_vip_frees_old_octet() {
-        let mut pool = IPPool::new("10.0.0.1");
-        pool.ensure_allocated("node-x", "10.0.0.5");
-        assert!(pool.used.contains(&5));
-        pool.ensure_allocated("node-x", "10.0.0.6");
-        assert!(!pool.used.contains(&5));
-        assert!(pool.used.contains(&6));
-        assert_eq!(pool.allocated.get("node-x"), Some(&"10.0.0.6".to_string()));
-        assert_eq!(
-            pool.vip_to_node.get("10.0.0.6"),
-            Some(&"node-x".to_string())
-        );
-        assert!(pool.vip_to_node.get("10.0.0.5").is_none());
-    }
-
-    #[test]
-    fn ippool_release_removes_phantom_same_vip() {
-        let mut pool = IPPool::new("10.0.0.1");
-        pool.allocate("node-a").expect("a");
-        pool.ensure_allocated("node-b", "10.0.0.2");
-        pool.allocated
-            .insert("phantom".to_string(), "10.0.0.2".to_string());
-        pool.release("10.0.0.2");
-        assert!(pool.allocated.values().all(|v| v.as_str() != "10.0.0.2"));
-        assert!(!pool.used.contains(&2));
     }
 
     #[test]
@@ -1243,12 +1044,12 @@ mod tests {
             "probe_sizes must not appear in current config: {raw}"
         );
         assert!(
-            raw.contains("apd_low_watermark = 0.1\n")
-                || raw.contains("apd_low_watermark = 0.1\r\n"),
+            raw.contains("apd_low_watermark = 0.02\n")
+                || raw.contains("apd_low_watermark = 0.02\r\n"),
             "apd_low_watermark must not dump f32 noise: {raw}"
         );
         assert!(
-            !raw.contains("0.10000000149011612"),
+            !raw.contains("0.019999999552965164"),
             "f32 binary expansion must not appear"
         );
         assert!(
@@ -1261,12 +1062,8 @@ mod tests {
     fn network_config_toml_loads_sectioned_tuning_keys() {
         let sectioned = r#"
 [session]
-server_name = "s"
 network_id = "n"
-role = "peer"
 virtual_ip = "10.0.0.2"
-owner_real_ip = "1.2.3.4"
-owner_port = 7878
 listen_port = 7878
 node_id = "id"
 crypto_key = "aa"
@@ -1308,6 +1105,8 @@ max_direct_retry_per_tick = 64
 punch_stage2_pps = 200
 "#;
         let cfg = parse_network_config_toml(sectioned).expect("sectioned");
+        assert_eq!(cfg.virtual_ip, "10.0.0.2");
+        assert_eq!(cfg.crypto_key, "aa");
         assert_eq!(cfg.advanced.timers.keepalive_secs, 9);
         assert_eq!(
             cfg.advanced.fec.shard_payload_size,
@@ -1326,12 +1125,8 @@ punch_stage2_pps = 200
     fn network_config_toml_rejects_unknown_root_table() {
         let nested = r#"
 [session]
-server_name = "s"
 network_id = "n"
-role = "peer"
 virtual_ip = "10.0.0.2"
-owner_real_ip = "1.2.3.4"
-owner_port = 7878
 listen_port = 7878
 node_id = "id"
 crypto_key = "aa"
@@ -1351,12 +1146,8 @@ keepalive_secs = 9
     fn network_config_toml_partial_sections_clamp_on_load() {
         let raw = r#"
 [session]
-server_name = "s"
 network_id = "n"
-role = "peer"
 virtual_ip = "10.0.0.2"
-owner_real_ip = "1.2.3.4"
-owner_port = 7878
 listen_port = 7878
 node_id = "id"
 crypto_key = "aa"
@@ -1379,11 +1170,30 @@ shard_payload_size = 9999
     }
 
     #[test]
+    fn network_config_toml_ignores_unknown_session_role_key() {
+        let raw = r#"
+[session]
+network_id = "n"
+role = "peer"
+virtual_ip = "10.0.0.2"
+listen_port = 7878
+node_id = "id"
+crypto_key = "aa"
+"#;
+        let cfg = parse_network_config_toml(raw).expect("stale role key ignored");
+        assert_eq!(cfg.virtual_ip, "10.0.0.2");
+        assert_eq!(cfg.crypto_key, "aa");
+        let encoded = encode_network_config_toml(&cfg).expect("encode");
+        assert!(
+            !encoded.contains("role"),
+            "role must not be rewritten: {encoded}"
+        );
+    }
+
+    #[test]
     fn reset_performance_fields_preserves_identity() {
         let mut cfg = NetworkConfig::default();
-        cfg.server_name = "srv".into();
         cfg.network_id = "net-1".into();
-        cfg.role = "owner".into();
         cfg.virtual_ip = "10.0.0.1".into();
         cfg.node_id = "node-a".into();
         cfg.crypto_key = "deadbeef".into();
@@ -1393,20 +1203,16 @@ shard_payload_size = 9999
             name: "peer".into(),
             virtual_ip: "10.0.0.2".into(),
             real_ip: "1.2.3.4:7878".into(),
+            vip_epoch: 0,
         });
         cfg.membership_version = 42;
         cfg.public_invite_code = "invite".into();
-        cfg.parasitic_enabled = true;
-        cfg.parasitic_use_public = false;
-
         cfg.udp_sndbuf = 1;
         cfg.pace_tick_us = 9999;
         cfg.cpu_affinity = "2-4".into();
         cfg.process_priority_level = 3;
 
-        let server_name = cfg.server_name.clone();
         let network_id = cfg.network_id.clone();
-        let role = cfg.role.clone();
         let virtual_ip = cfg.virtual_ip.clone();
         let node_id = cfg.node_id.clone();
         let crypto_key = cfg.crypto_key.clone();
@@ -1415,9 +1221,6 @@ shard_payload_size = 9999
         let peer_node = cfg.peers[0].node_id.clone();
         let membership_version = cfg.membership_version;
         let public_invite_code = cfg.public_invite_code.clone();
-        let parasitic_enabled = cfg.parasitic_enabled;
-        let parasitic_use_public = cfg.parasitic_use_public;
-
         cfg.reset_performance_fields();
 
         let d = NetworkConfig::default();
@@ -1426,9 +1229,7 @@ shard_payload_size = 9999
         assert_eq!(cfg.cpu_affinity, d.cpu_affinity);
         assert_eq!(cfg.process_priority_level, d.process_priority_level);
 
-        assert_eq!(cfg.server_name, server_name);
         assert_eq!(cfg.network_id, network_id);
-        assert_eq!(cfg.role, role);
         assert_eq!(cfg.virtual_ip, virtual_ip);
         assert_eq!(cfg.node_id, node_id);
         assert_eq!(cfg.crypto_key, crypto_key);
@@ -1437,8 +1238,6 @@ shard_payload_size = 9999
         assert_eq!(cfg.peers[0].node_id, peer_node);
         assert_eq!(cfg.membership_version, membership_version);
         assert_eq!(cfg.public_invite_code, public_invite_code);
-        assert_eq!(cfg.parasitic_enabled, parasitic_enabled);
-        assert_eq!(cfg.parasitic_use_public, parasitic_use_public);
     }
 
     #[test]
@@ -1557,12 +1356,8 @@ shard_payload_size = 9999
     fn network_config_toml_omitted_decentralized_fields_use_defaults() {
         let raw = r#"
 [session]
-server_name = "s"
 network_id = "n"
-role = "peer"
 virtual_ip = "10.0.0.2"
-owner_real_ip = "1.2.3.4"
-owner_port = 7878
 listen_port = 7878
 node_id = "id"
 crypto_key = "aa"
@@ -1654,8 +1449,8 @@ pace_max_queue_packets = 64
         let cfg = NetworkConfig::default();
         assert!(cfg.shed_enabled);
         assert_eq!(cfg.shed_max_sojourn_ms, 30);
-        assert!((cfg.shed_min_fill - 0.3).abs() < f32::EPSILON);
-        assert_eq!(cfg.shed_max_per_tick, 1);
+        assert!((cfg.shed_min_fill - 0.1).abs() < f32::EPSILON);
+        assert_eq!(cfg.shed_max_per_tick, 2);
 
         let raw = encode_network_config_toml(&cfg).expect("encode");
         let back = parse_network_config_toml(&raw).expect("decode");

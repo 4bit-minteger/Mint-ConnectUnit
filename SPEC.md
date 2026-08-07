@@ -12,7 +12,7 @@ Legend for tuning notes: **↑** = increase value in code/config; **↓** = decr
 2. [Runtime model](#runtime-model)
 3. [Source layout](#source-layout)
 4. [Startup sequence](#startup-sequence)
-5. [Roles: owner vs peer](#roles-owner-vs-peer)
+5. [FloatUnit members](#floatunit-members)
 6. [Wire contract](#wire-contract)
 7. [Wire protocol (tags)](#wire-protocol-tags)
 8. [Data plane path](#data-plane-path)
@@ -24,9 +24,9 @@ Legend for tuning notes: **↑** = increase value in code/config; **↓** = decr
 14. [FEC (forward error correction)](#fec-forward-error-correction)
 15. [Reliable control transport](#reliable-control-transport)
 16. [PMTUD](#pmtud)
-17. [NAT, hole punch, and parasitic join](#nat-hole-punch-and-parasitic-join)
+17. [NAT, hole punch, and LAN assist](#nat-hole-punch-and-lan-assist)
 18. [TUN / Wintun](#tun--wintun)
-19. [Membership sync (MSYN)](#membership-sync-msyn)
+19. [Membership gossip (MCLG)](#membership-gossip-mclg)
 20. [Broadcast and relay](#broadcast-and-relay)
 21. [CLI commands](#cli-commands)
 22. [Persistence](#persistence)
@@ -63,7 +63,6 @@ flowchart TB
   end
   subgraph io["I/O"]
     UDP["UDP socket listen ≥7878"]
-    PROBE["PMTUD probe UDP socket"]
     TUNR["Wintun read loop → mpsc (tun_from_adapter_queue_packets)"]
     TUNI["broadcast inject → Wintun write"]
   end
@@ -73,7 +72,6 @@ flowchart TB
   end
   ENG <--> UDP
   PACW -->|"try_send_to"| UDP
-  ENG <--> PROBE
   TUNR --> ENG
   ENG --> TUNI
   CLI --> CFG
@@ -82,7 +80,7 @@ flowchart TB
   ENG --> STUN_UPnP
 ```
 
-**Central idea:** one **`P2PEngine`** task owns RX, decrypt, routing/session state, and encrypt; a dedicated **`mint-fec-tx`** OS thread owns per-dest Reed–Solomon encode; a dedicated **`mint-pacing`** OS thread owns **`PacingEngine`** (queues, tick, paced UDP send). The **`Cli`** mutates configuration and sends **`EngineCmd`** messages. **`RoutingTable`** (shared `Arc<RwLock<>>`) maps **virtual IPs (VIP)** to endpoints and path quality. The **owner** allocates VIPs, holds the canonical peer list, and relays traffic when peers cannot talk directly.
+**Central idea:** one **`P2PEngine`** task owns RX, decrypt, routing/session state, and encrypt; a dedicated **`mint-fec-tx`** OS thread owns per-dest Reed–Solomon encode; a dedicated **`mint-pacing`** OS thread owns **`PacingEngine`** (queues, tick, paced UDP send). The **`Cli`** mutates configuration and sends **`EngineCmd`** messages. **`RoutingTable`** (shared `Arc<RwLock<>>`) maps **virtual IPs (VIP)** to endpoints and path quality. Equal FloatUnit **members** self-claim VIPs, gossip membership, and use a quality-based one-hop hub relay when peers cannot talk directly.
 
 ---
 
@@ -109,8 +107,8 @@ flowchart TB
 |------|----------------|
 | `src/main.rs` | Process wiring: admin check, UDP bind, load cache, spawn engine + CLI, endpoint-cache worker |
 | `src/lib.rs` | Crate module exports |
-| `src/cli.rs` | Terminal UI, create/join, parasitic LAN join, tuning commands, NAT punch orchestration |
-| `src/net/engine.rs` | **`P2PEngine`**: recv loop, TUN egress/ingress, control dispatch, STUN, MSYN, join/kick, FEC/reliable integration; encrypt then hand off to pacing worker |
+| `src/cli.rs` | Terminal UI, mint/join, LAN assist, tuning commands, NAT punch orchestration |
+| `src/net/engine.rs` | **`P2PEngine`**: recv loop, TUN egress/ingress, control dispatch, STUN, claim gossip, join, FEC/reliable integration; encrypt then hand off to pacing worker |
 | `src/net/packet.rs` | 4-byte tag constants, compact types, `frame_with_tag` / `parse_tag` |
 | `src/net/pacing.rs` | Send queues, token bucket, DRR, APD drain mode (`PacingEngine` algorithm) |
 | `src/net/pacing_worker.rs` | OS thread owning `PacingEngine`: command FIFO, tick, UDP send, `PacingObs` / `TickDone` |
@@ -119,13 +117,12 @@ flowchart TB
 | `src/net/fec_tx_worker.rs` | OS thread owning TX `FecEncoder`s: Push/control, Encoded→pacing, Passthrough events |
 | `src/net/reliable.rs` | MREL / MACK state machine |
 | `src/net/retransmit.rs` | Direct retransmit bypass rate limiter (`rtrx-s`) |
-| `src/net/msyn_sync.rs` | Pure MSYN v4 body builders, sharding, assemble helpers, and sync advance rules |
-| `src/net/pmtud_probe.rs` | Separate socket for PMTUD probe traffic |
+| `src/net/claim.rs` / `src/net/claim_gossip.rs` | Self-claim VIP helpers + claim-gossip merge / leave tombstones |
 | `src/net/punch_workflow.rs` | Canonical 3-stage hole-punch workflow |
 | `src/routing.rs` | Per-VIP routes, path candidates, failover, tombstones |
 | `src/crypto.rs` | AEGIS-128L data + control framing, invites, HKDF derivation, counter anti-replay |
 | `src/netinfo.rs` | `NetInfo/` paths next to executable (`config.toml`, `peer_cache.json`) |
-| `src/config.rs` | `NetInfo/config.toml` schema, `IPPool` for owner VIP allocation |
+| `src/config.rs` | `NetInfo/config.toml` schema, peer roster, `vip_epoch` |
 | `src/peer_cache.rs` | Serialize/deserialize learned endpoints |
 | `src/pmtud.rs` | Path MTU discovery state machine |
 | `src/bcast.rs` | Broadcast deduplication (~2s TTL) |
@@ -150,24 +147,26 @@ Largest behavioural surface: `cli.rs` and `net/engine.rs`. Trace bugs from CLI a
 3. Apply process **priority** and **CPU affinity** from snapshot.
 4. Ensure **`wintun.dll`** beside executable (Windows).
 5. Bind **UDP** on `max(listen_port, 7878)` with configured snd/rcv buffer sizes.
-6. Create empty **`RoutingTable`**. For **peer** role, hydrate **`config.peers`** as Candidate routes (skip self/owner VIP), then hydrate from **`NetInfo/peer_cache.json`**.
+6. Create empty **`RoutingTable`**. When local VIP is set, hydrate **`config.peers`** as Candidate routes (skip self VIP), then hydrate from **`NetInfo/peer_cache.json`**.
 7. Start **endpoint cache worker** (debounced ~1s flush of learned endpoints).
 8. Create channels: **TUN from adapter** (mpsc, `tun_from_adapter_queue_packets`), **TUN inject** (broadcast, `tun_inject_queue_packets`), **EngineCmd** (mpsc 256).
-9. Construct **`P2PEngine`** with initial pacing from config; if role is **owner**, attach **join/leave** handlers and **`IPPool`**.
+9. Construct **`P2PEngine`** with initial pacing from config; attach roster/endpoint handlers (no VIP pool / join allocate handler).
 10. **`LocalSet`**: spawn `engine.run()`, send initial `SetPacing`, then **`cli.run()`** until exit.
 
 ---
 
-## Roles: owner vs peer
+## FloatUnit members
 
-| | **Owner** | **Peer** |
-|---|-----------|----------|
-| VIP pool | Allocates new peer VIPs on join | Receives assigned VIP |
-| `config.toml` peers | Authoritative peer list | Stores owner endpoint + crypto; joiner roster (FIFO 64) from MSYN |
-| Relay | Relays packets for peers on degraded paths | Uses owner (or peer hub) as relay when `should_relay` |
-| MSYN | Publishes membership / route sync (coalesced 50ms) | Applies deltas, tracks `membership_version` |
-| Parasitic listener | Can accept LAN **parasitic** joins (`MPHI`/`MPHR`, including `discover_only`) | Join via menu: Parasitic Public (VIP) or Parasitic LAN (broadcast discover) |
-| Kick | Can **`MKCK`** peer | Clears local session on kick |
+Every peer that holds the FloatUnit network key is an equal **member**. Minting a unit grants no special power.
+
+| | **Member** |
+|---|------------|
+| VIP | Self-claims a host in the **key-derived** RFC1918 `/24` (`10.H1.H2.0/24` via HKDF info `floatunit-subnet-v1`); hosts `1..=254`; conflicts: lower hex `node_id` wins; loser bumps `vip_epoch`, rerolls, persists config, recreates Wintun |
+| `config.toml` peers | Member roster (FIFO 64) from claim gossip |
+| Relay | Sticky/best-quality peer hub when `should_relay` |
+| Membership | `MCLG` gossip + `MLEA` leave |
+| LAN assist | Same-key LAN presence (`MPHI`/`MPHR` matched on `network_id`) then punch + `MPJN` |
+| Exclusion | Rotate to a new FloatUnit key (no kick) |
 
 ---
 
@@ -176,13 +175,15 @@ Largest behavioural surface: `cli.rs` and `net/engine.rs`. Trace bugs from CLI a
 - **Authority**: protocol behaviour is defined by this repository (`src/`, `tests/`) and this document. Any wire or behavioural change requires an update here and matching tests.
 - **Data plane crypto**: AEGIS-128L with wire frame `0x02 | ctr_le_6 | ciphertext | tag_16`; per-direction HKDF (`data|sender_vip_be|receiver_vip_be`) from the 32-byte network key; nonce is `salt_10 | ctr_le_6`.
 - **Control-plane crypto**: AEGIS-128L AEAD; HKDF info `ctrl` (no VIP) from the same network key and salt `mint-aegis-128l-v1`; wire after outer `MCTS` is `ctr_le_6 | ciphertext | tag_16` where plaintext is `inner_tag || body`; AAD is `mcts`; nonce is `salt_10 | ctr_le_6`. Global 48-bit send counter; per-source 128-bit counter replay (`CtrlReplayTable`, max 4096 sources).
-- **Wire protocol version**: join `MPJN` / `MPJA` JSON field `proto_ver` must equal **7** (`WIRE_PROTOCOL_VERSION`). Enforced on-wire only; config does not store a protocol version field. Mismatch ⇒ join fails.
-- **Packet tags — control plane**: 4-byte ASCII (`M…`): `MPJN`, `MPJA`, `MCTS`, signaling, PMTU, MSYN family, etc.
+- **Wire protocol version**: join `MPJN` / `MPJA` JSON field `proto_ver` must equal **8** (`WIRE_PROTOCOL_VERSION`). Enforced on-wire only; config does not store a protocol version field. Mismatch ⇒ join fails.
+- **Packet tags — control plane**: 4-byte ASCII (`M…`): `MPJN`, `MPJA`, `MCTS`, signaling, PMTU, `MCLG` / `MLEA`, etc.
 - **Packet tags — data / reliable / probe plane**: 1-byte compact type (`0x01` data, `0x02` encrypted, `0x03` FEC, `0x04` reliable, `0x05` ack, `0x06` inner JoinAck inside reliable, `0x07` ping, `0x08` pong). Reserved: `0x00`, `0x09`–`0xF9` unassigned, `0xFA`–`0xFE` reserved, `0xFF` sentinel. First byte `b'M'` ⇒ 4-byte control tag; otherwise compact parse.
 - **Control-sign wrapper tag**: `MCTS`.
-- **Invite**: 40-byte payload (mode + IPv4 + port + protocol + key), URL-safe base64 (no padding).
-- **Decentralized join (discovery)**: BitTorrent-style trackers keyed by `room_id` (20-byte info hash) = first 20 bytes of `SHA-256(network_key || protocol_byte)` (`PROTO_UDP` = 1). **UDP (BEP15)**: `connect` / `announce` on the engine UDP socket. **HTTP (BEP3)**: GET announce on a separate TCP connection; request uses the same `info_hash`, `peer_id`, and **`port`** (public UDP port from STUN when known, else listen port). Responses must use **compact** `peers`; results merge into the same `discovered` set as UDP. **`decentralized_trackers`** entries: `udp://…`, `http://…`, and `https://…` (HTTPS parsed and retained; TLS announce not implemented — slots skipped). Empty config → built-in mixed UDP/HTTP list. Peers punch discovered endpoints; joiners fan out `MPJN`; only the owner answers `MPJA`. New members still require the owner online. User-visible join success requires CLI profile + `CommandLoop` (not engine-only MPJA). Config: `decentralized_enabled`, `decentralized_trackers`, `decentralized_announce_secs` (default 120), `decentralized_join_deadline_secs` (default 120, single MPJA wait aligned with punch), `join_method`.
-- **Peer rediscovery (joiner, tracker)**: Separate from owner reconnect fastpath. Runs only when decentralized is active, not in join wait, network crypto is set, and the owner send route is **missing** or **not hop-usable**; healthy owner suppresses peer reconnect and stops `peer-reconnect:*` workflows. **MSYN** apply also stops all `peer-reconnect:*` keys. Per announce: skip owner send endpoint, consider at most **8** peer addrs, at most **4** distinct `peer-reconnect:` punch keys (same-key respawn allowed), **30s** cooldown per VIP / `unbound` recorded only on successful spawn. Unique public IP → `peer-reconnect:{vip}`; otherwise `peer-reconnect:unbound`. Punch targets are announce candidates (no Active `filter_decentralized_punch_targets`). Learn via existing signed `HPCH`/`HACK` rules (no Active→Candidate demote). Joiner **roster** in `config.peers`: MSYN-driven dirty VIP upsert, FIFO **64** (`name` = `node_id`); remove on MSYN `removed[]`, phantom full sync, MSMD leave — not on `stale_evict`. Boot: roster → Candidate routes, then `peer_cache.json` overlay. Owner roster unchanged (UI lists up to **253** peers). Same-endpoint dead peer: out of scope.
+- **Invite**: 34-byte payload (`INVITE_VERSION` = 1 + `protocol` + 32-byte network key), URL-safe base64 (no padding). Key-only — no endpoint in the invite. `network_id` / FloatUnit ID = first 5 bytes of Blake2b-512(key) as hex; tracker `room_id` unchanged (`SHA-256(key || protocol)[:20]`).
+- **FloatUnit mint**: First-run `[1]` generates a network key, enables decentralized announce, prints a key-only invite. Self-picks a VIP inside the key-derived `/24` (`vip_epoch` starts at 0); `subnet_prefix` is forced to **24**. Out-of-unit saved VIP is replaced on hydrate/join.
+- **Equal-peer join**: Joiner self-claims `vip` + `vip_epoch` in `MPJN`. Any online member with identity may answer `MPJA` with **their own** claim fields (`node_id`, `vip`, `vip_epoch`, `prefix`) — no assigned VIP. When crypto is set, `MPJN`/`MPJA` are accepted only under `MCTS` (plain Compact JoinAck is rejected). Join success = first valid `MPJA`, or **genesis** when the join deadline elapses with an empty tracker discovered set. VIP conflicts: lexicographically smaller hex `node_id` wins; loser bumps `vip_epoch` and rerolls via `apply_local_vip_change` (config + Wintun). After merge, `settle_duplicate_vips` drops lex-loser claims; `update_route` never maps `my_vip` to a peer. Periodic sealed `MPJN` presence keeps claims fresh. Membership is **claim gossip** (`MCLG` / `MLEA`) — see [Membership gossip (MCLG)](#membership-gossip-mclg).
+- **Decentralized join (discovery)**: BitTorrent-style trackers keyed by `room_id` (20-byte info hash) = first 20 bytes of `SHA-256(network_key || protocol_byte)` (`PROTO_UDP` = 1). **UDP (BEP15)**: `connect` / `announce` on the engine UDP socket. **HTTP (BEP3)**: GET announce on a separate TCP connection; request uses the same `info_hash`, `peer_id`, and **`port`** (public UDP port from STUN when known, else listen port). Responses must use **compact** `peers`; results merge into the same `discovered` set as UDP. **`decentralized_trackers`** entries: `udp://…`, `http://…`, and `https://…` (HTTPS parsed and retained; TLS announce not implemented — slots skipped). Empty config → built-in mixed UDP/HTTP list. Peers punch discovered endpoints; joiners fan out claim `MPJN`; any member answers `MPJA`. User-visible join success requires CLI profile + `CommandLoop` (not engine-only MPJA). Config: `decentralized_enabled`, `decentralized_trackers`, `decentralized_announce_secs` (default 120), `decentralized_join_deadline_secs` (default 120, single MPJA wait aligned with punch), `join_method`, `vip_epoch`. Manual invite join prompts for a separate `ip:port` (endpoint is not in the invite).
+- **Peer rediscovery (tracker)**: Runs when decentralized is active, not in join wait, and network crypto is set. Budgeted punch toward announced endpoints when needed mesh paths miss (at most **8** peer addrs / announce, **4** distinct `peer-reconnect:` keys, **30s** cooldown). Unique public IP → `peer-reconnect:{vip}`; otherwise `peer-reconnect:unbound`. Learn via signed `HPCH`/`HACK`. Member **roster** in `config.peers`: claim-gossip-driven upsert keyed by `node_id` (VIP rerolls replace the same row), FIFO **64** (`name` = `node_id`, `vip_epoch`); remove on `MLEA` leave — not on `stale_evict`. Boot: when local VIP is set, roster → Candidate routes, then `peer_cache.json` overlay.
 - **Runtime model**: Tokio single-task engine loop + blocking Wintun reader bridge.
 - **Reliability**: no `panic!` / `unreachable!` / `unwrap()` on user or network input paths; fixed-size crypto may use `expect` only when the contract is type-level (e.g. 32-byte key into a MAC of matching size).
 
@@ -192,22 +193,22 @@ Legend for tuning notes below: **↑** = increase value in code/config; **↓** 
 
 ## Wire protocol (tags)
 
-Code tags: `src/net/packet.rs`. Join handshake requires `proto_ver: 7` in `MPJN` / `MPJA`.
+Code tags: `src/net/packet.rs`. Join handshake requires `proto_ver: 8` in `MPJN` / `MPJA`.
 
 | Tag | Role |
 |-----|------|
 | Compact `0x01` / `0x02` | IP payload (plain / encrypted) |
 | `MKPL` / `MHOL` / `MHAC` | Keepalive / hole-punch / hole-punch ack (standalone remain legal) |
-| `MCTL` | Compound control: HB/HOL and/or one MSYN v4 part (see Membership sync) |
+| `MCTL` | Compound control: HB/HOL keepalive / hole-punch compound |
 | Compact `0x07` / `0x08` | Ping / pong: ping body = `ping_id`+`sender_ts` (16 B); pong body = echo + `fwd_owd_sample_ms i32` + `loss_permille u32` (24 B). RTT at sender; forward OWD for CC/FEC; peer RX wire-loss (0–1000‰) for adaptive FEC |
 | `MPJN` / `MPJA` | Join request / ack |
 | `MPRX` | Proxy/relay wrapper |
-| `MKCK` | Kick |
-| `MSYN` | Membership / route sync |
+| `MCLG` | Claim-gossip digest (membership) |
+| `MLEA` | Graceful leave + tombstone |
 | Compact `0x04` / `0x05` | Reliable control send / ack (inner `0x06` = JoinAck JSON) |
 | `MPMT` / `MPAR` | PMTU probe / ack |
 | Compact `0x03` | FEC shard |
-| `MSMD` / `MSSR` / `MSSP` / `MSTR` / `MERR` / `MBRK` / `MRDY` | Sync/metadata/error/break/ready |
+| `MSTR` / `MERR` / `MBRK` / `MRDY` | Metadata/error/break/ready |
 | `MCTS` | Signed control wrapper |
 | `MPHI` / `MPHR` / `MPHO` / `MPPA` | Parasitic hello / reply / ok / punch ack |
 | `HPCH` / `HACK` | Authenticated hole-punch learn (peer rediscovery) |
@@ -230,7 +231,7 @@ Parasitic and some engine paths use JSON bodies inside signed or plain control f
 **Ingress (Internet → TUN):**
 
 1. `recv_from` → parse tag → decrypt / FEC reassemble → update routing RTT/loss/bandwidth samples.
-2. Deliver to local TUN via **inject broadcast** or relay onward if this node is owner/hop and packet is for another VIP.
+2. Deliver to local TUN via **inject broadcast** or relay onward if this node is a trusted hub and packet is for another VIP.
 
 User-tunable data-path knobs: edit `NetInfo/config.toml`, then `config reload` — see [Operational defaults](#operational-defaults-user-tunable).
 
@@ -240,8 +241,8 @@ User-tunable data-path knobs: edit `NetInfo/config.toml`, then `config reload` �
 
 1. UDP datagram → if STUN-shaped, handled separately.
 2. Compact reliable / ack → `ReliableChannel` (ordered retry, RTO EWMA).
-3. **`MPMT` / `MPAR`** → PMTUD state (+ probe socket for some paths).
-4. **`MCTS`** → AEGIS-128L open + per-source counter replay → `dispatch_control` (join, sync, kick, para signals, etc.).
+3. **`MPMT` / `MPAR`** → PMTUD state.
+4. **`MCTS`** → AEGIS-128L open + per-source counter replay → `dispatch_control` (join, claim gossip, LAN presence signals, etc.).
 5. Rate limiters protect join and plain control floods.
 
 Control messages update **`RoutingTable`**, **`CryptoPool`**, session identity, and CLI-visible state (via oneshot replies on some `EngineCmd`).
@@ -253,7 +254,6 @@ Control messages update **`RoutingTable`**, **`CryptoPool`**, session identity, 
 `P2PEngine::run` is a **`select!`** loop over:
 
 - Main **UDP** socket
-- **PMTUD probe** socket
 - **TUN** ingress channel
 - **`EngineCmd`** from CLI
 - **STUN DNS resolve** completions
@@ -267,11 +267,11 @@ Important internal state (non-exhaustive):
 - `PathMtuDiscovery`, `BroadcastDeduplicator`, `CtrlReplayTable`
 - `CryptoPool`, feature flags (multipath, dual-write, predictive heal, control path race, …)
 - `peer_sync_state`, `peer_pending_removals`, `msyn_applied_to_rev`
-- STUN query maps, pending pings/heal cooldowns, parasitic notify channels
+- STUN query maps, pending pings/heal cooldowns, LAN presence notify channels
 
-**Session reset** (e.g. after kick): clears routing, crypto, reliable, FEC, dedup, restarts pace-clock + pacing worker + fec-tx worker.
+**Session reset** (e.g. after local `remove` / `ResetSession`): clears routing, crypto, reliable, FEC, dedup, restarts pace-clock + pacing worker + fec-tx worker.
 
-`EngineCmd` variants (CLI → engine) include: `SetPacing`, `SetCryptoKey`, `PrepareJoin` / `SendJoin`, `ManualPunch`, `SetPeerKeepalive`, `SetFecEnabled`, `SetRawPerf`, `Kick`, `Shutdown`, and more — see `src/net/engine.rs`.
+`EngineCmd` variants (CLI → engine) include: `SetPacing`, `SetCryptoKey`, `PrepareJoin` / `SendJoin`, `ManualPunch`, `SetPeerKeepalive`, `SetFecEnabled`, `SetRawPerf`, `Shutdown`, and more — see `src/net/engine.rs`.
 
 ---
 
@@ -279,11 +279,11 @@ Important internal state (non-exhaustive):
 
 **`RoutingTable`** maps each **VIP** to a **`RouteEntry`** with:
 
-- Multiple **`PathCandidate`** records: `Direct`, `OwnerRelay`, `IceSrflx`
+- Multiple **`PathCandidate`** records: `Direct`, `HubRelay`, `IceSrflx`
 - EWMA: RTT, loss, bandwidth; **`quality_score`**; state `Candidate` / `Active` / `Degraded` / `Stale`
 - Optional delay telemetry: **`rtt_base_ms`** (windowed min-RTT) and **`queuing_delay_ms`** (`max(0, smoothed_rtt − base)`) for path quality / DRR fairness — fed by periodic compact **ping** probes (`probe_interval_ms`, default **40**; **0** = off). VIP-level RTT updates only from the **active** multipath endpoint; secondary-path samples stay path-local.
 - **Probe-miss failover:** consecutive CC-probe timeouts on one endpoint (no intervening matched pong) reaching `[engine_limits].probe_miss_fail_threshold` (default **8**, clamp **3–64**) call `note_fail` at most once per endpoint per ping-watchdog sweep. Detection latency is floored by the probe ping deadline (~**2 s**). With `probe_interval_ms = 0`, probes are off and this path is inactive (idle routes still age via `stale_mark_secs`).
-- **Forward OWD** (same probes): peer reports `fwd_owd_sample_ms` in compact **pong**; sender tracks windowed min **`owd_base_ms`** (`Option`; cold = `None`) and **`fwd_queuing_delay_ms`**. **Background CC** and the **FEC loss classifier** use **`effective_queuing_delay_ms`**: forward QD when OWD warm, else RTT-QD, else `-1` (cold → conservative loss MD). Clock jump (`|sample − base| > owd_clock_jump_reject_ms`, default **30000**) invalidates OWD base (fallback to RTT-QD).
+- **Forward OWD** (same probes): peer reports `fwd_owd_sample_ms` in compact **pong**; sender tracks windowed min **`owd_base_ms`** (`Option`; cold = `None`) and **`fwd_queuing_delay_ms`**, plus an EWMA of residual `2·owd − rtt`. **Background CC**, the **FEC loss classifier**, and DRR QD hints use **`effective_queuing_delay_ms`**: forward QD only after **`owd_prefer_after_samples`** (default **8**) Applied samples since cold; otherwise RTT-QD when RTT base is warm; else forward QD if OWD is warming while RTT is still cold; else `-1` (conservative loss MD). Guards that invalidate OWD (cold → RTT-QD fallback): absolute jump `|sample − base| > owd_clock_jump_reject_ms` (default **30000**), and residual consistency `|resid − ewma| > owd_rtt_consistency_ms` (default **5000**; peer clock step moves residual ≈ **2×**, so default ≈ **~2.5 s** peer step). Gradual clock slew under both thresholds is not rejected (min-window may still drift). Hysteresis length is **N probes**, not a fixed wall-clock duration.
 - **Control path race** (default on with multipath): recovery **`MHOL`** (`direct_retry`) and predictive **heal ping** fan out to up to **3** live `PathSet` endpoints in parallel. Periodic CC ping probes stay single-endpoint.
 - **Tombstones** when peers leave (revision counters for MSYN)
 
@@ -306,7 +306,7 @@ Defaults live in `src/routing.rs` (`failover` module) and are mirrored under the
 | `HOLD_DOWN_SECS` / `hold_down_secs` | 2 | After failover to relay, block immediate flip back to direct | Less route flapping; slower recovery to direct | Faster direct retry; more flapping risk |
 
 - Degraded → relay: quality below `D2R_QUALITY_MIN`, state degraded/stale, `loss_ewma` above `D2R_LOSS_MAX`, or `jitter_ms` above `D2R_JITTER_MAX`.
-- Data-plane relay hop: `select_relay_endpoint` prefers owner when hop-usable; otherwise one usable peer hub (one-hop MDAT; forward to dest direct ep only). Peer relay does not apply until the owner route already fails hop-usable.
+- Data-plane relay hop: `select_relay_endpoint` uses sticky usable hub first, then best usable peer by `quality_score` / RTT (all members equal; one-hop MDAT; forward to dest direct ep only).
 - Return to direct: quality ≥ `R2D_QUALITY_MIN`, `success_streak` ≥ `R2D_SUCCESS_MIN`, hold-down elapsed.
 
 
@@ -420,8 +420,8 @@ Field-level defaults and ↑/↓ semantics: [Operational defaults](#operational-
 - Each shard body starts with `orig_len` (`u16` LE), then payload bytes, then zero padding.
 - Encoder per destination; decoder map keyed by source address.
 - **Adaptive** parity from **peer-reported RX wire-loss** carried in compact pong (`loss_permille` → `rx_loss_ewma`), not from `RouteEntry.loss_ewma` (that field remains for failover / quality scoring only). RX measures wire loss from encrypted counter gaps (uncoded path) and FEC shard missing counts (coded path); FEC-recovered packets do not dilute the estimator. Thresholds via `adaptive_off_below` / `adaptive_on_above`, or **forced ratio** via `fec_force_*` fields.
-- **Loss classifier** (default **on**): when `loss_classifier_enabled = true`, adaptive FEC will **not increase** parity if `effective_queuing_delay / target_queue_delay_ms` exceeds `congestion_loss_threshold` (forward OWD when warm, else RTT-QD). Decreasing or turning FEC off still follows loss hysteresis. After delay recovers, a **recovery step-down** may lower parity while loss EWMA is sticky, within `fec_recovery_recency_ms` (default **1200**, **0** = disable step-down only) of the last congestive sample. The same predicate also gates **Background CC** loss multiplicative decrease and loss-driven delivery anchoring: a rising loss edge cuts rate only when delay is congestive (or when QD telemetry is untrusted — `rtt_base_tracking = false` or `qd_ms < 0` — in which case loss MD stays conservative). Non-congestive loss is left to FEC.
-- **Background CC (LEDBAT)** (`congestion_enabled`, default **on**): per-peer byte rate via token bucket; delay gradient updates rate from effective queuing delay (forward OWD preferred). With `congestion_enabled = false`, pacing CC actuation is off.
+- **Loss classifier** (default **on**): when `loss_classifier_enabled = true`, adaptive FEC will **not increase** parity if `effective_queuing_delay / target_queue_delay_ms` exceeds `congestion_loss_threshold` (trusted forward OWD after prefer-after hysteresis, else RTT-QD). Decreasing or turning FEC off still follows loss hysteresis. After delay recovers, a **recovery step-down** may lower parity while loss EWMA is sticky, within `fec_recovery_recency_ms` (default **1200**, **0** = disable step-down only) of the last congestive sample. The same predicate also gates **Background CC** loss multiplicative decrease and loss-driven delivery anchoring: a rising loss edge cuts rate only when delay is congestive (or when QD telemetry is untrusted — `rtt_base_tracking = false` or `qd_ms < 0` — in which case loss MD stays conservative). Non-congestive loss is left to FEC.
+- **Background CC (LEDBAT)** (`congestion_enabled`, default **on**): per-peer byte rate via token bucket; delay gradient updates rate from effective queuing delay (forward OWD once trusted). With `congestion_enabled = false`, pacing CC actuation is off.
 - Flush timers **2 ms / 4 ms** (aggressive vs default); small packets may flush immediately. While APD is in **Drain**, timer flush emits **passthrough only** (no parity).
 - `shard_payload_size` is a **local send ceiling** (512–1279); at runtime also capped so `10 + shard ≤ min_path_mtu − 28` (IPv4+UDP); below the 512 floor FEC bypasses. Disabled in **`rawperf-on`** mode.
 
@@ -439,10 +439,10 @@ Full congestion / FEC field table: [Operational defaults](#operational-defaults-
 
 ## PMTUD
 
-- **`PathMtuDiscovery`** in engine + **`pmtud_probe`** socket (DF / don't-fragment) for **public** peers. **RFC1918** peers send `MPMT` on the **main** engine listen socket so `MPAR` returns on the punched 5-tuple (parasitic LAN); APIPA/CGNAT keep the DF probe path.
-- Per-peer **search+confirm** PLPMTUD: exponential raise from ACK-proven `last_good`, then binary search until window ≤ `resolve_epsilon` (default **8** bytes). Probe ladder sizes are **IPv4 IP totals**. `min_path_mtu` tracks ACK-proven `last_good` only (never in-flight probe size).
+- **`PathMtuDiscovery`** runs on the engine **main UDP listen socket** for all peers (`MPMT` probe / `MPAR` ack), so ACKs return on the active punched 5-tuple.
+- Per-peer **search+confirm** PLPMTUD: exponential raise from ACK-proven `last_good`, then binary search until window ≤ `resolve_epsilon` (default **4** bytes). Probe ladder sizes are **IPv4 IP totals**. `min_path_mtu` tracks ACK-proven `last_good` only (never in-flight probe size).
 - **Phases:** Plateau → Raise or Revalidate; Raise fail → Binary; Revalidate timeout fail → **Recheck** (or **anomaly** when size-bucketed RX shows large packets still alive); Recheck fail → **soft-down** `last_good = max(576, stable/2)` (later soft-downs halve `last_good`) then DownSearch. For **never-acked RFC1918** peers, soft-down floors `last_good` at **1220** (near no-op → DownSearch closes → Raise retries). `on_tick` **heals** stuck never-acked private peers with `last_good < 1220` back to the discovery floor. Local `EMSGSIZE`/`WSAEMSGSIZE` on Revalidate/Recheck soft-downs immediately (skips anomaly/Recheck). DownSearch that closes with **no ACK** resets `first_bad` to the raise sentinel so Raise can climb again.
-- **Residual:** main-socket LAN probes have no DF (fragmentation can false-succeed on odd sub-1500 private links; `MessageTooLong` is unreliable there). Never-acked private peers will not soft-down below 1220 while probes never ACK.
+- **Residual:** probes run on the main socket without DF, so fragmentation can false-succeed on odd sub-1500 paths and local `MessageTooLong` is less reliable than strict DF probing.
 - **Probe timeout:** adaptive `clamp(max(probe_timeout_ms, 4×RTT_EWMA_ms), probe_timeout_ms, 5000)`; config `probe_timeout_ms` is the **floor**. After the final confirm timeout in Revalidate/Recheck, a one-timeout **late-ACK grace** can still recover to Plateau.
 - **Data-plane corroboration:** per-VIP size-bucketed RX rate/gap tracker (`SizeLossTable`); anomaly and early-wake require a warm tracker. Early-wake (Plateau/Frozen only, 10s cooldown) when large RX collapsed, small RX alive, recent large TX offer, and queuing delay is trusted non-congestive — no inflight abort, no Background CC change, `fec_mtu_bypass` is not used as proof.
 - Adapter MTU suggestion: `adapter = path_mtu − 28 − enc_overhead`, clamped to **`MIN_ADAPTER_PAYLOAD_MTU` (280)**..=1500. Default config adapter **1340**; live netsh apply accepts the same floor.
@@ -454,30 +454,28 @@ Full congestion / FEC field table: [Operational defaults](#operational-defaults-
 
 ---
 
-## NAT, hole punch, and parasitic join
+## NAT, hole punch, and LAN assist
 
 | Component | Use |
 |-----------|-----|
-| **UPnP** (`nat/upnp.rs`) | Map listen port on router during **create** |
+| **UPnP** (`nat/upnp.rs`) | Map listen port on router during **mint** |
 | **STUN** (`nat/stun.rs`) | Learn public endpoint; cached; keepalive |
 | **ICE** (`nat/ice.rs`) | Candidate list → punch target addresses |
 | **Manual punch** | CLI `punch` → engine `StartPunchWorkflow` (canonical 3-stage) |
 
-**Decentralized join** (default): paste invite → STUN → tracker announce (public UDP port from STUN, fallback listen port) → punch peers → `MPJN` fan-out → owner `MPJA`. Discovery uses **`decentralized_trackers`** (empty → built-in list; default list front-loads UDP+HTTP dual pairs on the same host:port, then UDP-only trackers):
+**Decentralized join** (default): paste invite → self-claim VIP → STUN → tracker announce (public UDP port from STUN, fallback listen port) → punch peers → claim `MPJN` fan-out → any-member `MPJA`. Discovery uses **`decentralized_trackers`** (empty → built-in list; default list front-loads UDP+HTTP dual pairs on the same host:port, then UDP-only trackers):
 
 - **UDP (BEP15)**: `connect` / `announce` on the engine UDP socket.
 - **HTTP (BEP3)**: GET announce over TCP; compact peer list merged into the same discovery set as UDP.
 - **HTTPS URLs** may appear in the list; announce over TLS is **not implemented** (slots kept but skipped).
 
-UDP and HTTP trackers run in parallel; join uses the same canonical tiered punch as manual/parasitic paths. Owner and existing peers keep announcing for reconnect. Owner must be online to admit **new** members.
+UDP and HTTP trackers run in parallel; join uses the same canonical tiered punch as manual paths. Members keep announcing for reconnect. If the deadline elapses with **no discovered peers**, join succeeds as **genesis** (solo member).
 
-**Peer rediscovery (joiner):** After join, peers keep announcing on the tracker. When the **owner route is missing or not hop-usable**, joiners may run a separate **`peer-reconnect:*`** canonical punch toward announced endpoints (budget 8 addrs per announce, max 4 concurrent keys, 30s per-key cooldown). VIP binding uses **unique public IP** only. Routes update via authenticated `HPCH`/`HACK`. While the owner path is healthy, peer reconnect is suppressed; **MSYN** stops in-flight peer reconnect workflows. Joiners persist a **roster** in `config.peers` (FIFO cap **64**, `name` = `node_id`). Boot hydrates roster as **Candidate** routes, then overlays **`peer_cache.json`**. Owner `config.peers` remains authoritative (up to **253** VIPs in the UI).
+**Peer rediscovery:** After join, members keep announcing on the tracker and may run budgeted **`peer-reconnect:*`** punches toward announced endpoints when needed mesh paths miss (budget 8 addrs / announce, max 4 concurrent keys, 30s per-key cooldown). VIP binding uses **unique public IP** only. Routes update via authenticated `HPCH`/`HACK`. Members persist a **roster** in `config.peers` (FIFO cap **64**, `name` = `node_id`, `vip_epoch`). Boot hydrates roster as **Candidate** routes for `member`, then overlays **`peer_cache.json`**.
 
-**Parasitic join**:
-- **Public**: VIP unicast signaling over an existing VPN/route + STUN/UPnP + punch (`join_parasitic_with_params`).
-- **LAN**: joiner broadcasts `discover_only` **`MPHI`**, collects owner **`MPHR`** (~2.5s), client picks owner (or `ip:port` fallback), then unicasts a real Hello; owner admits with VIP + `network_key_hex`; punch uses private candidates only (no STUN/UPnP). Owner listen port defaults to **7878**. Config: `parasitic_enabled`, `parasitic_use_public`.
+**LAN assist** (CLI `lan` / IPC `DiscoverLanMembers` + `AssistLanMember`): requires an already-configured FloatUnit (`crypto_key` + `network_id` + VIP). Members broadcast **`MPHI`** carrying `network_id` (never the key); matching members reply **`MPHR`**. Punch uses private candidates only, then **`PrepareJoin`** with claim `MPJN` (same equal-peer join path). Background LAN presence runs while a member session is active.
 
-Canonical punch stages and `PARA_*` constants: [Performance parameters](#performance-parameters) § Punch / NAT.
+Canonical punch stages and LAN discover constants: [Performance parameters](#performance-parameters) § Punch / NAT.
 
 ---
 
@@ -490,25 +488,23 @@ Canonical punch stages and `PARA_*` constants: [Performance parameters](#perform
 
 ---
 
-## Membership sync (MSYN)
+## Membership gossip (MCLG)
 
-- Periodic and event-driven **route/membership** sync using **`MSYN`** / **`MCTL`+MSYN** (v4 sharded JSON bodies built in `msyn_sync.rs`).
-- Owner increments **`membership_version`**; peers track **`msyn_applied_to_rev`** and **`peer_sync_state`**.
-- Removals use **tombstone revisions**; **`peer_pending_removals`** ensures peers learn departures before sync cursor advances.
-- **v4 sharding:** each part carries `sync_id`, `part_idx`, `parts_total`, `from_rev`, `to_rev`, `routes`, `removed`. Owner uses a global monotonic `sync_id` per peer-epoch; parts are sent sequentially via direct UDP (`send_to`). Advance + pending clear only when **every** part of that epoch got `Ok`. Owner **refuses** epochs with `parts_total > 64` or more than **1024** routes / **1024** removed (same caps as joiner apply); joiner ignores oversized assembled epochs without advancing `msyn_applied_to_rev`.
-- **Assemble-then-apply:** joiner buffers by `(from, sync_id)` (caps: 8 buffers/from, 64 parts, 30s TTL). On complete set, apply **all removed then all routes**, then phantom-evict only if `from_rev==0` using the **union of route VIPs**. Incomplete buffers never bump `msyn_applied_to_rev`.
-- **Shard budget:** `[engine_limits].msyn_shard_budget_bytes` (default 1200) is a **wire-oriented** ceiling; packing uses `effective_msyn_json_budget` = configured − `MSYN_SHARD_WRAP_RESERVE` (52 B for sealed `MCTL`+MSYN+HB vip) so JSON+compound+MCTS fit under the configured size.
-- **Coverage keepalive:** shared last-outbound UDP clock (engine direct sends + pacing `try_send` Ok + `SetPeerKeepalive` / ICE check sends). Periodic keepalive skips destinations refreshed within `keepalive_secs`; otherwise sends `MCTL` HB (and HB+HOL for untracked owner_extra). Compact Ping/Pong / CC probes unchanged.
-- **`MCTL` scope:** opportunistic compound only for keepalive HB(+HOL) and MSYN-part(+HB when uncovered). `direct_retry` / control-path race / punch stay standalone `MKPL`/`MHOL`. No cross-`select!` coalesce guarantee (keepalive / sync / direct_retry are separate timer arms).
-- Related: **`MSMD`** dedup, **`MSSP` / `MSSR`** snapshots (limits in [Performance parameters](#performance-parameters)).
-
+- Equal peers gossip a sealed **`MCLG`** digest (`PKT_CLG`): JSON `{ proto_ver, from, ts_ms, claims:[{node_id,vip,vip_epoch,ep_hints}], leaves?:[{node_id,vip,vip_epoch}] }`.
+- Always includes the sender’s own claim; up to **32** other live claims (sorted by `node_id`, **rotated** each tick), plus up to **8** recent leave tombs, capped by `[engine_limits].msyn_body_max`.
+- Fanout: up to **8** Active endpoints per send, **rotated** each tick.
+- Periodic tick uses `[timers].msyn_secs` (default 15s) for **all** members with identity; also on join learn / VIP reroll / `TriggerClaimGossip`.
+- Merge is per-`node_id` LWW by `vip_epoch` (`src/net/claim_gossip.rs`). After merge, `settle_duplicate_vips` keeps the lex-smaller `node_id` per VIP. Cross-node VIP fight: lower hex `node_id` wins; loser bumps epoch and rerolls (`apply_local_vip_change`). Observer of a remote loser: soft-drop that claim and remove the VIP route **only if** the routed `node_id` matches the loser; install a **30s** fight suppress on identical `(node_id, vip, vip_epoch)` so MCLG cannot re-accept the losing claim; **repeated blocked sightings slide the suppress TTL**; observer settle also marks pending claim gossip. Do **not** tear roster/crypto/FEC on fight. After settle, routes/`roster_upsert` apply only when the claim is still live in the map (no same-tick re-route of the loser). Stale merges do not move routes unless vip+epoch match the canonical claim (EP refresh only). Never `update_route(my_vip)`.
+- Graceful leave: sealed **`MLEA`** (`PKT_LEAVE`) installs a **300s** leave tombstone; suppress reclaim at that epoch until TTL expires (newer epoch may reclaim). Leave tombs also propagate via MCLG `leaves`. Local `stale_evict` remains local-only and also **removes the matching `claim_map` entry** when `node_id` is known, else **removes claims by VIP** (roster still not removed on stale).
+- **`MCTL`** is HB/HOL compound only (no membership section).
+- Member **roster** in `config.peers`: upsert by `node_id`, FIFO **64**, includes `vip_epoch`; boot hydrates Candidate routes when local VIP is set, then `peer_cache.json` overlay.
+- Peer rediscovery: budgeted tracker punch when mesh paths miss.
 ---
 
 ## Broadcast and relay
 
-- **Broadcast/multicast** IP on TUN: dedup with **`BroadcastDeduplicator`** (hash of prefix of packet + scope), then send to all non-stale peer endpoints. Peers that need relay get one aggregated copy to a **relay hop** (prefer owner when hop-usable, else best peer hub).
-- **Relay:** when `should_relay` applies, non-owners pick a **one-hop relay** via `RoutingTable::select_relay_endpoint` (prefer owner; peer hub when owner route is already unusable). The hop forwards by inner destination VIP to the peer’s **direct** endpoint only (no relay-of-relay). Owner still forwards using its routing table (`MPRX` / relay logic in engine).
-- **Limit:** peer relay failover requires the owner route to already fail hop-usable; it does not replace owner rediscovery after endpoint drift.
+- **Broadcast/multicast** IP on TUN: dedup with **`BroadcastDeduplicator`** (hash of prefix of packet + scope), then send to all non-stale peer endpoints. Peers that need relay get one aggregated copy to a **relay hop** (sticky/best quality hub among equal peers).
+- **Relay:** when `should_relay` applies, any member picks a **one-hop relay** via `RoutingTable::select_relay_endpoint` (sticky usable hub, else best quality/RTT peer). The hop forwards by inner destination VIP to the peer’s **direct** endpoint only (no relay-of-relay). Trusted members forward using the routing table. Control **`MPRX` (PRXY)** starts at `ttl: 1`; inbound ttl is clamped to 1 before forward and the forwarded body has `ttl: 0` (at most one hop).
 - Engine helpers: **`should_relay`**, **`is_broadcast_or_multicast`**, **`select_relay_endpoint`**.
 
 ---
@@ -519,14 +515,14 @@ Interactive loop after session restore (`?` = help):
 
 | Command | Description |
 |---------|-------------|
-| First-run `[1]` Create | New network (owner): name, port, VIP, subnet, UPnP, STUN, invites (idle only) |
-| First-run `[2]` Join | Join via wizard: decentralized (default), parasitic, or manual — not while a profile is active (`remove` first) |
+| First-run `[1]` Mint FloatUnit | New unit (member): name, port, VIP, subnet, UPnP, STUN, key-only invite; decentralized announce on |
+| First-run `[2]` Join | Join via wizard: decentralized (default) or manual — not while a profile is active (`remove` first) |
 | First-run `[3]` / `stop` / `exit` | Shut down VPN daemon and quit client |
 | `list` | Peers and routes |
 | `runtime` | Live dashboard: counters, VPN byte rates, pacing/UDP/TUN buffers (1s; Enter to stop) |
 | `ping` | Latency to peers |
-| `kick` | Disconnect peer (owner) |
-| `remove` | Remove peer from config |
+| `lan` | Same-FloatUnit LAN discover + assist (punch + claim hello) |
+| `remove` | Clear session and config (destructive) |
 | `stun` | Query public endpoint |
 | `punch` | Manual hole punch to host:port |
 | `config show` / `config reload` / `config reset` | Performance via `NetInfo/config.toml` (show, merge from disk + apply live, factory reset) |
@@ -541,7 +537,7 @@ First-run **`AppState::FirstRun`** menu runs before **`CommandLoop`**.
 
 | File | Role |
 |------|------|
-| `NetInfo/config.toml` (next to `ConnectUnit.exe`) | Full `NetworkConfig`: identity/session, peers, invites, parasitic state, buffers, MTU/metric, pacing/APD/DRR/FEC runtime knobs, decentralized join, and engine tuning keys (sectioned TOML tables: `[session]`, `[pacing]`, `[apd]`, `[drr]`, `[fec]`, `[congestion]`, `[failover]`, …) |
+| `NetInfo/config.toml` (next to `ConnectUnit.exe`) | Full `NetworkConfig`: identity/session, peers, invites, buffers, MTU/metric, pacing/APD/DRR/FEC runtime knobs, decentralized join, and engine tuning keys (sectioned TOML tables: `[session]`, `[pacing]`, `[apd]`, `[drr]`, `[fec]`, `[congestion]`, `[failover]`, …) |
 | `NetInfo/peer_cache.json` (next to `ConnectUnit.exe`) | Learned endpoints (maintained by engine; not normal hand-edit) |
 
 ### Identity / session fields (not applied by `config reload`)
@@ -550,30 +546,21 @@ These are written by create/join/leave flows. Changing them by hand requires a *
 
 | Field | Factory default | Meaning |
 |-------|----------------:|---------|
-| `server_name` | `""` | Display name for this node |
-| `network_id` | `""` | Network / room id (hex) |
-| `role` | `""` | `"owner"` or `"peer"` once joined |
+| `network_id` | `""` | Network / FloatUnit id (hex) |
 | `virtual_ip` | `""` | This node’s VIP |
-| `owner_real_ip` / `owner_port` | `""` / `0` | Owner’s known real endpoint |
+| `vip_epoch` | `0` | Claim epoch; bumped on VIP conflict loss |
 | `listen_port` | `0` | Saved bind preference; effective = `max(saved, 7878)` |
 | `node_id` | `""` | Local node id (hex) |
 | `crypto_key` | `""` | Network key (hex) |
-| `public_invite_code` | `""` | Single invite blob (mode=1; STUN endpoint or local IP:port fallback) |
-| `parasitic_enabled` | `false` | Parasitic join mode active |
-| `parasitic_peer_vip` / `parasitic_self_vip` | `""` | Parasitic signal peer / self |
-| `parasitic_peer_port` | `0` | Peer signal port in parasitic mode |
-| `parasitic_peer_node_id` | `""` | Peer node id in parasitic mode |
-| `parasitic_self_is_owner` | `false` | Local side is parasitic owner |
-| `parasitic_use_public` | `true` | `true` = Public parasitic (STUN/UPnP); `false` = LAN parasitic |
-| `peers` | `[]` | Authoritative peer list (`node_id`, `name`, `virtual_ip`, `real_ip`) |
-| `owner_endpoints_cache` | `[]` | Cached owner endpoints |
+| `public_invite_code` | `""` | Key-only invite blob |
+| `peers` | `[]` | Member roster (`node_id`, `name`, `virtual_ip`, `real_ip`, `vip_epoch`) |
 | `membership_version` / `last_membership_hash` | `0` / `""` | Membership revision + hash |
 | `created_at` | `0` | Profile create epoch (ms) |
 | `decentralized_enabled` | `false` | Tracker announce / decentralized path on |
 | `decentralized_trackers` | `[]` | Empty ⇒ built-in `DEFAULT_TRACKERS` list |
 | `decentralized_announce_secs` | `120` | Tracker re-announce interval (min effective 60 s) |
 | `decentralized_join_deadline_secs` | `120` | Join wait for `MPJA` / punch alignment |
-| `join_method` | `""` | e.g. `"decentralized"`, `"parasitic"`, `"manual"` after wizard |
+| `join_method` | `""` | e.g. `"decentralized"`, `"manual"` after wizard |
 
 ## Operational defaults (user-tunable)
 
@@ -619,16 +606,16 @@ Scheduler capacity (packets/s) is approximately `base_max_burst × (1_000_000 / 
 
 | Field | Default | Meaning | If ↑ | If ↓ |
 |-------|--------:|---------|------|------|
-| `pace_tick_us` | 300 | Engine send scheduler period | Slower tick → lower CPU, higher queue latency | Faster tick → lower latency, higher CPU |
+| `pace_tick_us` | 350 | Engine send scheduler period | Slower tick → lower CPU, higher queue latency | Faster tick → lower latency, higher CPU |
 | `pace_target_pps` | 8000 | Token refill rate when `pace_rate_mode=pps` (packets/s) | Higher throughput ceiling; more bandwidth | Lower cap; may queue or drop |
-| `pace_rate_mode` | `"pps"` | Global bucket units: `"pps"` or `"bytes"` | `bytes`: refill/consume/cap in bandwidth units | Packet-count bucket |
+| `pace_rate_mode` | `"bytes"` | Global bucket units: `"pps"` or `"bytes"` | `bytes`: refill/consume/cap in bandwidth units | Packet-count bucket |
 | `pace_target_bps` | `50000000` (~400 Mbit/s) | Refill rate when `pace_rate_mode=bytes` (**0** = derived from `pace_target_pps×1300`) | Higher byte/s ceiling | Lower bandwidth cap |
-| `base_max_burst` | 2 | Base max sends per tick (also APD ramp floor) | Bigger micro-bursts; jitter on wire | Smoother; may underuse link |
-| `pace_budget_cap_packets` | 32 | Max token-bucket balance in **packet units** (bytes mode: effective cap = value×1300) | Allows longer bursts after idle | Tighter burst control |
-| `pace_max_queue_packets` | 192 | Queue **basis** (splits into per-peer data cap + global control/retransmit caps) | More buffering per peer; higher latency under load | Earlier drop; lower delay |
+| `base_max_burst` | 3 | Base max sends per tick (also APD ramp floor) | Bigger micro-bursts; jitter on wire | Smoother; may underuse link |
+| `pace_budget_cap_packets` | 64 | Max token-bucket balance in **packet units** (bytes mode: effective cap = value×1300) | Allows longer bursts after idle | Tighter burst control |
+| `pace_max_queue_packets` | 250 | Queue **basis** (splits into per-peer data cap + global control/retransmit caps) | More buffering per peer; higher latency under load | Earlier drop; lower delay |
 | `pace_clock_mode` | `"hybrid"` | `""`/`auto`/`hybrid`: use `pace_spin_window_us`; `"spin"`: force spin window; `"hr"`: hybrid HR sleep (`spin_window=0`) | — | — |
-| `pace_spin_window_us` | 50 | Busy-wait within tick before sleep | Lower timer jitter; more CPU | Less CPU; coarser timing |
-| `pace_fab_enabled` | true | Lengthen tick after repeated overshoots | On: recovers from backlog spikes; tick less stable | Off: steady tick only |
+| `pace_spin_window_us` | 70 | Busy-wait within tick before sleep | Lower timer jitter; more CPU | Less CPU; coarser timing |
+| `pace_fab_enabled` | false | Lengthen tick after repeated overshoots | On: recovers from backlog spikes; tick less stable | Off: steady tick only |
 | `pace_fab_fallback_tick_us` | 500 | Tick used during FAB recovery | Slower drain during overload; less CPU | Faster FAB ticks; more CPU |
 | `tun_inject_queue_packets` | 512 | Broadcast channel for inject to TUN reader | Survives spikes from engine to adapter | Drops/lag on inject burst |
 | `tun_from_adapter_queue_packets` | 256 | mpsc capacity Wintun reader → engine (**startup-only**) | Absorbs TUN bursts before adapter ring fills | Earlier reader block; drops from adapter sooner |
@@ -637,7 +624,7 @@ Scheduler capacity (packets/s) is approximately `base_max_burst × (1_000_000 / 
 |---------|--------:|---------|------|------|
 | `drr_enabled` | true | Deficit round-robin across peers/queues | Fairer mix; slightly more CPU | FIFO-like; one peer can starve others |
 | `drr_small_packet_priority` | true | Prefer sub-threshold data packets per peer before bulk | Lower latency for small tunnel frames | Strict enqueue FIFO within peer |
-| `drr_small_packet_threshold_bytes` | 384 | Max length (bytes) for small-packet lane (**64–512**) | Larger frames count as “small” | Only smaller frames get priority |
+| `drr_small_packet_threshold_bytes` | 420 | Max length (bytes) for small-packet lane (**64–512**) | Larger frames count as “small” | Only smaller frames get priority |
 | `drr_rtt_aware` | true | Scale per-peer DRR quantum by **base RTT** (`rtt_base_ms`) vs median base among non-empty peers; missing base → no scale for that peer | High-base-RTT peers get larger byte slices per round | Fixed `drr_quantum` for all peers |
 | `drr_rtt_scale_min` | 0.5 | Lower clamp on RTT/ref ratio (**0.1–1.0**) | Low-RTT peers may get smaller quantum | Less differentiation for fast peers |
 | `drr_rtt_scale_max` | 2.5 | Upper clamp on RTT/ref ratio (**1.0–4.0**) | High-RTT peers may get larger quantum | Less compensation for slow peers |
@@ -655,17 +642,17 @@ When `apd_require_cc_headroom` is **true** and `congestion_enabled` is on, APD d
 | Field | Default | Meaning | If ↑ | If ↓ |
 |-------|--------:|---------|------|------|
 | `apd_enabled` | true | Queue-pressure ramp + drain | On: fights backlog | Off: pacing only |
-| `apd_high_watermark` | 0.4 | Queue fill ratio for ramp upper bound / drain arm (user range **0.2–0.95**; must be ≥ low + **0.1** unless cap mode) | Triggers later; less aggressive drain | Triggers sooner; more drain episodes |
-| `apd_low_watermark` | 0.1 | Fill ratio to exit drain (user range **0.1–0.8**) | Stays in drain longer | Exits drain sooner; queue may refill |
+| `apd_high_watermark` | 0.3 | Queue fill ratio for ramp upper bound / drain arm (user range **0.2–0.95**; must be ≥ low + **0.1** unless cap mode) | Triggers later; less aggressive drain | Triggers sooner; more drain episodes |
+| `apd_low_watermark` | 0.02 | Fill ratio to exit drain (user range **0.01–0.8**) | Stays in drain longer | Exits drain sooner; queue may refill |
 | `apd_sojourn_enabled` | true | Dual-gate drain arm/exit via HOL sojourn | Catches stale packets when fill is low | Fill-only arm/exit |
 | `apd_max_sojourn_ms` | 10 | Arm drain when HOL age exceeds this (ms, **2–500**) | Less sensitive to latency | Arms drain sooner on old HOL |
 | `apd_target_sojourn_ms` | 2 | Exit drain only when HOL age below this (ms, **1–200**, must be &lt; max − 2) | Exit drain sooner | Hold drain until queue is fresher |
 | `apd_require_cc_headroom` | **true** | Gate APD ramp-up / Drain arm / mid-Drain on data CC sendability | On: no false Drain/spin while CC starves all data HOL | Off: APD reacts to fill/sojourn even when CC blocks pops |
 | `ramp_max_burst` | 6 | **Absolute** max packets/tick for Tier-1 ramp ceiling (must be ≥ `base_max_burst`) | Faster ramp; bigger wire bursts in Alert | Slower ramp; smoother |
 | `drain_max_burst` | 3 | Max packets/tick during Tier-2 drain (≤ `ramp_max_burst`) | Faster drain micro-bursts | Gentler on upstream routers |
-| `apd_spinloop_budget_ms` | 3 | Max pure-spin time per drain episode (user **0–100** ms; **`0` = unlimited** until fill &lt; low WM) | Longer spin cap; more CPU | Shorter cap; may exit drain before queue empties |
-| `apd_drain_tick_us` | 100 | Pacing tick override in drain (`0` = base tick) | Faster drain loop | Slower drain |
-| `apd_confirm_ticks` | 4 | Ticks with ramp pinned and fill above high WM before drain (user **0–10**; **`0` = no confirm**) | Less false drain | More false positives |
+| `apd_spinloop_budget_ms` | 8 | Max pure-spin time per drain episode (user **0–100** ms; **`0` = unlimited** until fill &lt; low WM) | Longer spin cap; more CPU | Shorter cap; may exit drain before queue empties |
+| `apd_drain_tick_us` | 80 | Pacing tick override in drain (`0` = base tick) | Faster drain loop | Slower drain |
+| `apd_confirm_ticks` | 3 | Ticks with ramp pinned and fill above high WM before drain (user **0–10**; **`0` = no confirm**) | Less false drain | More false positives |
 | `apd_cooldown_ms` | 2 | Min time after drain before re-arming spin (ramp continues) | Fewer drain oscillations | Can re-enter drain spin quickly |
 | `apd_drain_freeze_drr` | true | Round-robin (not byte-deficit DRR) while draining | Prioritizes emptying queue | DRR continues; mixed fairness |
 
@@ -679,8 +666,8 @@ When enabled, pacing may proactively drop stale **bulk** HOL packets before the 
 |-------|--------:|---------|------|------|
 | `shed_enabled` | true | Enable bulk HOL stale shedding | Backlog pressure can be trimmed earlier | No proactive stale bulk drop |
 | `shed_max_sojourn_ms` | 30 | Drop bulk HOL older than this (**2–500** ms) | More tolerant to queue age | Drops stale bulk sooner |
-| `shed_min_fill` | 0.3 | Shedding gate: require fill ≥ this (**0.1–0.95**) | Shedding activates only under heavier fill | Can shed earlier under moderate fill |
-| `shed_max_per_tick` | 1 | Per-tick cap on stale bulk drops (**1–64**) | Faster stale-bulk cleanup in one tick | Smaller per-tick shedding work |
+| `shed_min_fill` | 0.1 | Shedding gate: require fill ≥ this (**0.1–0.95**) | Shedding activates only under heavier fill | Can shed earlier under moderate fill |
+| `shed_max_per_tick` | 2 | Per-tick cap on stale bulk drops (**1–64**) | Faster stale-bulk cleanup in one tick | Smaller per-tick shedding work |
 
 Sanitize rule: when `shed_enabled && apd_enabled && apd_sojourn_enabled`, `shed_max_sojourn_ms` is clamped to be at least `apd_max_sojourn_ms` so APD drain gets first chance before stale-bulk shedding.
 
@@ -703,25 +690,27 @@ Tracks base RTT and queuing delay on each `RouteEntry`. Optional gate on adaptiv
 |-------|--------:|---------|-----------|------------|
 | `congestion_enabled` | **true** | LEDBAT background CC (token bucket + delay gradient) | On: per-peer rate limits from queuing delay | Off: telemetry/FEC only; no pacing CC actuation |
 | `gain` | 0.1 | Multiplicative decrease when `queuing_delay / target > 1` (**0.1–4.0**) | Drops peer rate faster under delay | Gentler decrease |
-| `hol_escape_ms` | 12 | Send despite empty tokens when peer HOL sojourn ≥ this (**4–100**); recommend ≤ `apd_max_sojourn_ms` when `apd_require_cc_headroom` is on | Escape starvation sooner | Longer throttle under backlog |
-| `initial_rate_bps` | 2M | New peer starting rate (**≤ max_rate_bps**) | Higher cold-start send cap | Lower initial cap |
-| `additive_increase_bps` | 28000 | Linear increase per probe when delay ≤ target (**4000–1e6**) | Faster headroom use | Slower ramp |
+| `hol_escape_ms` | 8 | Send despite empty tokens when peer HOL sojourn ≥ this (**4–100**); recommend ≤ `apd_max_sojourn_ms` when `apd_require_cc_headroom` is on | Escape starvation sooner | Longer throttle under backlog |
+| `initial_rate_bps` | 4M | New peer starting rate (**≤ max_rate_bps**) | Higher cold-start send cap | Lower initial cap |
+| `additive_increase_bps` | 32000 | Linear increase per probe when delay ≤ target (**4000–1e6**) | Faster headroom use | Slower ramp |
 | `min_decrease_factor` | 0.9 | Floor on one multiplicative decrease step (**0.1–0.9**) | Shallower single-step cuts | Deeper cuts |
 | `rate_smoothing_alpha` | 0.9 | EWMA on applied rate (**0–0.95**) | Smoother rates | Faster response |
-| `min_rate_bps` / `max_rate_bps` | 1.8M / 25M | Absolute per-peer rate clamps | Wider/narrower range | Tighter caps |
+| `min_rate_bps` / `max_rate_bps` | 1.5M / 25M | Absolute per-peer rate clamps | Wider/narrower range | Tighter caps |
 | `loss_multiplicative_decrease` | 0.9 | On rising `loss_ewma` past failover threshold (**0.3–0.9**) | Stronger loss reaction | Weaker loss reaction |
-| `burst_cap_bytes` | 16000 | Per-peer token burst cap (**512–262144**) | Larger micro-bursts | Tighter pacing |
+| `burst_cap_bytes` | 24000 | Per-peer token burst cap (**512–262144**) | Larger micro-bursts | Tighter pacing |
 | `delivery_rate_window_ms` | **750** | Accumulate TX bytes before one delivery-rate EWMA sample (**100–5000**) | Smoother delivery estimate | Faster delivery samples |
 | `delivery_rate_ewma_alpha` | **0.25** | Weight of each delivery window sample (**0.05–1.0**) | Tracks recent TX faster | More inertia |
 | `delivery_anchor_factor` | **0.95** | On hard-anchored decrease, set rate to `delivery_ewma ×` this (**0.5–0.99**) | Softer floor under delivery | Deeper cut toward delivery |
 | `delivery_decouple_ratio` | **1.5** | Hard-anchor when `rate_bps > delivery_ewma ×` this (**1.05–3.0**); else classic MD | Needs larger ceiling/delivery gap | Anchors sooner when slightly above delivery |
 | `rtt_base_tracking` | true | Update RTT base / OWD base and queuing-delay telemetry | On: delay telemetry available | Off: skip base updates (effective QD stays cold/`-1`) |
 | `loss_classifier_enabled` | **true** | Gate adaptive FEC increases by delay ratio; gate Background CC loss-MD / loss-driven delivery anchor; enable post-congestion FEC recovery step-down | On: hold FEC parity up under congestion; CC ignores non-congestive loss edges; FEC step-down after QD recovers (see `fec_recovery_recency_ms`) | Off: loss-only adaptive FEC; CC always applies loss MD on rising edge |
-| `target_queue_delay_ms` | 15 | Denominator for `delay_ratio` (**10–150**) | Higher → less likely to classify as congestive | Lower → hold FEC increases sooner |
+| `target_queue_delay_ms` | 20 | Denominator for `delay_ratio` (**10–150**) | Higher → less likely to classify as congestive | Lower → hold FEC increases sooner |
 | `congestion_loss_threshold` | 0.7 | Hold increase / mark congestive when `effective_qd / target >` this (**0.3–0.95**); recovery uses the same threshold for “delay recovered” | More tolerant of delay before hold | Holds sooner |
 | `base_rtt_window_secs` | 4 | Min-RTT / min-OWD window length (**1–60**) | Slower base adaptation | Faster base churn |
 | `base_rtt_stale_windows` | 3 | Consecutive windows before base may **rise** (**1–10**) | Base rises only after more confirmation | Base rises sooner when path worsens |
-| `owd_clock_jump_reject_ms` | **30000** | Invalidate forward OWD base when `|sample − base|` exceeds this (**1000–600000**) | More tolerant of clock steps | Rejects / resets OWD sooner |
+| `owd_clock_jump_reject_ms` | **30000** | Invalidate forward OWD base when `|sample − base|` exceeds this (**1000–600000**) | More tolerant of large clock steps | Rejects / resets OWD sooner |
+| `owd_rtt_consistency_ms` | **5000** | Invalidate OWD when `|(2·owd − rtt) − residual_ewma|` exceeds this (**500–120000**); peer step ≈ half | Absorbs static skew; catches mid-session NTP steps under the absolute jump | Raise if extreme one-way queue / RTT collapse false-rejects |
+| `owd_prefer_after_samples` | **8** | Applied samples after cold before preferring forward QD (**1–64**; **1** = trust immediately) | Longer RTT-QD hysteresis after join/reject | Prefer forward QD sooner |
 | `probe_interval_ms` | 40 | Periodic compact ping/pong for RTT + forward OWD samples (**0** = off, else **20–1000**). Also drives probe-miss failover when on | Fresher queuing-delay telemetry; faster silent-peer detect | Less control traffic; sparser samples; **0** disables probe-miss failover |
 | `fec_recovery_recency_ms` | **1200** | After last congestive sample, how long recovery may step parity down one ladder rung (**0** = off; else **100–60000**) | Longer sticky post-bloat shed window | Shorter / disable step-down (hold-increase only) |
 
@@ -745,7 +734,7 @@ DRR RTT-aware fairness uses **base RTT** only (orthogonal to background CC’s q
 
 ### Punch (create/join)
 
-All interactive punch paths (manual `punch`, invite join, parasitic active/passive, decentralized join overlay, reconnect fastpath) use the same **canonical 3-stage workflow** in `src/net/punch_workflow.rs`:
+All interactive punch paths (manual `punch`, invite join, LAN assist, decentralized join overlay, reconnect) use the same **canonical 3-stage workflow** in `src/net/punch_workflow.rs`:
 
 | Stage | Behavior |
 |-------|----------|
@@ -772,9 +761,7 @@ On-disk TOML is sectioned by feature. Example shape (key names unchanged inside 
 
 ```toml
 [session]
-server_name = "..."
 network_id = "..."
-role = "owner"
 virtual_ip = "10.0.0.1"
 # crypto_key, node_id, listen_port, invites, membership, …
 
@@ -784,7 +771,6 @@ name = "..."
 virtual_ip = "10.0.0.2"
 real_ip = "..."
 
-[parasitic]
 [adapter]
 [pacing]
 [apd]
@@ -823,7 +809,7 @@ stale_evict_secs = 45
 ```
 
 Full key sets for each advanced table use the current field names (`d2r_*`, `keepalive_secs`, `shard_payload_size`, `congestion_enabled`, `probe_timeout_ms`, `rtt_ewma_*`, `max_direct_retry_per_tick`, `punch_stage*`, …).
-Clamps (enforced before apply): `stale_tick < stale_mark < stale_evict`; `rto_min ≤ rto_max`; `shard_payload_size` ∈ `512..=1279` (v3 wire max — larger needs a protocol bump); PMTUD: `probe_timeout_ms` ∈ `50..=10000` (adaptive timeout floor; effective timeout also capped at 5s), `confirm_count` ∈ `1..=8`, `resolve_epsilon` ∈ `1..=8`, `raise_step` ∈ `1..=512`, `max_probes_per_search` ∈ `8..=256`, `max_concurrent_peers` ∈ `1..=64`, `pmtud_tick_ms` ∈ `10..=1000`; `adaptive_off_below ≤ adaptive_on_above`; congestion: `gain` ∈ `0.1..=4.0`, `hol_escape_ms` ∈ `4..=100`, `target_queue_delay_ms` ∈ `10..=150`, `congestion_loss_threshold` ∈ `0.3..=0.95`, `base_rtt_window_secs` ∈ `1..=60`, `base_rtt_stale_windows` ∈ `1..=10`, `owd_clock_jump_reject_ms` ∈ `1000..=600000`, `probe_interval_ms` **0** or **20–1000**, `fec_recovery_recency_ms` **0** or **100–60000**, `min_decrease_factor` ∈ `0.1..=0.9`, `additive_increase_bps` ∈ `4000..=1_000_000`, `rate_smoothing_alpha` ∈ `0..=0.95`, `min_rate_bps` ≥ `1000`, `max_rate_bps` ≤ `50_000_000`, `initial_rate_bps` ∈ `[min_rate_bps, max_rate_bps]`, `loss_multiplicative_decrease` ∈ `0.3..=0.9`, `burst_cap_bytes` ∈ `512..=262144`, `delivery_rate_window_ms` ∈ `100..=5000`, `delivery_rate_ewma_alpha` ∈ `0.05..=1.0`, `delivery_anchor_factor` ∈ `0.5..=0.99`, `delivery_decouple_ratio` ∈ `1.05..=3.0`; `pace_rate_mode` must be `pps` or `bytes`.
+Clamps (enforced before apply): `stale_tick < stale_mark < stale_evict`; `rto_min ≤ rto_max`; `shard_payload_size` ∈ `512..=1279` (v3 wire max — larger needs a protocol bump); PMTUD: `probe_timeout_ms` ∈ `50..=10000` (adaptive timeout floor; effective timeout also capped at 5s), `confirm_count` ∈ `1..=8`, `resolve_epsilon` ∈ `1..=8`, `raise_step` ∈ `1..=512`, `max_probes_per_search` ∈ `8..=256`, `max_concurrent_peers` ∈ `1..=64`, `pmtud_tick_ms` ∈ `10..=1000`; `adaptive_off_below ≤ adaptive_on_above`; congestion: `gain` ∈ `0.1..=4.0`, `hol_escape_ms` ∈ `4..=100`, `target_queue_delay_ms` ∈ `10..=150`, `congestion_loss_threshold` ∈ `0.3..=0.95`, `base_rtt_window_secs` ∈ `1..=60`, `base_rtt_stale_windows` ∈ `1..=10`, `owd_clock_jump_reject_ms` ∈ `1000..=600000`, `owd_rtt_consistency_ms` ∈ `500..=120000`, `owd_prefer_after_samples` ∈ `1..=64`, `probe_interval_ms` **0** or **20–1000**, `fec_recovery_recency_ms` **0** or **100–60000**, `min_decrease_factor` ∈ `0.1..=0.9`, `additive_increase_bps` ∈ `4000..=1_000_000`, `rate_smoothing_alpha` ∈ `0..=0.95`, `min_rate_bps` ≥ `1000`, `max_rate_bps` ≤ `50_000_000`, `initial_rate_bps` ∈ `[min_rate_bps, max_rate_bps]`, `loss_multiplicative_decrease` ∈ `0.3..=0.9`, `burst_cap_bytes` ∈ `512..=262144`, `delivery_rate_window_ms` ∈ `100..=5000`, `delivery_rate_ewma_alpha` ∈ `0.05..=1.0`, `delivery_anchor_factor` ∈ `0.5..=0.99`, `delivery_decouple_ratio` ∈ `1.05..=3.0`; `pace_rate_mode` must be `pps` or `bytes`.
 
 **FEC `shard_payload_size`** is a *local send ceiling*. Reducing it is valid for all peers on this wire version (they decode smaller shards fine); values above `1279` are rejected because the FEC header cannot carry larger shards without a wire-version change. Changing it flushes in-flight FEC groups. At send time the engine also derives an **effective** ceiling `min(configured, min_path_mtu − 28 − 12)` so FEC UDP datagrams fit the PMTUD path; if that value is below `512`, FEC bypasses. While APD is in Drain, FEC *timer* flush is passthrough-only (no Reed–Solomon parity).
 
@@ -848,9 +834,9 @@ Beyond [Failover defaults](#failover-defaults) and the `[routing_ewma]` / `quali
 
 | Timer | Period | Meaning | If ↑ | If ↓ |
 |-------|--------|---------|------|------|
-| Peer keepalive | 5 s | Coverage-gated `MCTL` HB (or standalone `MKPL`); owner_extra may add HOL | Less keepalive traffic; bindings may expire | More traffic; fresher mappings |
-| MSYN sync | 15 s | Membership table broadcast period | Slower peer list convergence | Faster updates; more control traffic |
-| MSYN coalesce (owner) | 50 ms | Batches owner MSYN churn | Fewer packets; slower fan-out | More frequent sync |
+| Peer keepalive | 5 s | Coverage-gated `MCTL` HB (or standalone `MKPL`) | Less keepalive traffic; bindings may expire | More traffic; fresher mappings |
+| Claim gossip period | 15 s | `timers.msyn_secs` — MCLG fanout period | Slower mesh convergence | Faster updates; more control traffic |
+| Claim gossip fanout | 8 | Active endpoints per MCLG send | Faster membership flood | Slower fan-out |
 | Direct route retry | 5 s | Retries direct path after relay | Slower rediscovery | More aggressive direct retry |
 | PMTUD tick / raise | 50 ms active / 60 s raise | Search tick while probing; periodic raise/revalidate | Slower MTU adaptation | More probe traffic |
 | Stale tick / mark / evict | 30 / 45 / 120 s | Route aging and removal | Keeps dead routes longer | Faster cleanup; risk drop valid slow peers |
@@ -864,8 +850,7 @@ Beyond [Failover defaults](#failover-defaults) and the `[routing_ewma]` / `quali
 | Constant | Value | Meaning | If ↑ | If ↓ |
 |----------|------:|---------|------|------|
 | `probe_miss_fail_threshold` | 8 | Consecutive CC-probe timeouts (no pong) before one `note_fail` per expire sweep (**3–64**) | More tolerant of burst loss before failover | Faster silent-peer `note_fail` |
-| `MAX_EXTRA_KEYS` | 8 | Extra peer crypto keys cached | More parasitic/multi-key peers | Evict sooner |
-| MSYN `MAX_PER_TICK` | 8 | MSYN relay sends per tick | Faster membership flood | Slower fan-out |
+| `MAX_EXTRA_KEYS` | 8 | Extra peer crypto keys cached | More multi-key peers | Evict sooner |
 
 **STUN / membership / misc**
 
@@ -873,10 +858,10 @@ Beyond [Failover defaults](#failover-defaults) and the `[routing_ewma]` / `quali
 |-----------|------:|---------|------|------|
 | `stun_cache_ttl_secs` | 30 | Reuse mapped address without query (config) | Fewer STUN requests | Staler public endpoint |
 | `STUN_QUERY_DEADLINE_SLACK` | 2 s | Extra wait beyond user timeout | More likely late STUN answer | Stricter timeout |
-| `msyn_body_max` | 524288 | Max MSYN/MCTL payload size (config; hard ceiling 524288) | Allows huge peer lists | Reject large sync |
-| `msyn_shard_budget_bytes` | 1200 | Wire-oriented max for one MSYN part after `MCTL`+`MCTS` wrap; JSON packed under budget−52 (512..=min(4096, msyn_body_max)) | Fewer/larger parts | More parts; safer UDP fit |
+| `msyn_body_max` | 524288 | Max MCLG / MCTL payload size (config; hard ceiling 524288) | Allows huge claim digests | Reject large gossip |
+| `msyn_shard_budget_bytes` | 1200 | Retained tuning key (unused by claim gossip; former MSYN shard budget) | — | — |
+| `MAX_MSMD_CACHE` | 4096 | Dedup leave (`MLEA`) event ids | More memory | Earlier dedup eviction |
 | `MAX_MSSP_ROUTES` | 1024 | Routes in MSSP snapshot | Larger networks | Truncate route ads |
-| `MAX_MSMD_CACHE` | 4096 | Dedup MSMD events | More memory | Earlier dedup eviction |
 | DNS timeout | 800 ms | STUN hostname resolve wait | Slower fail on bad DNS | Faster fail |
 | Keepalive task min interval | 100 ms | Floor for `SetPeerKeepalive` | — | — |
 
@@ -946,7 +931,7 @@ Owned exclusively by the **`mint-pacing`** OS thread (`src/net/pacing_worker.rs`
 | Parameter | Value | Meaning | If ↑ | If ↓ |
 |-----------|------:|---------|------|------|
 | `raise_step` | 32 | Initial exponential raise increment | Coarser early steps | Finer early steps |
-| `resolve_epsilon` | 8 | Stop binary when `first_bad - last_good ≤ ε` | Less precise ceiling | Byte-accurate (ε=1) |
+| `resolve_epsilon` | 4 | Stop binary when `first_bad - last_good ≤ ε` | Less precise ceiling | Byte-accurate (ε=1) |
 | `confirm_count` | 3 | Timeouts at same size before confirmed fail | More loss-tolerant | Faster fail on loss |
 | `probe_timeout_ms` | 500 | Floor for adaptive probe timeout (cap 5s) | Longer minimum wait | Faster retries when RTT is low |
 | `max_probes_per_search` | 64 | Campaign budget → Frozen (not applied to Recheck) | Longer search | Freeze sooner |
@@ -954,19 +939,17 @@ Owned exclusively by the **`mint-pacing`** OS thread (`src/net/pacing_worker.rs`
 | `MIN_ADAPTER_PAYLOAD_MTU` | 280 | Hard floor for suggested/applied adapter MTU | — | — |
 | `pmtud_tick_ms` / `pmtud_raise_secs` | 50 / 60 | Active tick vs raise/revalidate period | — | — |
 
-### NAT / punch / parasitic (`src/cli.rs`)
+### NAT / punch / LAN assist (`src/cli.rs`)
 
 | Constant | Value | Meaning | If ↑ | If ↓ |
 |----------|------:|---------|------|------|
-| `PARA_SIGNAL_*` | 10 / 1500 ms | VIP signal retries | Better discovery | More LAN UDP |
-| `PARA_PUNCH_WORKFLOW_DEADLINE_SECS` | 25 | Parasitic wait while canonical punch runs | Longer join attempt | Shorter timeout |
+| `PARA_LAN_DISCOVER_MS` | 2500 | LAN presence discover window | Longer discovery | Faster timeout |
+| `PARA_SIGNAL_*` | 10 / 1500 ms | Presence signal retries | Better discovery | More LAN UDP |
+| `PARA_PUNCH_WORKFLOW_DEADLINE_SECS` | 25 | Wait while canonical punch runs | Longer attempt | Shorter timeout |
 | `PARA_KEEPALIVE_*` | 3 × 100 ms | Pre-workflow MHOL to each candidate | — | — |
-| `PARA_SESSION_TTL_MS` | 90000 | Parasitic session lifetime | Longer state | Faster cleanup |
-| `PARA_MAX_PENDING_SESSIONS` | 16 | Concurrent parasitic joins | More parallel joins | Reject earlier |
-| `PARA_OWNER_ACK_DEADLINE_MS` | 45000 | Owner wait for peer ack | More patient join | Faster timeout |
-| `PARA_MAX_CLOCK_SKEW_MS` | 5000 | Allowed time skew for para sync | Looser clocks | Stricter |
+| `PARA_MAX_CLOCK_SKEW_MS` | 5000 | Allowed time skew for presence sync | Looser clocks | Stricter |
 
-(Remaining `PARA_*` in `cli.rs` follow same pattern: higher attempt/PPS/deadline → more traffic or longer waits.)
+(Remaining LAN assist helpers in `cli.rs` follow same pattern: higher attempt/PPS/deadline → more traffic or longer waits.)
 
 ### Process / OS
 
@@ -1019,6 +1002,18 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 - **Engine and routing locks:** avoid holding `routing.write()` across await points in new code.
 - **Admin required** for Wintun and some adapter operations (UAC on each launch unless policy disables prompts).
 
+### FloatUnit mesh invariants
+
+| Invariant | Contract |
+|-----------|----------|
+| Equal members | Every peer with the network key is equal; no kick / no reserved VIP host |
+| Unique live VIP (settled view) | After claim merge + `settle_duplicate_vips`, a node’s claim map + self VIP do not keep two live claims on the same VIP |
+| Claim fight | Same VIP + different `node_id` → lexicographically smaller hex `node_id` wins; loser bumps `vip_epoch` and rerolls via `apply_local_vip_change` (persists config + Wintun); winner never routes `my_vip` to a peer EP; observers soft-drop the loser (node-scoped VIP route remove + 30s suppress, **slid on repeated sightings**) without roster/crypto/FEC teardown |
+| Shared `/24` | VIP hosts live in `10.H1.H2.0/24` derived from the network key (`floatunit-subnet-v1`); FloatUnit forces `subnet_prefix = 24`. With crypto set, wire claim/join/gossip/leave/HPCH VIP bodies outside that `/24` are ignored |
+| Unknown key | Sealed control (`MCTS`, including `MCLG`) that fails AEAD open is dropped (`auth_failures`); LAN presence replies only on matching `network_id` (never transmits the key) |
+| One-hop relay | Hub forwards MDAT/PRXY to the destination’s **direct** endpoint only; PRXY initial `ttl = 1`, inbound clamp to 1, forwarded `ttl = 0` — never relays a relay |
+| Exclusion | Rotate to a new FloatUnit key |
+
 ---
 
 ## Quick trace cheatsheet
@@ -1029,7 +1024,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 | Why relay instead of direct? | `routing.rs` `should_relay`, quality/loss EWMA |
 | Join failed? | `cli.rs` `handle_join`, `EngineCmd::PrepareJoin`, `MPJN`/`MPJA` in engine |
 | MTU issues? | `pmtud.rs`, `MPMT`/`MPAR`, adapter MTU in config |
-| LAN join without invite? | Parasitic LAN: `discover_parasitic_lan` / `join_parasitic_lan_with_target`, `MPHI`/`MPHR`/`MPHO` |
+| LAN assist (same key)? | `discover_lan_members` / `assist_lan_member`, `MPHI`/`MPHR` by `network_id`, then `MPJN` |
 | TUN not receiving? | `tun/wintun.rs` read loop, inject broadcast capacity |
 
 Behaviour on the wire is always defined by **`src/`**, **`tests/`**, and this document.

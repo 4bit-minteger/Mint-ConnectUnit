@@ -1090,11 +1090,54 @@ impl PathMtuDiscovery {
         let raise_step = self.raise_step;
         let epsilon = self.resolve_epsilon;
         let downgrade_batches = self.stable_downgrade_batches;
+        let sz = Self::clamp_size(size);
 
-        let Some(peer) = self.peers.get_mut(&peer_addr) else {
+        let resolved_peer_addr = if self.peers.contains_key(&peer_addr) {
+            Some(peer_addr)
+        } else {
+            let mut candidate: Option<SocketAddr> = None;
+            for (addr, state) in &self.peers {
+                if addr.ip() != peer_addr.ip() {
+                    continue;
+                }
+                let inflight_match = match &state.inflight {
+                    Some(inf) => {
+                        state.search_gen == search_gen
+                            && inf.probe_id != 0
+                            && inf.probe_id == probe_id
+                            && inf.size == sz
+                    }
+                    None => false,
+                };
+                let grace_match = if state.inflight.is_none() {
+                    match &state.grace {
+                        Some(g) => {
+                            g.probe_id == probe_id
+                                && g.search_gen == search_gen
+                                && g.size == sz
+                                && now <= g.deadline
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if !inflight_match && !grace_match {
+                    continue;
+                }
+                if candidate.is_some() {
+                    return (false, false, events);
+                }
+                candidate = Some(*addr);
+            }
+            candidate
+        };
+        let Some(resolved_peer_addr) = resolved_peer_addr else {
             return (false, false, events);
         };
-        let sz = Self::clamp_size(size);
+        let Some(peer) = self.peers.get_mut(&resolved_peer_addr) else {
+            return (false, false, events);
+        };
 
         // Late-ACK grace match (Revalidate/Recheck).
         if peer.inflight.is_none() {
@@ -1872,6 +1915,10 @@ mod tests {
         "192.168.0.100:7878".parse().unwrap()
     }
 
+    fn same_ip_peer(port: u16) -> SocketAddr {
+        format!("198.51.100.1:{port}").parse().unwrap()
+    }
+
     #[test]
     fn is_rfc1918_private_ip_predicate() {
         assert!(is_rfc1918_private_ip("192.168.1.1".parse().unwrap()));
@@ -2040,5 +2087,91 @@ mod tests {
         assert_eq!(st.stable, DEFAULT_MTU);
         assert!(matches!(st.phase, Phase::Plateau));
         assert_eq!(st.next_raise_at, now);
+    }
+
+    #[test]
+    fn on_ack_accepts_same_ip_different_port_with_unique_match() {
+        let mut p = PathMtuDiscovery::new();
+        p.confirm_count = 1;
+        let ep = same_ip_peer(5000);
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.next_raise_at = now;
+            st.first_bad = FIRST_BAD_SENTINEL;
+        }
+        let intents = tick_one(&mut p, now, ep);
+        assert!(!intents.is_empty());
+        let intent = intents[0];
+        let remapped: SocketAddr = "198.51.100.1:6000".parse().unwrap();
+        let (ok, _, _) = p.on_ack(
+            remapped,
+            intent.size,
+            intent.probe_id,
+            intent.search_gen,
+            now,
+        );
+        assert!(ok);
+        assert!(p.peers.get(&ep).unwrap().ever_acked);
+    }
+
+    #[test]
+    fn on_ack_same_ip_ambiguous_inflight_rejected() {
+        let mut p = PathMtuDiscovery::new();
+        p.confirm_count = 1;
+        let ep_a = same_ip_peer(5000);
+        let ep_b = same_ip_peer(5001);
+        let now = Instant::now();
+        p.ensure_peer(ep_a, now);
+        p.ensure_peer(ep_b, now);
+        {
+            let st = p.peers.get_mut(&ep_a).unwrap();
+            st.search_gen = 7;
+            st.inflight = Some(Inflight {
+                probe_id: 11,
+                size: 1400,
+                confirms_left: 1,
+                deadline: now + Duration::from_secs(1),
+            });
+        }
+        {
+            let st = p.peers.get_mut(&ep_b).unwrap();
+            st.search_gen = 7;
+            st.inflight = Some(Inflight {
+                probe_id: 11,
+                size: 1400,
+                confirms_left: 1,
+                deadline: now + Duration::from_secs(1),
+            });
+        }
+        let remapped: SocketAddr = "198.51.100.1:6500".parse().unwrap();
+        let (ok, _, _) = p.on_ack(remapped, 1400, 11, 7, now);
+        assert!(!ok);
+        assert!(p.peers.get(&ep_a).unwrap().inflight.is_some());
+        assert!(p.peers.get(&ep_b).unwrap().inflight.is_some());
+    }
+
+    #[test]
+    fn on_ack_same_ip_wrong_probe_rejected() {
+        let mut p = PathMtuDiscovery::new();
+        p.confirm_count = 1;
+        let ep = same_ip_peer(5002);
+        let now = Instant::now();
+        p.ensure_peer(ep, now);
+        {
+            let st = p.peers.get_mut(&ep).unwrap();
+            st.search_gen = 9;
+            st.inflight = Some(Inflight {
+                probe_id: 21,
+                size: 1300,
+                confirms_left: 1,
+                deadline: now + Duration::from_secs(1),
+            });
+        }
+        let remapped: SocketAddr = "198.51.100.1:6600".parse().unwrap();
+        let (ok, _, _) = p.on_ack(remapped, 1300, 22, 9, now);
+        assert!(!ok);
+        assert!(p.peers.get(&ep).unwrap().inflight.is_some());
     }
 }

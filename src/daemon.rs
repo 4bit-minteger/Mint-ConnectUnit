@@ -1,20 +1,18 @@
 //! VPN daemon: engine + full `Cli` session host; serves IPC to thin CLI clients.
 
+use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::Result;
 use tokio::task::LocalSet;
 
-use crate::bootstrap::{self, BootstrapSnapshot, ReconnectOutcome};
+use crate::bootstrap::{BootstrapSnapshot, ReconnectOutcome};
 use crate::cli::Cli;
 use crate::cli_emit::{begin_capture, end_capture, set_daemon_ui_bus};
 use crate::vpn_controller::VpnController;
 
 fn ipc_response_from_capture(result: Result<()>, mut lines: Vec<String>) -> IpcResponse {
     if let Err(e) = result {
-        lines.push(format!("[error] {e}"));
+        lines.push(crate::term_style::fmt_info_line(format_args!(" {e}")));
     }
     IpcResponse::Ok { lines }
 }
@@ -65,6 +63,7 @@ pub async fn run_daemon() -> Result<()> {
     let rt = build_engine_runtime(config.clone()).await?;
     let boot_cmd_tx = rt.cmd_tx.clone();
     let initial_pacing = rt.initial_pacing;
+    let mut identity_changed_rx = rt.identity_changed_rx;
 
     let cli = Cli::new(
         rt.config.clone(),
@@ -73,7 +72,6 @@ pub async fn run_daemon() -> Result<()> {
         rt.tun_from_tun_tx,
         rt.tun_inject_rx,
         Some(rt.peer_cache_reset_tx),
-        rt.owner_vip_pool,
         Some(rt.engine_metrics),
         rt.runtime_trace,
         true, // headless: all prompts on CLI client
@@ -92,6 +90,19 @@ pub async fn run_daemon() -> Result<()> {
     let ui_srv = state.controller.ui.clone();
     local.spawn_local(async move {
         let _ = run_ui_event_server(ui_srv).await;
+    });
+
+    let state_identity = state.clone();
+    local.spawn_local(async move {
+        while let Some(ev) = identity_changed_rx.recv().await {
+            let mut c = state_identity.cli_lock();
+            if let Err(e) = c.apply_identity_changed(&ev.new_vip, ev.vip_epoch).await {
+                let _ = state_identity
+                    .controller
+                    .ui
+                    .emit_stderr(format!("identity change apply failed: {e}"));
+            }
+        }
     });
 
     local
@@ -113,48 +124,19 @@ pub async fn run_daemon() -> Result<()> {
 async fn run_daemon_bootstrap_task(state: Arc<DaemonState>) {
     *state.controller.bootstrap.write() = BootstrapSnapshot::pending();
 
-    let peer_defer = match {
+    if let Err(e) = {
         let mut c = state.cli_lock();
         c.daemon_bootstrap_before_reconnect().await
     } {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = state
-                .controller
-                .ui
-                .emit_stderr(format!("daemon bootstrap (pre): {e}"));
-            false
-        }
-    };
-
-    let outcome = if peer_defer {
-        let reconnect_fut = async {
-            let mut c = state.cli_lock();
-            c.parasitic_auto_reconnect().await
-        };
-        match tokio::time::timeout(
-            Duration::from_secs(bootstrap::PARA_AUTO_RECONNECT_DEADLINE_SECS),
-            reconnect_fut,
-        )
-        .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                let _ = state
-                    .controller
-                    .ui
-                    .emit_stderr(format!("daemon parasitic auto-reconnect: {e}"));
-                ReconnectOutcome::Failed
-            }
-            Err(_) => ReconnectOutcome::TimedOut,
-        }
-    } else {
-        ReconnectOutcome::Skipped
-    };
+        let _ = state
+            .controller
+            .ui
+            .emit_stderr(format!("daemon bootstrap (pre): {e}"));
+    }
 
     let snapshot = match {
         let mut c = state.cli_lock();
-        c.daemon_bootstrap_finalize(outcome, peer_defer).await
+        c.daemon_bootstrap_finalize(ReconnectOutcome::Skipped).await
     } {
         Ok(s) => s,
         Err(e) => {
@@ -164,12 +146,7 @@ async fn run_daemon_bootstrap_task(state: Arc<DaemonState>) {
                 .emit_stderr(format!("daemon bootstrap (finalize): {e}"));
             BootstrapSnapshot {
                 complete: true,
-                parasitic_attempted: peer_defer,
-                outcome: Some(if peer_defer {
-                    ReconnectOutcome::Failed
-                } else {
-                    ReconnectOutcome::Skipped
-                }),
+                outcome: Some(ReconnectOutcome::Skipped),
                 home_lines: vec![],
             }
         }
@@ -331,57 +308,41 @@ async fn handle_ipc(state: Arc<DaemonState>, req: IpcRequest) -> IpcResponse {
             IpcResponse::Ok { lines: vec![] }
         }
         IpcRequest::CreateNetwork {
-            name,
             listen_port,
-            owner_vip,
+            virtual_ip,
             subnet_prefix,
         } => {
             begin_capture();
             let result = {
                 let mut cli = state.cli_lock();
-                cli.create_network_with_params(name, listen_port, owner_vip, subnet_prefix)
+                cli.create_network_with_params(listen_port, virtual_ip, subnet_prefix)
                     .await
             };
             let captured = end_capture();
             ipc_response_from_capture(result, captured)
         }
-        IpcRequest::JoinParasitic {
-            peer_vip,
-            self_vip,
-            upnp_port,
-        } => {
+        IpcRequest::DiscoverLanMembers => {
             begin_capture();
             let result = {
                 let mut cli = state.cli_lock();
-                cli.join_parasitic_with_params(peer_vip, self_vip, upnp_port)
-                    .await
+                cli.discover_lan_members().await
             };
             let captured = end_capture();
-            ipc_response_from_capture(result, captured)
-        }
-        IpcRequest::DiscoverParasiticLan => {
-            begin_capture();
-            let result = {
-                let mut cli = state.cli_lock();
-                cli.discover_parasitic_lan().await
-            };
-            let captured = end_capture();
-            // Still emit discover progress lines to UI, then return structured owners.
             for line in captured {
                 let _ = state.controller.ui.emit_plain(line);
             }
             match result {
-                Ok(owners) => IpcResponse::ParasiticLanOwners { owners },
+                Ok(members) => IpcResponse::LanMembers { members },
                 Err(e) => IpcResponse::Err {
                     message: e.to_string(),
                 },
             }
         }
-        IpcRequest::JoinParasiticLan { target } => {
+        IpcRequest::AssistLanMember { target } => {
             begin_capture();
             let result = {
                 let mut cli = state.cli_lock();
-                cli.join_parasitic_lan_from_str(target).await
+                cli.assist_lan_member(target).await
             };
             let captured = end_capture();
             ipc_response_from_capture(result, captured)
@@ -395,11 +356,15 @@ async fn handle_ipc(state: Arc<DaemonState>, req: IpcRequest) -> IpcResponse {
             let captured = end_capture();
             ipc_response_from_capture(result, captured)
         }
-        IpcRequest::JoinInvite { invite, lan_mode } => {
+        IpcRequest::JoinInvite {
+            invite,
+            lan_mode,
+            endpoint,
+        } => {
             begin_capture();
             let result = {
                 let mut cli = state.cli_lock();
-                cli.join_invite_code(invite, lan_mode).await
+                cli.join_invite_code(invite, lan_mode, endpoint).await
             };
             let captured = end_capture();
             ipc_response_from_capture(result, captured)

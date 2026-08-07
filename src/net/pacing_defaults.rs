@@ -1,13 +1,13 @@
 //! Single source of truth for pacing / APD defaults and effective-value fallbacks.
 
-pub const DEFAULT_PACE_TICK_US: i64 = 300;
+pub const DEFAULT_PACE_TICK_US: i64 = 350;
 pub const DEFAULT_PACE_TARGET_PPS: i64 = 8_000;
-pub const DEFAULT_PACE_BURST_PER_TICK: i64 = 2;
-pub const DEFAULT_PACE_BUDGET_PACKETS: f64 = 32.0;
-pub const DEFAULT_PACE_MAX_QUEUE: i64 = 192;
+pub const DEFAULT_PACE_BURST_PER_TICK: i64 = 3;
+pub const DEFAULT_PACE_BUDGET_PACKETS: f64 = 64.0;
+pub const DEFAULT_PACE_MAX_QUEUE: i64 = 250;
 
-pub const DEFAULT_PACE_SPIN_WINDOW_US: i64 = 50;
-pub const DEFAULT_PACE_FAB_ENABLED: bool = true;
+pub const DEFAULT_PACE_SPIN_WINDOW_US: i64 = 70;
+pub const DEFAULT_PACE_FAB_ENABLED: bool = false;
 pub const DEFAULT_PACE_FAB_FALLBACK_TICK_US: i64 = 500;
 
 pub const DEFAULT_MAX_TICK_WORK_US: u64 = 150;
@@ -26,15 +26,15 @@ pub const DEFAULT_TUN_INJECT_QUEUE: i64 = 512;
 pub const DEFAULT_TUN_FROM_ADAPTER_QUEUE: i64 = 256;
 
 pub const DEFAULT_APD_ENABLED: bool = true;
-pub const DEFAULT_APD_HIGH_WM: f32 = 0.40;
-pub const DEFAULT_APD_LOW_WM: f32 = 0.10;
+pub const DEFAULT_APD_HIGH_WM: f32 = 0.30;
+pub const DEFAULT_APD_LOW_WM: f32 = 0.02;
 /// Absolute burst ceiling for Tier-1 ramp (not “extra” packets).
 pub const DEFAULT_RAMP_MAX_BURST: u64 = 6;
 /// Max packets/tick during Tier-2 drain (pure-spin); independent of ramp ceiling.
 pub const DEFAULT_DRAIN_MAX_BURST: u64 = 3;
-pub const DEFAULT_APD_SPINLOOP_BUDGET_MS: u32 = 3;
-pub const DEFAULT_APD_DRAIN_TICK_US: u64 = 100;
-pub const DEFAULT_APD_CONFIRM_TICKS: u32 = 4;
+pub const DEFAULT_APD_SPINLOOP_BUDGET_MS: u32 = 8;
+pub const DEFAULT_APD_DRAIN_TICK_US: u64 = 80;
+pub const DEFAULT_APD_CONFIRM_TICKS: u32 = 3;
 pub const DEFAULT_APD_COOLDOWN_MS: u32 = 2;
 pub const DEFAULT_APD_DRAIN_FREEZE_DRR: bool = true;
 pub const DEFAULT_APD_SOJOURN_ENABLED: bool = true;
@@ -44,12 +44,12 @@ pub const DEFAULT_APD_TARGET_SOJOURN_MS: u32 = 2;
 pub const DEFAULT_APD_REQUIRE_CC_HEADROOM: bool = true;
 pub const DEFAULT_SHED_ENABLED: bool = true;
 pub const DEFAULT_SHED_MAX_SOJOURN_MS: u32 = 30;
-pub const DEFAULT_SHED_MIN_FILL: f32 = 0.3;
-pub const DEFAULT_SHED_MAX_PER_TICK: u32 = 1;
+pub const DEFAULT_SHED_MIN_FILL: f32 = 0.1;
+pub const DEFAULT_SHED_MAX_PER_TICK: u32 = 2;
 pub const DEFAULT_MIN_CONTROL_RESERVED_BYTES_PER_TICK: u32 = 256;
 pub const DEFAULT_MIN_RETRANSMIT_RESERVED_BYTES_PER_TICK: u32 = 256;
 pub const DEFAULT_DRR_SMALL_PACKET_PRIORITY: bool = true;
-pub const DEFAULT_DRR_SMALL_PACKET_THRESHOLD_BYTES: u32 = 384;
+pub const DEFAULT_DRR_SMALL_PACKET_THRESHOLD_BYTES: u32 = 420;
 pub const DEFAULT_DRR_RTT_AWARE: bool = true;
 pub const DEFAULT_DRR_RTT_SCALE_MIN: f64 = 0.5;
 pub const DEFAULT_DRR_RTT_SCALE_MAX: f64 = 2.5;
@@ -64,6 +64,8 @@ pub const DRR_SMALL_BULK_FORCE_AFTER: u8 = 8;
 /// Bulk HOL age (ms) that forces a bulk pop ahead of small lane.
 pub const DRR_BULK_HOL_FORCE_MS: u32 = 8;
 pub const PACE_RESERVED_BYTES_PER_TICK_MAX: u32 = 8192;
+pub const APD_LOW_WM_MIN: f32 = 0.01;
+pub const APD_LOW_WM_MAX: f32 = 0.80;
 pub const APD_SOJOURN_MS_MIN: u32 = 2;
 pub const APD_SOJOURN_MS_MAX: u32 = 500;
 pub const APD_TARGET_SOJOURN_MS_MIN: u32 = 1;
@@ -249,19 +251,21 @@ mod tests {
 
     #[test]
     fn factory_pace_apd_defaults_match_low_latency_profile() {
-        assert_eq!(DEFAULT_PACE_TICK_US, 300);
+        assert_eq!(DEFAULT_PACE_TICK_US, 350);
         assert_eq!(DEFAULT_PACE_TARGET_PPS, 8_000);
-        assert_eq!(DEFAULT_PACE_BURST_PER_TICK, 2);
-        assert_eq!(DEFAULT_PACE_BUDGET_PACKETS, 32.0);
-        assert_eq!(DEFAULT_PACE_MAX_QUEUE, 192);
+        assert_eq!(DEFAULT_PACE_BURST_PER_TICK, 3);
+        assert_eq!(DEFAULT_PACE_BUDGET_PACKETS, 64.0);
+        assert_eq!(DEFAULT_PACE_MAX_QUEUE, 250);
         assert_eq!(DEFAULT_TUN_INJECT_QUEUE, 512);
         assert_eq!(DEFAULT_TUN_FROM_ADAPTER_QUEUE, 256);
-        assert_eq!(DEFAULT_PACE_FAB_ENABLED, true);
+        assert_eq!(DEFAULT_PACE_SPIN_WINDOW_US, 70);
+        assert!(!DEFAULT_PACE_FAB_ENABLED);
         assert_eq!(DEFAULT_PACE_FAB_FALLBACK_TICK_US, 500);
-        assert_eq!(DEFAULT_APD_HIGH_WM, 0.40);
-        assert_eq!(DEFAULT_APD_CONFIRM_TICKS, 4);
-        assert_eq!(DEFAULT_APD_DRAIN_TICK_US, 100);
-        assert_eq!(DEFAULT_APD_SPINLOOP_BUDGET_MS, 3);
+        assert_eq!(DEFAULT_APD_HIGH_WM, 0.30);
+        assert_eq!(DEFAULT_APD_LOW_WM, 0.02);
+        assert_eq!(DEFAULT_APD_CONFIRM_TICKS, 3);
+        assert_eq!(DEFAULT_APD_DRAIN_TICK_US, 80);
+        assert_eq!(DEFAULT_APD_SPINLOOP_BUDGET_MS, 8);
         assert_eq!(DEFAULT_RAMP_MAX_BURST, 6);
         assert_eq!(DEFAULT_DRAIN_MAX_BURST, 3);
         assert_eq!(DEFAULT_APD_MAX_SOJOURN_MS, 10);
@@ -269,14 +273,24 @@ mod tests {
         assert!(DEFAULT_APD_REQUIRE_CC_HEADROOM);
         assert!(DEFAULT_SHED_ENABLED);
         assert_eq!(DEFAULT_SHED_MAX_SOJOURN_MS, 30);
-        assert!((DEFAULT_SHED_MIN_FILL - 0.3).abs() < f32::EPSILON);
-        assert_eq!(DEFAULT_SHED_MAX_PER_TICK, 1);
-        assert_eq!(DEFAULT_DRR_SMALL_PACKET_THRESHOLD_BYTES, 384);
+        assert!((DEFAULT_SHED_MIN_FILL - 0.1).abs() < f32::EPSILON);
+        assert_eq!(DEFAULT_SHED_MAX_PER_TICK, 2);
+        assert_eq!(DEFAULT_DRR_SMALL_PACKET_THRESHOLD_BYTES, 420);
         assert_eq!(DEFAULT_MIN_CONTROL_RESERVED_BYTES_PER_TICK, 256);
         assert_eq!(DEFAULT_MIN_RETRANSMIT_RESERVED_BYTES_PER_TICK, 256);
         assert_eq!(DEFAULT_DRR_RTT_SCALE_MAX, 2.5);
         // base < ramp ceiling (interactive UX invariant)
         assert!(DEFAULT_PACE_BURST_PER_TICK < DEFAULT_RAMP_MAX_BURST as i64);
+        // factory watermarks / shed gate must survive their own clamps unchanged
+        assert!((APD_LOW_WM_MIN..=APD_LOW_WM_MAX).contains(&DEFAULT_APD_LOW_WM));
+        assert!(DEFAULT_APD_HIGH_WM >= DEFAULT_APD_LOW_WM + 0.1);
+        assert!(DEFAULT_SHED_MIN_FILL >= SHED_MIN_FILL_LO);
+        // Under CC starve, HOL escape must unblock APD no later than the sojourn arm,
+        // so the sojourn-arm can fire instead of being suppressed then confirm-decayed.
+        assert!(
+            crate::net::background_cc::DEFAULT_HOL_ESCAPE_MS <= DEFAULT_APD_MAX_SOJOURN_MS,
+            "hol_escape_ms must be <= apd_max_sojourn_ms for coherent CC-starve arming"
+        );
         // target sojourn must stay below max − gap
         assert!(
             DEFAULT_APD_TARGET_SOJOURN_MS + APD_SOJOURN_TARGET_MAX_GAP_MS

@@ -18,7 +18,7 @@ pub enum RouteState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PathKind {
     Direct,
-    OwnerRelay,
+    HubRelay,
     IceSrflx,
 }
 
@@ -162,7 +162,7 @@ impl PathSet {
     }
 
     pub fn set_relay(&mut self, endpoint: SocketAddr) {
-        self.paths[1] = Some(PathCandidate::new(PathKind::OwnerRelay, endpoint, true));
+        self.paths[1] = Some(PathCandidate::new(PathKind::HubRelay, endpoint, true));
     }
 
     pub fn set_srflx(&mut self, endpoint: SocketAddr) {
@@ -375,6 +375,10 @@ pub struct RouteEntry {
     pub owd_base_stale_count: u8,
     /// `max(0, owd_sample − owd_base)` when warm; meaningful only if `owd_base_ms.is_some()`.
     pub fwd_queuing_delay_ms: f64,
+    /// EWMA of `2·owd − rtt`; `None` after cold until first Applied.
+    pub owd_rtt_residual_ewma: Option<f64>,
+    /// Applied samples since last OWD cold (gates forward-QD preference).
+    pub owd_samples_since_cold: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -505,7 +509,7 @@ impl RoutingTable {
                 if !incoming_node.is_empty() && prev_node == incoming_node {
                     self.remove(&prev_vip);
                 } else if prev_node.is_empty() && !incoming_node.is_empty() {
-                    // PrepareJoin placeholder owner route (no node_id) → identified owner VIP.
+                    // PrepareJoin placeholder route (no node_id) → identified peer VIP.
                     self.remove(&prev_vip);
                 } else {
                     self.ep_to_vip.remove(&ep);
@@ -547,6 +551,8 @@ impl RoutingTable {
             owd_base_window_start: now,
             owd_base_stale_count: 0,
             fwd_queuing_delay_ms: 0.0,
+            owd_rtt_residual_ewma: None,
+            owd_samples_since_cold: 0,
         });
         let ep_changed = old
             .as_ref()
@@ -818,11 +824,12 @@ impl RoutingTable {
     }
 
     /// Apply a forward OWD sample on the active path VIP (caller already gated on active path).
-    /// Returns whether the sample was applied or rejected by the clock-jump guard.
+    /// Returns whether the sample was applied or rejected by clock / residual guards.
     pub fn note_fwd_owd(
         &mut self,
         from: SocketAddr,
         owd_sample_ms: f64,
+        rtt_ms: f64,
         ignore_relay_ep: Option<SocketAddr>,
     ) -> OwdSampleOutcome {
         let Some(vip) = self.vip_for_data_endpoint(from, ignore_relay_ep) else {
@@ -842,7 +849,7 @@ impl RoutingTable {
         }
         let now = Instant::now();
         let congestion = self.congestion;
-        update_owd_base_on_sample(entry, owd_sample_ms, now, &congestion)
+        update_owd_base_on_sample(entry, owd_sample_ms, rtt_ms, now, &congestion)
     }
 
     /// Control-race destinations for a known endpoint (or `[ep]` if unmapped / no PathSet).
@@ -1150,13 +1157,12 @@ impl RoutingTable {
     fn best_usable_peer_hop(
         &self,
         dest_vip: Option<&str>,
-        owner_vip: &str,
         my_vip: &str,
         exclude: Option<SocketAddr>,
     ) -> Option<SocketAddr> {
         let mut best: Option<(&str, SocketAddr, i32, f64)> = None;
         for (vip, entry) in &self.table {
-            if vip == my_vip || vip == owner_vip {
+            if vip == my_vip {
                 continue;
             }
             if dest_vip.is_some_and(|d| d == vip) {
@@ -1190,24 +1196,15 @@ impl RoutingTable {
     pub fn select_relay_endpoint(
         &self,
         dest_vip: &str,
-        owner_vip: &str,
         my_vip: &str,
         exclude: Option<SocketAddr>,
     ) -> RelaySelection {
-        if !owner_vip.is_empty() {
-            if let Some(owner_ep) = self.lookup(owner_vip) {
-                if self.hop_usable(owner_ep, Some(dest_vip), my_vip, exclude) {
-                    return RelaySelection::Hop(owner_ep);
-                }
-            }
-        }
         if let Some(sticky) = self.sticky_relay_hop(dest_vip) {
             if self.hop_usable(sticky, Some(dest_vip), my_vip, exclude) {
                 return RelaySelection::Hop(sticky);
             }
         }
-        if let Some(peer_ep) = self.best_usable_peer_hop(Some(dest_vip), owner_vip, my_vip, exclude)
-        {
+        if let Some(peer_ep) = self.best_usable_peer_hop(Some(dest_vip), my_vip, exclude) {
             return RelaySelection::Hop(peer_ep);
         }
         RelaySelection::None
@@ -1215,18 +1212,10 @@ impl RoutingTable {
 
     pub fn select_broadcast_relay_hop(
         &self,
-        owner_vip: &str,
         my_vip: &str,
         exclude: Option<SocketAddr>,
     ) -> RelaySelection {
-        if !owner_vip.is_empty() {
-            if let Some(owner_ep) = self.lookup(owner_vip) {
-                if self.hop_usable(owner_ep, None, my_vip, exclude) {
-                    return RelaySelection::Hop(owner_ep);
-                }
-            }
-        }
-        if let Some(peer_ep) = self.best_usable_peer_hop(None, owner_vip, my_vip, exclude) {
+        if let Some(peer_ep) = self.best_usable_peer_hop(None, my_vip, exclude) {
             return RelaySelection::Hop(peer_ep);
         }
         RelaySelection::None
@@ -1336,6 +1325,12 @@ pub fn update_rtt_base_on_sample(
 
 /// Absolute clock-jump guard default for forward OWD samples (ms).
 pub const DEFAULT_OWD_CLOCK_JUMP_REJECT_MS: u64 = 30_000;
+/// Reject when `| (2·owd − rtt) − residual_ewma |` exceeds this (ms). Peer clock step ≈ half.
+pub const DEFAULT_OWD_RTT_CONSISTENCY_MS: u64 = 5_000;
+/// Applied samples after cold before preferring forward QD over RTT-QD.
+pub const DEFAULT_OWD_PREFER_AFTER_SAMPLES: u8 = 8;
+
+const OWD_RTT_RESIDUAL_EWMA_ALPHA: f64 = 0.125;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwdSampleOutcome {
@@ -1349,13 +1344,28 @@ fn reset_owd_base_cold(entry: &mut RouteEntry, now: Instant) {
     entry.owd_base_window_min = f64::INFINITY;
     entry.owd_base_window_start = now;
     entry.owd_base_stale_count = 0;
+    entry.fwd_queuing_delay_ms = 0.0;
+    entry.owd_rtt_residual_ewma = None;
+    entry.owd_samples_since_cold = 0;
+}
+
+fn note_owd_applied_residual(entry: &mut RouteEntry, owd_sample_ms: f64, rtt_ms: f64) {
+    let resid = 2.0 * owd_sample_ms - rtt_ms;
+    entry.owd_rtt_residual_ewma = Some(match entry.owd_rtt_residual_ewma {
+        Some(ewma) => {
+            (1.0 - OWD_RTT_RESIDUAL_EWMA_ALPHA) * ewma + OWD_RTT_RESIDUAL_EWMA_ALPHA * resid
+        }
+        None => resid,
+    });
+    entry.owd_samples_since_cold = entry.owd_samples_since_cold.saturating_add(1);
 }
 
 /// LEDBAT-style min forward-OWD window. No-op when `rtt_base_tracking` is false.
-/// On clock jump (`|sample − base| > `cfg `owd_clock_jump_reject_ms`), invalidates base (cold).
+/// Rejects (cold) on absolute clock jump or residual consistency spike vs `2·owd − rtt` EWMA.
 pub fn update_owd_base_on_sample(
     entry: &mut RouteEntry,
     owd_sample_ms: f64,
+    rtt_ms: f64,
     now: Instant,
     cg: &crate::advanced_tuning::CongestionTuning,
 ) -> OwdSampleOutcome {
@@ -1370,12 +1380,21 @@ pub fn update_owd_base_on_sample(
         }
     }
 
+    let resid = 2.0 * owd_sample_ms - rtt_ms;
+    if let Some(ewma) = entry.owd_rtt_residual_ewma {
+        if (resid - ewma).abs() > cg.owd_rtt_consistency_ms as f64 {
+            reset_owd_base_cold(entry, now);
+            return OwdSampleOutcome::Rejected;
+        }
+    }
+
     if entry.owd_base_ms.is_none() {
         entry.owd_base_ms = Some(owd_sample_ms);
         entry.owd_base_window_min = owd_sample_ms;
         entry.owd_base_window_start = now;
         entry.owd_base_stale_count = 0;
         entry.fwd_queuing_delay_ms = 0.0;
+        note_owd_applied_residual(entry, owd_sample_ms, rtt_ms);
         return OwdSampleOutcome::Applied;
     }
 
@@ -1404,15 +1423,19 @@ pub fn update_owd_base_on_sample(
     }
 
     entry.fwd_queuing_delay_ms = (owd_sample_ms - base).max(0.0);
+    note_owd_applied_residual(entry, owd_sample_ms, rtt_ms);
     OwdSampleOutcome::Applied
 }
 
-/// QD for CC/FEC: forward OWD when warm, else RTT-QD, else cold (`-1`).
-pub fn effective_queuing_delay_ms(entry: &RouteEntry) -> f64 {
-    if entry.owd_base_ms.is_some() {
+/// QD for CC/FEC: trusted forward OWD, else RTT-QD, else cold (`-1`).
+/// Forward QD is trusted after `owd_prefer_after_samples` Applied samples since cold.
+pub fn effective_queuing_delay_ms(entry: &RouteEntry, owd_prefer_after_samples: u8) -> f64 {
+    if entry.owd_base_ms.is_some() && entry.owd_samples_since_cold >= owd_prefer_after_samples {
         entry.fwd_queuing_delay_ms
     } else if entry.rtt_base_ms >= 0.0 {
         entry.queuing_delay_ms
+    } else if entry.owd_base_ms.is_some() {
+        entry.fwd_queuing_delay_ms
     } else {
         -1.0
     }
@@ -1463,26 +1486,6 @@ pub fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix: u8) -> bool {
     }
     let mask = u32::MAX << (32 - p);
     (u32::from(a) & mask) == (u32::from(b) & mask)
-}
-
-pub fn owner_vip_with_prefix(my_vip: &str, prefix: u8) -> String {
-    let Ok(addr) = my_vip.parse::<Ipv4Addr>() else {
-        return my_vip.to_string();
-    };
-    let p = prefix.clamp(1, 30);
-    let mask = u32::MAX << (32 - p);
-    let net = u32::from(addr) & mask;
-    let host_mask = if p >= 32 {
-        0u32
-    } else {
-        (1u32 << (32 - p)) - 1
-    };
-    let owner_u32 = net | (1u32 & host_mask);
-    Ipv4Addr::from(owner_u32).to_string()
-}
-
-pub fn owner_vip(my_vip: &str) -> String {
-    owner_vip_with_prefix(my_vip, 24)
 }
 
 #[cfg(test)]
@@ -1599,14 +1602,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_vip_with_prefix_for_slash_24_matches_factory() {
-        assert_eq!(
-            owner_vip_with_prefix("10.20.30.2", 24),
-            owner_vip("10.20.30.2")
-        );
-    }
-
-    #[test]
     fn endpoints_excluding_stale_skips_stale_only() {
         let mut rt = RoutingTable::new();
         let ep1: SocketAddr = "198.51.100.1:1".parse().unwrap();
@@ -1709,7 +1704,7 @@ mod tests {
         ps.switch_candidate_since = Some(Instant::now() - Duration::from_secs(4));
         ps.reselect_active(false);
         let (_, kind) = ps.active_endpoint_kind().unwrap();
-        assert_eq!(kind, PathKind::OwnerRelay);
+        assert_eq!(kind, PathKind::HubRelay);
     }
 
     #[test]
@@ -1748,7 +1743,7 @@ mod tests {
         );
         ps.reselect_active(false);
         let (_, kind) = ps.active_endpoint_kind().unwrap();
-        assert_eq!(kind, PathKind::OwnerRelay);
+        assert_eq!(kind, PathKind::HubRelay);
     }
 
     #[test]
@@ -1994,6 +1989,8 @@ mod tests {
             owd_base_window_start: now,
             owd_base_stale_count: 0,
             fwd_queuing_delay_ms: 0.0,
+            owd_rtt_residual_ewma: None,
+            owd_samples_since_cold: 0,
         };
         update_rtt_base_on_sample(&mut entry, 60.0, now, &cg);
         assert_eq!(entry.rtt_base_ms, 60.0);
@@ -2041,6 +2038,8 @@ mod tests {
             owd_base_window_start: now,
             owd_base_stale_count: 0,
             fwd_queuing_delay_ms: 0.0,
+            owd_rtt_residual_ewma: None,
+            owd_samples_since_cold: 0,
         };
         update_rtt_base_on_sample(&mut entry, 80.0, now, &cg);
         assert_eq!(entry.rtt_base_ms, 50.0);
@@ -2082,6 +2081,8 @@ mod tests {
             owd_base_window_start: now,
             owd_base_stale_count: 0,
             fwd_queuing_delay_ms: 0.0,
+            owd_rtt_residual_ewma: None,
+            owd_samples_since_cold: 0,
         }
     }
 
@@ -2090,26 +2091,29 @@ mod tests {
         use crate::advanced_tuning::CongestionTuning;
         let cg = CongestionTuning {
             base_rtt_window_secs: 10,
+            owd_prefer_after_samples: 1,
             ..CongestionTuning::default()
         };
         let now = Instant::now();
         let mut entry = blank_route_entry(now);
         assert_eq!(
-            update_owd_base_on_sample(&mut entry, 100.0, now, &cg),
+            update_owd_base_on_sample(&mut entry, 100.0, 40.0, now, &cg),
             OwdSampleOutcome::Applied
         );
         assert_eq!(entry.owd_base_ms, Some(100.0));
         assert_eq!(entry.fwd_queuing_delay_ms, 0.0);
+        assert!(entry.owd_rtt_residual_ewma.is_some());
+        assert_eq!(entry.owd_samples_since_cold, 1);
 
         entry.owd_base_window_start = now - Duration::from_secs(11);
         assert_eq!(
-            update_owd_base_on_sample(&mut entry, 60.0, now, &cg),
+            update_owd_base_on_sample(&mut entry, 60.0, 40.0, now, &cg),
             OwdSampleOutcome::Applied
         );
         assert_eq!(entry.owd_base_ms, Some(60.0));
 
         assert_eq!(
-            update_owd_base_on_sample(&mut entry, 90.0, now, &cg),
+            update_owd_base_on_sample(&mut entry, 90.0, 40.0, now, &cg),
             OwdSampleOutcome::Applied
         );
         assert!((entry.fwd_queuing_delay_ms - 30.0).abs() < 0.01);
@@ -2129,8 +2133,11 @@ mod tests {
         entry.owd_base_window_min = 80.0;
         entry.owd_base_window_start = now - Duration::from_secs(2);
         entry.owd_base_stale_count = 0;
+        // Pre-seed residual so warm path runs (gate sees stable resid).
+        entry.owd_rtt_residual_ewma = Some(2.0 * 80.0 - 40.0);
+        entry.owd_samples_since_cold = 1;
         assert_eq!(
-            update_owd_base_on_sample(&mut entry, 80.0, now, &cg),
+            update_owd_base_on_sample(&mut entry, 80.0, 40.0, now, &cg),
             OwdSampleOutcome::Applied
         );
         assert_eq!(entry.owd_base_ms, Some(50.0));
@@ -2138,7 +2145,7 @@ mod tests {
         entry.owd_base_window_min = 80.0;
         entry.owd_base_window_start = now - Duration::from_secs(2);
         assert_eq!(
-            update_owd_base_on_sample(&mut entry, 80.0, now, &cg),
+            update_owd_base_on_sample(&mut entry, 80.0, 40.0, now, &cg),
             OwdSampleOutcome::Applied
         );
         assert_eq!(entry.owd_base_ms, Some(80.0));
@@ -2151,54 +2158,168 @@ mod tests {
         let now = Instant::now();
         let mut entry = blank_route_entry(now);
         assert_eq!(
-            update_owd_base_on_sample(&mut entry, -5000.0, now, &cg),
+            update_owd_base_on_sample(&mut entry, -5000.0, 40.0, now, &cg),
             OwdSampleOutcome::Applied
         );
         assert_eq!(entry.owd_base_ms, Some(-5000.0));
+        assert!(entry.owd_rtt_residual_ewma.is_some());
         assert_eq!(
             update_owd_base_on_sample(
                 &mut entry,
                 -5000.0 + DEFAULT_OWD_CLOCK_JUMP_REJECT_MS as f64 + 1.0,
+                40.0,
                 now,
                 &cg
             ),
             OwdSampleOutcome::Rejected
         );
         assert!(entry.owd_base_ms.is_none());
-        assert_eq!(effective_queuing_delay_ms(&entry), -1.0);
+        assert!(entry.owd_rtt_residual_ewma.is_none());
+        assert_eq!(entry.owd_samples_since_cold, 0);
+        assert_eq!(entry.fwd_queuing_delay_ms, 0.0);
+        assert_eq!(
+            effective_queuing_delay_ms(&entry, cg.owd_prefer_after_samples),
+            -1.0
+        );
+    }
+
+    #[test]
+    fn owd_residual_spike_rejects_with_stable_rtt() {
+        use crate::advanced_tuning::CongestionTuning;
+        let cg = CongestionTuning {
+            owd_rtt_consistency_ms: 5_000,
+            owd_prefer_after_samples: 1,
+            ..CongestionTuning::default()
+        };
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        entry.rtt_base_ms = 40.0;
+        entry.queuing_delay_ms = 5.0;
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 20.0, 40.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        // resid was 2*20-40=0; spike owd by 3000 (< absolute jump 30s) → resid=5960, |Δ|≫5s
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 3020.0, 40.0, now, &cg),
+            OwdSampleOutcome::Rejected
+        );
+        assert!(entry.owd_base_ms.is_none());
+        assert!((effective_queuing_delay_ms(&entry, 1) - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn owd_hysteresis_prefers_rtt_qd_until_n_samples() {
+        use crate::advanced_tuning::CongestionTuning;
+        let cg = CongestionTuning {
+            owd_prefer_after_samples: 3,
+            ..CongestionTuning::default()
+        };
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        entry.rtt_base_ms = 40.0;
+        entry.queuing_delay_ms = 12.0;
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 20.0, 40.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert_eq!(entry.owd_samples_since_cold, 1);
+        assert!((effective_queuing_delay_ms(&entry, 3) - 12.0).abs() < 0.01);
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 25.0, 40.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert!((effective_queuing_delay_ms(&entry, 3) - 12.0).abs() < 0.01);
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 30.0, 40.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert_eq!(entry.owd_samples_since_cold, 3);
+        assert!((effective_queuing_delay_ms(&entry, 3) - 10.0).abs() < 0.01);
     }
 
     #[test]
     fn owd_negative_base_stays_warm_for_effective_qd() {
         use crate::advanced_tuning::CongestionTuning;
-        let cg = CongestionTuning::default();
+        let cg = CongestionTuning {
+            owd_prefer_after_samples: 1,
+            ..CongestionTuning::default()
+        };
         let now = Instant::now();
         let mut entry = blank_route_entry(now);
         assert_eq!(
-            update_owd_base_on_sample(&mut entry, -2000.0, now, &cg),
+            update_owd_base_on_sample(&mut entry, -2000.0, 40.0, now, &cg),
             OwdSampleOutcome::Applied
         );
+        assert!(entry.owd_rtt_residual_ewma.is_some());
+        assert_eq!(entry.owd_samples_since_cold, 1);
         assert_eq!(
-            update_owd_base_on_sample(&mut entry, -1950.0, now, &cg),
+            update_owd_base_on_sample(&mut entry, -1950.0, 40.0, now, &cg),
             OwdSampleOutcome::Applied
         );
         assert!((entry.fwd_queuing_delay_ms - 50.0).abs() < 0.01);
-        assert!((effective_queuing_delay_ms(&entry) - 50.0).abs() < 0.01);
+        assert!((effective_queuing_delay_ms(&entry, 1) - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn owd_prefer_after_one_trusts_immediately() {
+        use crate::advanced_tuning::CongestionTuning;
+        let cg = CongestionTuning {
+            owd_prefer_after_samples: 1,
+            ..CongestionTuning::default()
+        };
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        entry.rtt_base_ms = 40.0;
+        entry.queuing_delay_ms = 99.0;
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 20.0, 40.0, now, &cg),
+            OwdSampleOutcome::Applied
+        );
+        assert!((effective_queuing_delay_ms(&entry, 1) - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn owd_rtt_cold_uses_fwd_during_hysteresis() {
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        entry.owd_base_ms = Some(-100.0);
+        entry.fwd_queuing_delay_ms = 7.0;
+        entry.owd_samples_since_cold = 2;
+        // rtt_base still cold; samples < prefer_after → still use fwd (avoid -1)
+        assert!((effective_queuing_delay_ms(&entry, 8) - 7.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn owd_ignored_when_rtt_base_tracking_disabled() {
+        use crate::advanced_tuning::CongestionTuning;
+        let cg = CongestionTuning {
+            rtt_base_tracking: false,
+            ..CongestionTuning::default()
+        };
+        let now = Instant::now();
+        let mut entry = blank_route_entry(now);
+        assert_eq!(
+            update_owd_base_on_sample(&mut entry, 20.0, 40.0, now, &cg),
+            OwdSampleOutcome::Ignored
+        );
+        assert!(entry.owd_base_ms.is_none());
     }
 
     #[test]
     fn effective_queuing_delay_precedence_fwd_rtt_cold() {
         let now = Instant::now();
         let mut entry = blank_route_entry(now);
-        assert_eq!(effective_queuing_delay_ms(&entry), -1.0);
+        assert_eq!(effective_queuing_delay_ms(&entry, 8), -1.0);
 
         entry.rtt_base_ms = 40.0;
         entry.queuing_delay_ms = 12.0;
-        assert!((effective_queuing_delay_ms(&entry) - 12.0).abs() < 0.01);
+        assert!((effective_queuing_delay_ms(&entry, 8) - 12.0).abs() < 0.01);
 
         entry.owd_base_ms = Some(-100.0);
         entry.fwd_queuing_delay_ms = 7.0;
-        assert!((effective_queuing_delay_ms(&entry) - 7.0).abs() < 0.01);
+        entry.owd_samples_since_cold = 8;
+        assert!((effective_queuing_delay_ms(&entry, 8) - 7.0).abs() < 0.01);
     }
 
     fn healthy_route(rt: &mut RoutingTable, vip: &str, ep: SocketAddr) {
@@ -2211,39 +2332,41 @@ mod tests {
     }
 
     #[test]
-    fn select_relay_prefer_owner_over_better_peer_rtt() {
+    fn select_relay_prefers_better_rtt_peer() {
         let mut rt = RoutingTable::new();
-        let owner_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
-        let peer_ep: SocketAddr = "198.51.100.2:3000".parse().unwrap();
+        let slow_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
+        let fast_ep: SocketAddr = "198.51.100.2:3000".parse().unwrap();
         let dest_ep: SocketAddr = "198.51.100.3:4000".parse().unwrap();
-        healthy_route(&mut rt, "10.1.1.1", owner_ep);
-        healthy_route(&mut rt, "10.1.1.2", peer_ep);
+        healthy_route(&mut rt, "10.1.1.1", slow_ep);
+        healthy_route(&mut rt, "10.1.1.2", fast_ep);
         healthy_route(&mut rt, "10.1.1.3", dest_ep);
         if let Some(e) = rt.table.get_mut("10.1.1.2") {
             e.smoothed_rtt_ms = 5.0;
+            e.quality_score = 90;
         }
         if let Some(e) = rt.table.get_mut("10.1.1.1") {
             e.smoothed_rtt_ms = 200.0;
+            e.quality_score = 90;
         }
-        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.1", "10.1.1.4", None) {
-            RelaySelection::Hop(ep) => assert_eq!(ep, owner_ep),
-            RelaySelection::None => panic!("expected owner hop"),
+        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.4", None) {
+            RelaySelection::Hop(ep) => assert_eq!(ep, fast_ep),
+            RelaySelection::None => panic!("expected better-RTT hub"),
         }
     }
 
     #[test]
-    fn select_relay_zombie_owner_uses_peer() {
+    fn select_relay_skips_unusable_peer() {
         let mut rt = RoutingTable::new();
-        let owner_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
+        let stale_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
         let peer_ep: SocketAddr = "198.51.100.2:3000".parse().unwrap();
         let dest_ep: SocketAddr = "198.51.100.3:4000".parse().unwrap();
-        rt.update("10.1.1.1", owner_ep, None);
+        rt.update("10.1.1.1", stale_ep, None);
         if let Some(e) = rt.table.get_mut("10.1.1.1") {
             e.state = RouteState::Stale;
         }
         healthy_route(&mut rt, "10.1.1.2", peer_ep);
         healthy_route(&mut rt, "10.1.1.3", dest_ep);
-        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.1", "10.1.1.4", None) {
+        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.4", None) {
             RelaySelection::Hop(ep) => assert_eq!(ep, peer_ep),
             RelaySelection::None => panic!("expected peer hop"),
         }
@@ -2252,74 +2375,106 @@ mod tests {
     #[test]
     fn select_relay_respects_exclude() {
         let mut rt = RoutingTable::new();
-        let owner_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
-        let peer_ep: SocketAddr = "198.51.100.2:3000".parse().unwrap();
+        let hub_a: SocketAddr = "198.51.100.1:2000".parse().unwrap();
+        let hub_b: SocketAddr = "198.51.100.2:3000".parse().unwrap();
         let dest_ep: SocketAddr = "198.51.100.3:4000".parse().unwrap();
-        healthy_route(&mut rt, "10.1.1.1", owner_ep);
-        healthy_route(&mut rt, "10.1.1.2", peer_ep);
+        healthy_route(&mut rt, "10.1.1.1", hub_a);
+        healthy_route(&mut rt, "10.1.1.2", hub_b);
         healthy_route(&mut rt, "10.1.1.3", dest_ep);
-        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.1", "10.1.1.4", Some(owner_ep)) {
-            RelaySelection::Hop(ep) => assert_eq!(ep, peer_ep),
-            RelaySelection::None => panic!("expected peer after exclude owner"),
+        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.4", Some(hub_a)) {
+            RelaySelection::Hop(ep) => assert_eq!(ep, hub_b),
+            RelaySelection::None => panic!("expected peer after exclude"),
         }
     }
 
     #[test]
-    fn select_relay_sticky_skips_unusable_stamped_owner() {
+    fn select_relay_sticky_skips_unusable_stamped_hub() {
         let mut rt = RoutingTable::new();
-        let owner_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
+        let stale_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
         let peer_ep: SocketAddr = "198.51.100.2:3000".parse().unwrap();
         let dest_ep: SocketAddr = "198.51.100.3:4000".parse().unwrap();
-        rt.update("10.1.1.1", owner_ep, None);
+        rt.update("10.1.1.1", stale_ep, None);
         if let Some(e) = rt.table.get_mut("10.1.1.1") {
             e.state = RouteState::Stale;
         }
         healthy_route(&mut rt, "10.1.1.2", peer_ep);
         healthy_route(&mut rt, "10.1.1.3", dest_ep);
-        rt.stamp_relay_hop("10.1.1.3", owner_ep);
-        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.1", "10.1.1.4", None) {
+        rt.stamp_relay_hop("10.1.1.3", stale_ep);
+        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.4", None) {
             RelaySelection::Hop(ep) => assert_eq!(ep, peer_ep),
-            RelaySelection::None => panic!("expected peer when sticky owner unusable"),
+            RelaySelection::None => panic!("expected peer when sticky hub unusable"),
+        }
+    }
+
+    #[test]
+    fn select_relay_sticky_prefers_stamped_over_better_peer() {
+        let mut rt = RoutingTable::new();
+        let sticky_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
+        let better_ep: SocketAddr = "198.51.100.2:3000".parse().unwrap();
+        let dest_ep: SocketAddr = "198.51.100.3:4000".parse().unwrap();
+        healthy_route(&mut rt, "10.1.1.1", sticky_ep);
+        healthy_route(&mut rt, "10.1.1.2", better_ep);
+        healthy_route(&mut rt, "10.1.1.3", dest_ep);
+        if let Some(e) = rt.table.get_mut("10.1.1.2") {
+            e.smoothed_rtt_ms = 5.0;
+            e.quality_score = 95;
+        }
+        if let Some(e) = rt.table.get_mut("10.1.1.1") {
+            e.smoothed_rtt_ms = 200.0;
+            e.quality_score = 80;
+        }
+        rt.stamp_relay_hop("10.1.1.3", sticky_ep);
+        match rt.select_relay_endpoint("10.1.1.3", "10.1.1.4", None) {
+            RelaySelection::Hop(ep) => assert_eq!(ep, sticky_ep),
+            RelaySelection::None => panic!("expected sticky hub"),
         }
     }
 
     #[test]
     fn select_relay_none_when_no_candidate() {
         let mut rt = RoutingTable::new();
-        let owner_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
+        let stale_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
         let dest_ep: SocketAddr = "198.51.100.3:4000".parse().unwrap();
-        rt.update("10.1.1.1", owner_ep, None);
+        rt.update("10.1.1.1", stale_ep, None);
         if let Some(e) = rt.table.get_mut("10.1.1.1") {
             e.state = RouteState::Stale;
         }
         healthy_route(&mut rt, "10.1.1.3", dest_ep);
         assert_eq!(
-            rt.select_relay_endpoint("10.1.1.3", "10.1.1.1", "10.1.1.4", None),
+            rt.select_relay_endpoint("10.1.1.3", "10.1.1.4", None),
             RelaySelection::None
         );
     }
 
     #[test]
-    fn select_broadcast_relay_hop_prefers_owner_then_peer() {
+    fn select_broadcast_relay_hop_picks_best_usable_peer() {
         let mut rt = RoutingTable::new();
-        let owner_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
-        let peer_ep: SocketAddr = "198.51.100.2:3000".parse().unwrap();
+        let slow_ep: SocketAddr = "198.51.100.1:2000".parse().unwrap();
+        let fast_ep: SocketAddr = "198.51.100.2:3000".parse().unwrap();
         let from: SocketAddr = "198.51.100.9:9000".parse().unwrap();
-        healthy_route(&mut rt, "10.1.1.1", owner_ep);
-        healthy_route(&mut rt, "10.1.1.2", peer_ep);
-        match rt.select_broadcast_relay_hop("10.1.1.1", "10.1.1.4", Some(from)) {
-            RelaySelection::Hop(ep) => assert_eq!(ep, owner_ep),
-            RelaySelection::None => panic!("expected owner for bcast"),
+        healthy_route(&mut rt, "10.1.1.1", slow_ep);
+        healthy_route(&mut rt, "10.1.1.2", fast_ep);
+        if let Some(e) = rt.table.get_mut("10.1.1.2") {
+            e.smoothed_rtt_ms = 5.0;
+            e.quality_score = 90;
         }
         if let Some(e) = rt.table.get_mut("10.1.1.1") {
+            e.smoothed_rtt_ms = 200.0;
+            e.quality_score = 90;
+        }
+        match rt.select_broadcast_relay_hop("10.1.1.4", Some(from)) {
+            RelaySelection::Hop(ep) => assert_eq!(ep, fast_ep),
+            RelaySelection::None => panic!("expected best hub for bcast"),
+        }
+        if let Some(e) = rt.table.get_mut("10.1.1.2") {
             e.state = RouteState::Stale;
         }
-        match rt.select_broadcast_relay_hop("10.1.1.1", "10.1.1.4", Some(from)) {
-            RelaySelection::Hop(ep) => assert_eq!(ep, peer_ep),
-            RelaySelection::None => panic!("expected peer hub"),
+        match rt.select_broadcast_relay_hop("10.1.1.4", Some(from)) {
+            RelaySelection::Hop(ep) => assert_eq!(ep, slow_ep),
+            RelaySelection::None => panic!("expected remaining hub"),
         }
         assert_eq!(
-            rt.select_broadcast_relay_hop("10.1.1.1", "10.1.1.4", Some(peer_ep)),
+            rt.select_broadcast_relay_hop("10.1.1.4", Some(slow_ep)),
             RelaySelection::None
         );
     }
@@ -2401,6 +2556,8 @@ mod tests {
             owd_base_window_start: now,
             owd_base_stale_count: 0,
             fwd_queuing_delay_ms: 0.0,
+            owd_rtt_residual_ewma: None,
+            owd_samples_since_cold: 0,
         };
         let mut ewma = RoutingEwmaTuning::default();
         ewma.rtt_ewma_old = 0.5;

@@ -2,10 +2,10 @@
 
 use crate::config::NetworkConfig;
 
-/// True when the node has completed create/join and has an active VPN profile.
+/// True when the node has completed mint/join and has an active VPN profile.
 /// Matches `Cli::has_active_profile()` in `cli.rs`.
 pub fn has_active_profile(snap: &NetworkConfig) -> bool {
-    (snap.role == "owner" || snap.role == "peer") && !snap.virtual_ip.is_empty()
+    !snap.crypto_key.is_empty() && !snap.virtual_ip.is_empty()
 }
 
 /// When idle (no create/join profile), exit after the last real CLI session ends.

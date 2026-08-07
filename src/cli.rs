@@ -17,24 +17,22 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::bootstrap::{self, ReconnectOutcome};
-use crate::config::{effective_decentralized_trackers, ConfigManager, IPPool, PeerInfo};
+use crate::config::{effective_decentralized_trackers, ConfigManager, MEMBER_ROSTER_MAX};
 use crate::cpu_affinity;
 use crate::crypto::{
     decode_invite, derive_network_id, encode_invite, now_epoch_ms, room_id_20b, room_id_hex,
-    InvitePayload, Key, MintCrypto, PROTO_UDP,
+    InvitePayload, Key, MintCrypto, INVITE_VERSION, PROTO_UDP,
 };
 use crate::metrics::EngineMetrics;
 use crate::nat::{ice, stun, upnp};
-use crate::net::engine::{
-    EngineCmd, JoinAck, ParaCandidate as ParaEngineCandidate, ParaSignal, RuntimeSnapshot,
-};
+use crate::net::engine::{EngineCmd, JoinAck, ParaSignal, RuntimeSnapshot};
 use crate::net::pace_clock::{self, PaceClockApply};
 use crate::net::pacing::PacingConfig;
 use crate::net::packet::WIRE_PROTOCOL_VERSION;
 use crate::netinfo::{self, ensure_netinfo_dir};
 use crate::pmtud::is_rfc1918_private_ip;
 use crate::process_priority;
-use crate::routing::{owner_vip, RoutingTable};
+use crate::routing::RoutingTable;
 use crate::runtime_trace::RuntimeTrace;
 use crate::term_style;
 #[cfg(windows)]
@@ -50,7 +48,6 @@ pub enum AppState {
 
 const PORT_MIN: u16 = 1024;
 const PORT_MAX: u16 = 65535;
-const MAX_PEERS: usize = 253;
 
 /// Fixed line count for `paint_runtime_frame` (header + flags + traffic + 2-col metrics).
 const RUNTIME_DISPLAY_LINE_COUNT: usize = 53;
@@ -74,49 +71,31 @@ const DEFAULT_TUN_FROM_ADAPTER_QUEUE: usize = pace_def::DEFAULT_TUN_FROM_ADAPTER
 
 const JOIN_HANDSHAKE_PUNCH_KEY: &str = "join-handshake";
 const PARA_PUNCH_WORKFLOW_DEADLINE_SECS: u64 = 25;
-const PARA_SIGNAL_ATTEMPTS: u32 = 10;
-const PARA_SIGNAL_PAUSE_MS: u64 = 1500;
-const PARA_SIGNAL_JITTER_PCT: u64 = 20;
 const PARA_LAN_DISCOVER_MS: u64 = 2500;
-const PARA_OK_REDUNDANCY: u32 = 3;
-const PARA_OK_GAP_MS: u64 = 200;
-const PARA_PUNCH_ACK_REDUNDANCY: u32 = 5;
-const PARA_PUNCH_ACK_GAP_MS: u64 = 150;
-const PARA_START_BUFFER_MS: u64 = 1500;
-const PARA_MAX_CLOCK_SKEW_MS: u64 = 5000;
-const PARA_OK_WAIT_MS: u64 = 1500;
 const PARA_KEEPALIVE_COUNT: u32 = 3;
 const PARA_KEEPALIVE_GAP_MS: u64 = 100;
-/// STUN attempts on headless daemon before failing (no interactive retry prompt).
-const HEADLESS_STUN_ATTEMPTS: u32 = 3;
-
-const PARA_OWNER_PASSIVE_MIN_BURST_WALL_MS: u64 = 1000;
-const PARA_PEER_PUNCH_MIN_WALL_MS: u64 = 1000;
 
 const PARA_PUNCH_ROUTE_DEBOUNCE_MS: u64 = 250;
-
-const PARA_OWNER_ACK_DEADLINE_MS: u64 = 45_000;
 
 const BANNER_DELAY_FIRST_RUN_MS: u64 = 20;
 
 const WINTUN_CREATE_TIMEOUT_SECS: u64 = 45;
-
-const PARA_OWNER_ACK_KEEPALIVE_PPS: u32 = 4;
-const PARA_SESSION_TTL_MS: u64 = 90_000;
-const PARA_MAX_PENDING_SESSIONS: usize = 16;
 
 /// Invite-join choices normally prompted on the CLI client (daemon headless).
 #[derive(Clone, Copy, Debug)]
 struct JoinInviteRunOpts {
     use_public: bool,
     skip_share_gate: bool,
+    /// Manual join punch target (invite is key-only; endpoint is typed separately).
+    target_endpoint: Option<SocketAddr>,
 }
 
 impl JoinInviteRunOpts {
-    fn from_ipc(lan_mode: Option<bool>) -> Self {
+    fn from_ipc(lan_mode: Option<bool>, target_endpoint: SocketAddr) -> Self {
         Self {
             use_public: !lan_mode.unwrap_or(false),
             skip_share_gate: true,
+            target_endpoint: Some(target_endpoint),
         }
     }
 
@@ -124,6 +103,7 @@ impl JoinInviteRunOpts {
         Self {
             use_public: true,
             skip_share_gate: true,
+            target_endpoint: None,
         }
     }
 }
@@ -133,63 +113,6 @@ struct ParaCandidate {
     ip: String,
     port: u16,
     kind: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ParaState {
-    HelloSent {
-        attempts: u32,
-    },
-    ReplyReceived {
-        peer_ep: SocketAddr,
-        start_at_ms: u64,
-    },
-    OkSent {
-        peer_ep: SocketAddr,
-        start_at_ms: u64,
-    },
-    WaitingStart {
-        peer_ep: SocketAddr,
-        start_at_ms: u64,
-        ok_confirmed: bool,
-    },
-    Punching,
-    Connected,
-    Failed {
-        reason: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-enum PendingParaSessionStatus {
-    Pending,
-    Running,
-    Superseded,
-    Closed,
-}
-
-#[derive(Debug, Clone)]
-struct PendingParaSession {
-    session_id: String,
-    remote_node_id: String,
-    signal_from: SocketAddr,
-    remote_candidates: Vec<SocketAddr>,
-    remote_vip: String,
-    remote_ep: Option<SocketAddr>,
-    created_at_ms: u64,
-    agreed_start_at_ms: u64,
-    agreed_key_raw: [u8; 32],
-    lease_token: u64,
-    status: PendingParaSessionStatus,
-}
-
-#[derive(Debug)]
-struct PendingAckWait {
-    tx: mpsc::Sender<()>,
-    expiry_ms: u64,
-    expected_node_id: String,
-    expected_sources: HashSet<SocketAddr>,
-    expected_vip: String,
 }
 
 async fn cli_ping_peer_rtt(
@@ -224,7 +147,6 @@ pub struct Cli {
     routing: Arc<RwLock<RoutingTable>>,
     cmd_tx: mpsc::Sender<EngineCmd>,
     peer_cache_reset_tx: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
-    owner_vip_pool: Option<Arc<parking_lot::Mutex<IPPool>>>,
     engine_metrics: Option<Arc<EngineMetrics>>,
     runtime_trace: Arc<RuntimeTrace>,
     state: AppState,
@@ -243,8 +165,8 @@ pub struct Cli {
     upnp_mapping: Option<upnp::UPnPMapping>,
     upnp_refresh_stop: Option<Arc<AtomicBool>>,
     upnp_refresh_task: Option<JoinHandle<()>>,
-    parasitic_listener_stop: Option<Arc<AtomicBool>>,
-    parasitic_listener_task: Option<JoinHandle<()>>,
+    lan_presence_stop: Option<Arc<AtomicBool>>,
+    lan_presence_task: Option<JoinHandle<()>>,
     #[cfg(windows)]
     vni: Option<Arc<WintunAdapter>>,
     #[cfg(windows)]
@@ -265,7 +187,6 @@ impl Cli {
         tun_from_tun_tx: mpsc::Sender<Bytes>,
         tun_inject_rx: broadcast::Receiver<Bytes>,
         peer_cache_reset_tx: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
-        owner_vip_pool: Option<Arc<parking_lot::Mutex<IPPool>>>,
         engine_metrics: Option<Arc<EngineMetrics>>,
         runtime_trace: Arc<RuntimeTrace>,
         headless: bool,
@@ -283,7 +204,6 @@ impl Cli {
             routing,
             cmd_tx,
             peer_cache_reset_tx,
-            owner_vip_pool,
             engine_metrics,
             runtime_trace,
             state,
@@ -302,8 +222,8 @@ impl Cli {
             upnp_mapping: None,
             upnp_refresh_stop: None,
             upnp_refresh_task: None,
-            parasitic_listener_stop: None,
-            parasitic_listener_task: None,
+            lan_presence_stop: None,
+            lan_presence_task: None,
             #[cfg(windows)]
             vni: None,
             #[cfg(windows)]
@@ -437,32 +357,6 @@ impl Cli {
         }
     }
 
-    fn refresh_owner_vip_pool_from_config(&mut self, force_rebuild: bool) {
-        let snap = self.config.snapshot();
-        if snap.role != "owner" || snap.virtual_ip.is_empty() {
-            if force_rebuild {
-                self.owner_vip_pool = None;
-            }
-            return;
-        }
-        if self.owner_vip_pool.is_some() && !force_rebuild {
-            return;
-        }
-        let owner_vip = snap.virtual_ip.clone();
-        let mut pool = IPPool::new(&owner_vip);
-        for used in self.config.used_virtual_ips() {
-            if used != owner_vip {
-                pool.mark_used(&used);
-            }
-        }
-        for p in &snap.peers {
-            if !p.node_id.is_empty() && !p.virtual_ip.is_empty() {
-                pool.ensure_allocated(&p.node_id, &p.virtual_ip);
-            }
-        }
-        self.owner_vip_pool = Some(Arc::new(parking_lot::Mutex::new(pool)));
-    }
-
     /// Push FEC/DRR/rawperf/retransmit settings from saved config into the live engine.
     pub async fn apply_saved_runtime_perf_to_engine(&self) -> Result<()> {
         let snap = self.config.snapshot();
@@ -540,30 +434,18 @@ impl Cli {
         Ok(())
     }
 
-    /// Engine/daemon startup: restore adapter, sync profile, parasitic listener (no REPL).
+    /// Engine/daemon startup: restore adapter, sync profile, LAN presence listener (no REPL).
     pub async fn run_daemon_bootstrap(&mut self) -> Result<()> {
-        let peer_parasitic_defer = self.daemon_bootstrap_before_reconnect().await?;
-        let outcome = if peer_parasitic_defer {
-            self.parasitic_auto_reconnect().await?
-        } else {
-            ReconnectOutcome::Skipped
-        };
+        self.daemon_bootstrap_before_reconnect().await?;
         let _ = self
-            .daemon_bootstrap_finalize(outcome, peer_parasitic_defer)
+            .daemon_bootstrap_finalize(ReconnectOutcome::Skipped)
             .await?;
         Ok(())
     }
 
-    /// Pre-reconnect daemon bootstrap (adapter, engine sync, passive listener).
-    pub async fn daemon_bootstrap_before_reconnect(&mut self) -> Result<bool> {
-        let snap_at_start = self.config.snapshot();
-        let parasitic_at_start = snap_at_start.parasitic_enabled;
-        let role_at_start = snap_at_start.role.clone();
-        drop(snap_at_start);
-        let peer_parasitic_defer = parasitic_at_start && role_at_start == "peer";
-        if !peer_parasitic_defer {
-            self.restore_adapter_from_saved_session().await?;
-        }
+    /// Pre-reconnect daemon bootstrap (adapter, engine sync, LAN presence).
+    pub async fn daemon_bootstrap_before_reconnect(&mut self) -> Result<()> {
+        self.restore_adapter_from_saved_session().await?;
         let apply = PaceClockApply::from_network_config(self.config.snapshot().as_ref());
         let _ = self.cmd_tx.try_send(EngineCmd::SetPacingAndPaceClock {
             cfg: self.pacing,
@@ -579,21 +461,19 @@ impl Cli {
                     ))
                 );
             }
-            self.ensure_parasitic_passive_listener().await?;
+            self.ensure_lan_presence_listener().await?;
         }
-        Ok(peer_parasitic_defer)
+        Ok(())
     }
 
     /// Post-reconnect: session-open home block (+ SessionReady on headless).
     pub async fn daemon_bootstrap_finalize(
         &mut self,
         outcome: ReconnectOutcome,
-        parasitic_attempted: bool,
     ) -> Result<bootstrap::BootstrapSnapshot> {
         if self.state != AppState::CommandLoop || !self.has_active_profile() {
             return Ok(bootstrap::BootstrapSnapshot {
                 complete: true,
-                parasitic_attempted,
                 outcome: None,
                 home_lines: vec![],
             });
@@ -602,19 +482,16 @@ impl Cli {
         if self.reconnect_home_shown {
             return Ok(bootstrap::BootstrapSnapshot {
                 complete: true,
-                parasitic_attempted,
                 outcome: Some(effective),
                 home_lines: vec![],
             });
         }
         if self.headless {
-            // Home lines go into the snapshot only; CLI takes them once (not UI replay).
             let home_lines = self
                 .emit_session_home_block(effective, false, false)
                 .await?;
             return Ok(bootstrap::BootstrapSnapshot {
                 complete: true,
-                parasitic_attempted,
                 outcome: Some(effective),
                 home_lines,
             });
@@ -624,7 +501,6 @@ impl Cli {
             .await?;
         Ok(bootstrap::BootstrapSnapshot {
             complete: true,
-            parasitic_attempted,
             outcome: Some(effective),
             home_lines,
         })
@@ -656,20 +532,19 @@ impl Cli {
         Ok(())
     }
 
-    async fn ensure_parasitic_passive_listener(&mut self) -> Result<()> {
+    async fn ensure_lan_presence_listener(&mut self) -> Result<()> {
         let snap = self.config.snapshot();
         let should_run = self.state == AppState::CommandLoop
-            && snap.role == "owner"
             && !snap.network_id.is_empty()
             && !snap.crypto_key.is_empty()
             && !snap.virtual_ip.is_empty();
         drop(snap);
 
         if !should_run {
-            self.stop_parasitic_passive_listener();
+            self.stop_lan_presence_listener();
             return Ok(());
         }
-        if self.parasitic_listener_task.is_some() {
+        if self.lan_presence_task.is_some() {
             return Ok(());
         }
 
@@ -679,810 +554,71 @@ impl Cli {
 
         let cmd_tx = self.cmd_tx.clone();
         let config = self.config.clone();
-        let routing = self.routing.clone();
-        let owner_vip_pool = self.owner_vip_pool.clone();
         let stop_flag = stop.clone();
-        self.parasitic_listener_stop = Some(stop);
-        self.parasitic_listener_task = Some(tokio::spawn(async move {
-            let mut sessions: HashMap<String, PendingParaSession> = HashMap::new();
-            let mut pending_oks: HashMap<String, u64> = HashMap::new();
-            let mut pending_acks: HashMap<String, PendingAckWait> = HashMap::new();
-            let mut node_to_session: HashMap<String, String> = HashMap::new();
-            let mut active_from: HashMap<SocketAddr, String> = HashMap::new();
-            let mut running_sessions: HashMap<String, PendingParaSession> = HashMap::new();
-            let mut vip_owners: HashMap<String, (String, u64)> = HashMap::new();
-            let mut peer_candidates: HashMap<String, Vec<SocketAddr>> = HashMap::new();
-            let mut peer_node_to_vip: HashMap<String, String> = HashMap::new();
-            let mut lease_counter: u64 = 1;
-            let mut workers =
-                tokio::task::JoinSet::<(String, String, SocketAddr, String, u64, bool)>::new();
-            let mut reply_tasks = tokio::task::JoinSet::<(SocketAddr, Vec<u8>)>::new();
-            let mut session_punch_cancel: HashMap<String, Arc<AtomicBool>> = HashMap::new();
-            const OK_BEFORE_HELLO_GRACE_MS: u64 = 3_000;
-
-            let cleanup_vip = |vip: &str,
-                               routing: &Arc<RwLock<RoutingTable>>,
-                               pool: &Option<Arc<parking_lot::Mutex<IPPool>>>,
-                               config: &Arc<ConfigManager>| {
-                if vip.is_empty() {
-                    return;
-                }
-                routing.write().remove(vip);
-                let _ = cmd_tx.try_send(crate::net::engine::EngineCmd::PeerRouteRemoved {
-                    vip: vip.to_string(),
-                });
-                if let Some(pool) = pool.as_ref() {
-                    pool.lock().release(vip);
-                }
-                config.remove_peer_by_vip(vip);
-            };
-            let should_cleanup_vip =
-                |vip: &str,
-                 session_id: &str,
-                 lease_token: u64,
-                 vip_owners: &HashMap<String, (String, u64)>,
-                 running_sessions: &HashMap<String, PendingParaSession>| {
-                    if !vip_owner_matches(vip_owners, vip, session_id, lease_token) {
-                        return false;
-                    }
-                    !running_sessions.values().any(|s| {
-                        s.remote_vip == vip
-                            && s.session_id != session_id
-                            && matches!(s.status, PendingParaSessionStatus::Running)
-                    })
-                };
-
-            let spawn_session_worker =
-                |workers: &mut tokio::task::JoinSet<(
-                    String,
-                    String,
-                    SocketAddr,
-                    String,
-                    u64,
-                    bool,
-                )>,
-                 cmd_tx: &mpsc::Sender<EngineCmd>,
-                 routing: &Arc<RwLock<RoutingTable>>,
-                 pending_acks: &mut HashMap<String, PendingAckWait>,
-                 session_punch_cancel: &mut HashMap<String, Arc<AtomicBool>>,
-                 session: PendingParaSession| {
-                    let cmd_tx = cmd_tx.clone();
-                    let routing = routing.clone();
-                    let punch_cancel = Arc::new(AtomicBool::new(false));
-                    session_punch_cancel.insert(session.session_id.clone(), punch_cancel.clone());
-                    let (ack_tx, mut ack_rx) = mpsc::channel::<()>(4);
-                    let mut expected_sources = HashSet::new();
-                    expected_sources.insert(session.signal_from);
-                    if let Some(peer) = session.remote_ep {
-                        expected_sources.insert(peer);
-                    }
-                    for peer in &session.remote_candidates {
-                        expected_sources.insert(*peer);
-                    }
-                    pending_acks.insert(
-                        session.session_id.clone(),
-                        PendingAckWait {
-                            tx: ack_tx,
-                            expiry_ms: now_epoch_ms().saturating_add(PARA_SESSION_TTL_MS),
-                            expected_node_id: session.remote_node_id.clone(),
-                            expected_sources,
-                            expected_vip: session.remote_vip.clone(),
-                        },
-                    );
-                    workers.spawn(async move {
-                        wait_until_para_start(session.agreed_start_at_ms).await;
-                        let key_raw = session.agreed_key_raw;
-                        // Keep owner primary network key; only bind/add for this peer.
-                        let _ = cmd_tx.send(EngineCmd::AddCryptoKey(Key(key_raw))).await;
-                        let mut bind_targets = Vec::new();
-                        let mut seen_targets = HashSet::new();
-                        if seen_targets.insert(session.signal_from) {
-                            bind_targets.push(session.signal_from);
-                        }
-                        if let Some(peer) = session.remote_ep {
-                            if seen_targets.insert(peer) {
-                                bind_targets.push(peer);
-                            }
-                        }
-                        for peer in &session.remote_candidates {
-                            if seen_targets.insert(*peer) {
-                                bind_targets.push(*peer);
-                            }
-                        }
-                        for peer in bind_targets {
-                            let _ = cmd_tx
-                                .send(EngineCmd::BindPeerKey {
-                                    peer,
-                                    key: Key(key_raw),
-                                })
-                                .await;
-                        }
-                        let ready = run_parasitic_punch_worker(
-                            cmd_tx.clone(),
-                            routing.clone(),
-                            session.remote_candidates.clone(),
-                            session.remote_vip.clone(),
-                            format!("para-passive-{}", session.session_id),
-                            punch_cancel,
-                        )
-                        .await;
-                        if ready {
-                            let keepalive_key = format!("para-ack-{}", session.session_id);
-                            let _ = cmd_tx
-                                .send(EngineCmd::SetPeerKeepalive {
-                                    key: keepalive_key.clone(),
-                                    targets: session.remote_candidates.clone(),
-                                    interval_ms: 1000 / PARA_OWNER_ACK_KEEPALIVE_PPS as u64,
-                                })
-                                .await;
-                            let ack_wait = tokio::time::timeout(
-                                Duration::from_millis(PARA_OWNER_ACK_DEADLINE_MS),
-                                ack_rx.recv(),
-                            )
-                            .await;
-                            let _ = cmd_tx
-                                .send(EngineCmd::StopPeerKeepalive { key: keepalive_key })
-                                .await;
-                            let acked = ack_wait.ok().flatten().is_some();
-                            return (
-                                session.session_id.clone(),
-                                session.remote_node_id.clone(),
-                                session.signal_from,
-                                session.remote_vip.clone(),
-                                session.lease_token,
-                                acked,
-                            );
-                        }
-                        (
-                            session.session_id.clone(),
-                            session.remote_node_id.clone(),
-                            session.signal_from,
-                            session.remote_vip.clone(),
-                            session.lease_token,
-                            false,
-                        )
-                    });
-                };
-
+        self.lan_presence_stop = Some(stop);
+        self.lan_presence_task = Some(tokio::spawn(async move {
             loop {
-                while let Some(done) = workers.try_join_next() {
-                    if let Ok((sid, node_id, from, vip, lease, acked)) = done {
-                        pending_acks.remove(&sid);
-                        session_punch_cancel.remove(&sid);
-                        pending_oks.remove(&sid);
-                        if let Some(session) = running_sessions.get_mut(&sid) {
-                            session.status = PendingParaSessionStatus::Closed;
-                        }
-                        running_sessions.remove(&sid);
-                        sessions.remove(&sid);
-                        if active_from.get(&from).map(|v| v == &sid).unwrap_or(false) {
-                            active_from.remove(&from);
-                        }
-                        if node_to_session
-                            .get(&node_id)
-                            .map(|v| v == &sid)
-                            .unwrap_or(false)
-                        {
-                            node_to_session.remove(&node_id);
-                        }
-                        if acked {
-                            crate::cli_println!(
-                                "{}",
-                                term_style::fmt_para_passive_line_success(format_args!(
-                                    " Connected (session={} node={}).",
-                                    sid, node_id
-                                ))
-                            );
-                            let _ = cmd_tx.send(EngineCmd::TriggerMembershipBroadcast).await;
-                            let new_cands =
-                                peer_candidates.get(&node_id).cloned().unwrap_or_default();
-                            let other_pairs: Vec<(String, Vec<SocketAddr>)> = peer_candidates
-                                .iter()
-                                .filter(|(other_node, _)| other_node.as_str() != node_id.as_str())
-                                .map(|(n, c)| (n.clone(), c.clone()))
-                                .collect();
-                            for (other_node, other_cands) in other_pairs {
-                                let other_vip = match peer_node_to_vip.get(&other_node).cloned() {
-                                    Some(v) => v,
-                                    None => continue,
-                                };
-                                let other_ep = { routing.read().lookup(&other_vip) };
-                                let Some(other_ep) = other_ep else { continue };
-                                let new_payload =
-                                    serde_json::to_value(candidates_to_ice(&new_cands))
-                                        .unwrap_or(json!([]));
-                                let _ = cmd_tx
-                                    .send(EngineCmd::SendPeerRelay {
-                                        relay_ep: other_ep,
-                                        dst_node: other_node.clone(),
-                                        kind: "candidates".to_string(),
-                                        payload: new_payload,
-                                    })
-                                    .await;
-                                let other_payload =
-                                    serde_json::to_value(candidates_to_ice(&other_cands))
-                                        .unwrap_or(json!([]));
-                                let _ = cmd_tx
-                                    .send(EngineCmd::SendPeerRelay {
-                                        relay_ep: from,
-                                        dst_node: node_id.clone(),
-                                        kind: "candidates".to_string(),
-                                        payload: other_payload,
-                                    })
-                                    .await;
-                            }
-                        } else if should_cleanup_vip(
-                            &vip,
-                            &sid,
-                            lease,
-                            &vip_owners,
-                            &running_sessions,
-                        ) {
-                            let route_still_live = {
-                                let rt = routing.read();
-                                rt.table
-                                    .get(&vip)
-                                    .map(|entry| {
-                                        matches!(
-                                            entry.state,
-                                            crate::routing::RouteState::Active
-                                                | crate::routing::RouteState::Candidate
-                                        )
-                                    })
-                                    .unwrap_or(false)
-                            };
-                            if route_still_live {
-                                crate::cli_println!(
-                                    "{}",
-                                    term_style::fmt_para_passive_line(format_args!(
-                                        " ACK timeout but route still live; skip rollback (sid={}).",
-                                        sid
-                                    ))
-                                );
-                            } else {
-                                vip_owners.remove(&vip);
-                                peer_candidates.remove(&node_id);
-                                peer_node_to_vip.remove(&node_id);
-                                cleanup_vip(&vip, &routing, &owner_vip_pool, &config);
-                                crate::cli_println!(
-                                    "{}",
-                                    term_style::fmt_para_passive_line(format_args!(
-                                        " Rollback: peer ack timeout (sid={}).",
-                                        sid
-                                    ))
-                                );
-                            }
-                        }
-                    }
-                }
-                while let Some(done) = reply_tasks.try_join_next() {
-                    if let Ok((target_vip, payload)) = done {
-                        let _ = cmd_tx
-                            .send(EngineCmd::ParaSendReply {
-                                target_vip,
-                                payload,
-                            })
-                            .await;
-                    }
-                }
                 if stop_flag.load(Ordering::Acquire) {
-                    workers.abort_all();
-                    reply_tasks.abort_all();
-                    let all_owned_vips: Vec<String> = vip_owners.keys().cloned().collect();
-                    for vip in all_owned_vips {
-                        cleanup_vip(&vip, &routing, &owner_vip_pool, &config);
-                    }
-                    peer_candidates.clear();
-                    peer_node_to_vip.clear();
                     break;
                 }
                 let recv = tokio::time::timeout(Duration::from_millis(600), sig_rx.recv()).await;
                 let Ok(Some(sig)) = recv else {
-                    let now = now_epoch_ms();
-                    let stale: Vec<(String, String, SocketAddr, String, u64)> = sessions
-                        .iter()
-                        .filter(|(_, s)| now.saturating_sub(s.created_at_ms) > PARA_SESSION_TTL_MS)
-                        .map(|(sid, s)| {
-                            (
-                                sid.clone(),
-                                s.remote_node_id.clone(),
-                                s.signal_from,
-                                s.remote_vip.clone(),
-                                s.lease_token,
-                            )
-                        })
-                        .collect();
-                    for (sid, node, from, vip, lease) in stale {
-                        if let Some(session) = sessions.get_mut(&sid) {
-                            session.status = PendingParaSessionStatus::Closed;
-                        }
-                        sessions.remove(&sid);
-                        if node_to_session
-                            .get(&node)
-                            .map(|v| v == &sid)
-                            .unwrap_or(false)
-                        {
-                            node_to_session.remove(&node);
-                        }
-                        if active_from.get(&from).map(|v| v == &sid).unwrap_or(false) {
-                            active_from.remove(&from);
-                        }
-                        if should_cleanup_vip(&vip, &sid, lease, &vip_owners, &running_sessions) {
-                            vip_owners.remove(&vip);
-                            peer_candidates.remove(&node);
-                            peer_node_to_vip.remove(&node);
-                            cleanup_vip(&vip, &routing, &owner_vip_pool, &config);
-                        }
-                    }
-                    pending_oks.retain(|_, expiry| now <= *expiry);
-                    pending_acks.retain(|_, wait| now <= wait.expiry_ms);
                     continue;
                 };
                 let snap = config.snapshot();
-                if snap.role != "owner" || snap.network_id.is_empty() || snap.crypto_key.is_empty()
+                if snap.network_id.is_empty()
+                    || snap.crypto_key.is_empty()
+                    || snap.virtual_ip.is_empty()
                 {
                     continue;
                 }
-                match sig {
-                    ParaSignal::HelloReceived {
-                        from,
-                        public_ip,
-                        public_port,
-                        proposed_key: _,
-                        proposed_vip_subnet,
-                        candidates,
-                        start_at_ms,
-                        session_id,
-                        node_id,
-                        discover_only,
-                        ..
-                    } => {
-                        let remote_node_id = node_id.trim().to_string();
-                        if remote_node_id.is_empty() {
-                            continue;
-                        }
-                        if discover_only {
-                            let snap_for_reply = snap.clone();
-                            let cmd_tx_for_reply = cmd_tx.clone();
-                            let reply_network_id = snap_for_reply.network_id.clone();
-                            let session_id_for_reply = session_id.clone();
-                            reply_tasks.spawn(async move {
-                                let local_candidates = owner_reply_para_candidates(
-                                    &snap_for_reply,
-                                    &cmd_tx_for_reply,
-                                    from,
-                                    Duration::from_secs(1),
-                                )
-                                .await;
-                                let reply = build_owner_para_reply_bytes(
-                                    &snap_for_reply,
-                                    &local_candidates,
-                                    "",
-                                    &reply_network_id,
-                                    now_epoch_ms() + PARA_START_BUFFER_MS,
-                                    &session_id_for_reply,
-                                    false,
-                                );
-                                (from, reply)
-                            });
-                            continue;
-                        }
-                        if session_id.is_empty() {
-                            continue;
-                        }
-                        if running_sessions.contains_key(&session_id) {
-                            continue;
-                        }
-                        if let Some(existing) = sessions.get(&session_id) {
-                            if existing.remote_node_id != remote_node_id {
-                                continue;
-                            }
-                            active_from.insert(from, session_id.clone());
-                            node_to_session.insert(remote_node_id.clone(), session_id.clone());
-                            let snap_for_reply = snap.clone();
-                            let cmd_tx_for_reply = cmd_tx.clone();
-                            let assigned_vip_for_reply = existing.remote_vip.clone();
-                            let session_id_for_reply = existing.session_id.clone();
-                            let agreed_start_at_ms = existing.agreed_start_at_ms;
-                            let reply_network_id_for_reply = if snap_for_reply.network_id.is_empty()
-                            {
-                                derive_network_id(&Key(existing.agreed_key_raw))
-                            } else {
-                                snap_for_reply.network_id.clone()
-                            };
-                            reply_tasks.spawn(async move {
-                                let local_candidates = owner_reply_para_candidates(
-                                    &snap_for_reply,
-                                    &cmd_tx_for_reply,
-                                    from,
-                                    Duration::from_secs(1),
-                                )
-                                .await;
-                                let reply = build_owner_para_reply_bytes(
-                                    &snap_for_reply,
-                                    &local_candidates,
-                                    &assigned_vip_for_reply,
-                                    &reply_network_id_for_reply,
-                                    agreed_start_at_ms,
-                                    &session_id_for_reply,
-                                    true,
-                                );
-                                (from, reply)
-                            });
-                            continue;
-                        }
-                        if let Some(prev_sid) = active_from.get(&from).cloned() {
-                            if prev_sid != session_id {
-                                if let Some(prev) = sessions.get_mut(&prev_sid) {
-                                    prev.status = PendingParaSessionStatus::Superseded;
-                                }
-                                if let Some(prev) = sessions.remove(&prev_sid) {
-                                    peer_candidates.remove(&prev.remote_node_id);
-                                    peer_node_to_vip.remove(&prev.remote_node_id);
-                                    if should_cleanup_vip(
-                                        &prev.remote_vip,
-                                        &prev.session_id,
-                                        prev.lease_token,
-                                        &vip_owners,
-                                        &running_sessions,
-                                    ) {
-                                        vip_owners.remove(&prev.remote_vip);
-                                        cleanup_vip(
-                                            &prev.remote_vip,
-                                            &routing,
-                                            &owner_vip_pool,
-                                            &config,
-                                        );
-                                    }
-                                }
-                                if let Some(prev) = running_sessions.get_mut(&prev_sid) {
-                                    prev.status = PendingParaSessionStatus::Superseded;
-                                }
-                                pending_oks.remove(&prev_sid);
-                                pending_acks.remove(&prev_sid);
-                                active_from.remove(&from);
-                            }
-                        }
-                        if let Some(prev_sid) = node_to_session.get(&remote_node_id).cloned() {
-                            if prev_sid != session_id {
-                                if let Some(prev) = sessions.get_mut(&prev_sid) {
-                                    prev.status = PendingParaSessionStatus::Superseded;
-                                }
-                                if let Some(prev) = sessions.remove(&prev_sid) {
-                                    peer_candidates.remove(&prev.remote_node_id);
-                                    peer_node_to_vip.remove(&prev.remote_node_id);
-                                    if should_cleanup_vip(
-                                        &prev.remote_vip,
-                                        &prev.session_id,
-                                        prev.lease_token,
-                                        &vip_owners,
-                                        &running_sessions,
-                                    ) {
-                                        vip_owners.remove(&prev.remote_vip);
-                                        cleanup_vip(
-                                            &prev.remote_vip,
-                                            &routing,
-                                            &owner_vip_pool,
-                                            &config,
-                                        );
-                                    }
-
-                                    if active_from
-                                        .get(&prev.signal_from)
-                                        .map(|sid| sid == &prev_sid)
-                                        .unwrap_or(false)
-                                    {
-                                        active_from.remove(&prev.signal_from);
-                                    }
-                                }
-                                if let Some(prev) = running_sessions.get_mut(&prev_sid) {
-                                    prev.status = PendingParaSessionStatus::Superseded;
-                                }
-                                pending_oks.remove(&prev_sid);
-                                pending_acks.remove(&prev_sid);
-                                node_to_session.remove(&remote_node_id);
-                            }
-                        }
-                        if sessions.len() >= PARA_MAX_PENDING_SESSIONS
-                            && !sessions.contains_key(&session_id)
-                        {
-                            continue;
-                        }
-                        let Ok(agreed_key_raw) = parse_key_hex_32(snap.crypto_key.trim()) else {
-                            crate::cli_eprintln!(
-                                "{}",
-                                term_style::fmt_para_line_stderr(format_args!(
-                                    " Passive: reject HELLO (invalid owner crypto_key)."
-                                ))
-                            );
-                            continue;
-                        };
-                        let ep = if is_rfc1918_private_ip(from.ip()) {
-                            from
-                        } else if let Ok(parsed) = make_socket_addr(&public_ip, public_port) {
-                            parsed
-                        } else {
-                            continue;
-                        };
-                        let mut remote_candidates = candidates_to_socket_addrs(&candidates);
-                        if is_rfc1918_private_ip(from.ip()) {
-                            remote_candidates.retain(|a| is_rfc1918_private_ip(a.ip()));
-                        }
-                        if !remote_candidates.contains(&ep) {
-                            remote_candidates.push(ep);
-                        }
-                        let assigned_vip = if let Some(pool) = owner_vip_pool.as_ref() {
-                            let endpoint = ep.to_string();
-
-                            let preserve_vip = config
-                                .find_peer_by_node_id(&remote_node_id)
-                                .map(|p| p.virtual_ip)
-                                .filter(|v| !v.is_empty());
-                            let removed =
-                                config.remove_peers_by_endpoint(&endpoint, &remote_node_id);
-                            for peer in removed {
-                                if peer.virtual_ip.is_empty() {
-                                    continue;
-                                }
-                                if preserve_vip
-                                    .as_deref()
-                                    .map(|kept| kept == peer.virtual_ip)
-                                    .unwrap_or(false)
-                                {
-                                    continue;
-                                }
-                                routing.write().remove(&peer.virtual_ip);
-                                pool.lock().release(&peer.virtual_ip);
-                            }
-                            let assigned = {
-                                let mut guard = pool.lock();
-                                if let Some(vip) = preserve_vip.clone() {
-                                    guard.ensure_allocated(&remote_node_id, &vip);
-                                    Some(vip)
-                                } else if let Some(existing) =
-                                    config.find_peer_by_node_id(&remote_node_id)
-                                {
-                                    guard.ensure_allocated(&remote_node_id, &existing.virtual_ip);
-                                    Some(existing.virtual_ip)
-                                } else {
-                                    guard.allocate(&remote_node_id)
-                                }
-                            };
-                            if let Some(vip) = assigned {
-                                config.add_peer(PeerInfo {
-                                    node_id: remote_node_id.clone(),
-                                    name: remote_node_id.clone(),
-                                    virtual_ip: vip.clone(),
-                                    real_ip: endpoint,
-                                });
-                                vip
-                            } else {
-                                let snap_for_reply = snap.clone();
-                                let cmd_tx_for_reply = cmd_tx.clone();
-                                let session_id_for_reply = session_id.clone();
-                                reply_tasks.spawn(async move {
-                                    let local_candidates = owner_reply_para_candidates(
-                                        &snap_for_reply,
-                                        &cmd_tx_for_reply,
-                                        from,
-                                        Duration::from_secs(1),
-                                    )
-                                    .await;
-                                    let reject = build_owner_para_reply_bytes(
-                                        &snap_for_reply,
-                                        &local_candidates,
-                                        "",
-                                        "",
-                                        now_epoch_ms() + PARA_START_BUFFER_MS,
-                                        &session_id_for_reply,
-                                        false,
-                                    );
-                                    (from, reject)
-                                });
-                                continue;
-                            }
-                        } else {
-                            let owner_subnet = if snap.virtual_ip.is_empty() {
-                                proposed_vip_subnet
-                            } else {
-                                snap.virtual_ip.clone()
-                            };
-                            vip_from_owner_subnet(&owner_subnet, false)
-                                .unwrap_or_else(|_| "10.0.0.2".to_string())
-                        };
-
-                        let agreed_start_at_ms = compute_agreed_start_at_ms(
-                            start_at_ms,
-                            now_epoch_ms() + PARA_START_BUFFER_MS,
-                        );
-
-                        let reply_network_id = if snap.network_id.is_empty() {
-                            derive_network_id(&Key(agreed_key_raw))
-                        } else {
-                            snap.network_id.clone()
-                        };
-                        let session_remote_cands = remote_candidates.clone();
-                        let session = PendingParaSession {
-                            session_id: session_id.clone(),
-                            remote_node_id: remote_node_id.clone(),
-                            signal_from: from,
-                            remote_candidates,
-                            remote_vip: assigned_vip.clone(),
-                            remote_ep: Some(ep),
-                            created_at_ms: now_epoch_ms(),
-                            agreed_start_at_ms,
-                            agreed_key_raw,
-                            lease_token: lease_counter,
-                            status: PendingParaSessionStatus::Pending,
-                        };
-                        lease_counter = lease_counter.wrapping_add(1);
-
-                        vip_owners.insert(
-                            assigned_vip.clone(),
-                            (session_id.clone(), session.lease_token),
-                        );
-                        peer_candidates.insert(remote_node_id.clone(), session_remote_cands);
-                        peer_node_to_vip.insert(remote_node_id.clone(), assigned_vip.clone());
-                        sessions.insert(session_id.clone(), session);
-                        node_to_session.insert(remote_node_id, session_id.clone());
-                        active_from.insert(from, session_id.clone());
-                        let snap_for_reply = snap.clone();
-                        let cmd_tx_for_reply = cmd_tx.clone();
-                        let assigned_vip_for_reply = assigned_vip.clone();
-                        let reply_network_id_for_reply = reply_network_id.clone();
-                        let session_id_for_reply = session_id.clone();
-                        reply_tasks.spawn(async move {
-                            let local_candidates = owner_reply_para_candidates(
-                                &snap_for_reply,
-                                &cmd_tx_for_reply,
-                                from,
-                                Duration::from_secs(3),
-                            )
-                            .await;
-                            let reply = build_owner_para_reply_bytes(
-                                &snap_for_reply,
-                                &local_candidates,
-                                &assigned_vip_for_reply,
-                                &reply_network_id_for_reply,
-                                agreed_start_at_ms,
-                                &session_id_for_reply,
-                                true,
-                            );
-                            (from, reply)
-                        });
-                        if pending_oks.remove(&session_id).is_some() {
-                            if let Some(mut session) = sessions.remove(&session_id) {
-                                if !pending_acks.contains_key(&session.session_id) {
-                                    session.status = PendingParaSessionStatus::Running;
-                                    running_sessions
-                                        .insert(session.session_id.clone(), session.clone());
-                                    spawn_session_worker(
-                                        &mut workers,
-                                        &cmd_tx,
-                                        &routing,
-                                        &mut pending_acks,
-                                        &mut session_punch_cancel,
-                                        session,
-                                    );
-                                }
-                            }
-                        }
+                if let ParaSignal::HelloReceived {
+                    from,
+                    network_id,
+                    session_id,
+                    ..
+                } = sig
+                {
+                    if network_id != snap.network_id {
+                        continue;
                     }
-                    ParaSignal::ReplyReceived {
-                        session_id,
-                        assigned_vip,
-                        candidates,
-                        ..
-                    } => {
-                        if session_id.is_empty() {
-                            continue;
-                        }
-                        if let Some(session) = sessions.get_mut(&session_id) {
-                            if !assigned_vip.is_empty() {
-                                session.remote_vip = assigned_vip;
-                            }
-                            let mut remote_candidates = candidates_to_socket_addrs(&candidates);
-                            if remote_candidates.is_empty() {
-                                if let Some(ep) = session.remote_ep {
-                                    remote_candidates.push(ep);
-                                }
-                            }
-                            session.remote_candidates = remote_candidates;
-                        }
-                    }
-                    ParaSignal::OkReceived { session_id, .. } => {
-                        if session_id.is_empty() {
-                            continue;
-                        }
-
-                        if pending_acks.contains_key(&session_id) {
-                            continue;
-                        }
-                        if let Some(mut session) = sessions.remove(&session_id) {
-                            session.status = PendingParaSessionStatus::Running;
-                            running_sessions.insert(session.session_id.clone(), session.clone());
-                            spawn_session_worker(
-                                &mut workers,
-                                &cmd_tx,
-                                &routing,
-                                &mut pending_acks,
-                                &mut session_punch_cancel,
-                                session,
-                            );
-                        } else {
-                            pending_oks.insert(
-                                session_id,
-                                now_epoch_ms().saturating_add(OK_BEFORE_HELLO_GRACE_MS),
-                            );
-                        }
-                    }
-                    ParaSignal::PunchAckReceived {
-                        from,
-                        node_id,
-                        session_id,
-                    } => {
-                        if session_id.is_empty() {
-                            continue;
-                        }
-                        if let Some(waiter) = pending_acks.get_mut(&session_id) {
-                            let node_ok = waiter.expected_node_id.is_empty()
-                                || waiter.expected_node_id == node_id;
-                            let dynamic_route_ok = if waiter.expected_vip.is_empty() {
-                                false
-                            } else {
-                                let rt_ep = { routing.read().lookup(&waiter.expected_vip) };
-                                rt_ep.map(|ep| ep == from).unwrap_or(false)
-                            };
-                            let ip_ok = waiter.expected_sources.iter().any(|s| s.ip() == from.ip());
-                            if dynamic_route_ok {
-                                waiter.expected_sources.insert(from);
-                            } else if ip_ok {
-                                waiter.expected_sources.insert(from);
-                            }
-                            let source_ok = waiter.expected_sources.contains(&from);
-                            if node_ok && (source_ok || dynamic_route_ok || ip_ok) {
-                                stop_para_passive_punch_loops(&cmd_tx, &session_id);
-                                if let Some(cancel) = session_punch_cancel.get(&session_id) {
-                                    cancel.store(true, Ordering::Release);
-                                }
-                                let _ = waiter.tx.try_send(());
-                            } else {
-                                crate::cli_eprintln!(
-                                    "{}",
-                                    term_style::fmt_para_passive_line_stderr(format_args!(
-                                        " Ignored ACK sid={} from={} node={} (source_ok={} node_ok={} dynamic_route_ok={} ip_ok={})",
-                                        session_id,
-                                        from,
-                                        node_id,
-                                        source_ok,
-                                        node_ok,
-                                        dynamic_route_ok,
-                                        ip_ok
-                                    ))
-                                );
-                            }
-                        }
-                    }
+                    let local_ip = get_local_ip();
+                    let listen_port = snap.listen_port.max(7878);
+                    let local_candidates = local_only_para_candidates(&snap);
+                    let reply = json!({
+                        "node_id": snap.node_id,
+                        "public_ip": local_ip,
+                        "public_port": listen_port,
+                        "network_id": snap.network_id,
+                        "ts_ms": now_epoch_ms(),
+                        "candidates": local_candidates,
+                        "session_id": session_id,
+                        "responder_vip": snap.virtual_ip,
+                    })
+                    .to_string()
+                    .into_bytes();
+                    let _ = cmd_tx
+                        .send(EngineCmd::ParaSendReply {
+                            target_vip: from,
+                            payload: reply,
+                        })
+                        .await;
                 }
             }
-            if let Some(listener_id) = listener_id {
+            if let Some(id) = listener_id {
                 let _ = cmd_tx
-                    .send(EngineCmd::ParaRemoveListener { listener_id })
+                    .send(EngineCmd::ParaRemoveListener { listener_id: id })
                     .await;
             }
         }));
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(" Passive listener armed (owner mode)."))
-        );
         Ok(())
     }
 
-    fn stop_parasitic_passive_listener(&mut self) {
-        if let Some(stop) = self.parasitic_listener_stop.take() {
+    fn stop_lan_presence_listener(&mut self) {
+        if let Some(stop) = self.lan_presence_stop.take() {
             stop.store(true, Ordering::Release);
         }
-        if let Some(task) = self.parasitic_listener_task.take() {
+        if let Some(task) = self.lan_presence_task.take() {
             task.abort();
         }
     }
@@ -1638,8 +774,8 @@ impl Cli {
     }
 
     async fn emit_first_run_menu_lines(&mut self) -> Result<()> {
-        crate::cli_println!("  [1]  Create a new home");
-        crate::cli_println!("  [2]  Join an existing network");
+        crate::cli_println!("  [1]  Create unit");
+        crate::cli_println!("  [2]  Join unit");
         crate::cli_println!("  [3]  Exit");
         crate::cli_println!("  -----------");
         Ok(())
@@ -1656,13 +792,7 @@ impl Cli {
             return Ok(vec![]);
         }
         let snap = self.config.snapshot();
-        let lines = bootstrap::session_home_lines(
-            outcome,
-            &snap.server_name,
-            &snap.network_id,
-            &snap.virtual_ip,
-            &snap.role,
-        );
+        let lines = bootstrap::session_home_lines(outcome, &snap.network_id, &snap.virtual_ip);
         if self.headless {
             // Client clears + renders via TakeSessionHome once; never enter UI replay ring.
             self.reconnect_home_shown = true;
@@ -1681,13 +811,6 @@ impl Cli {
         Ok(lines)
     }
 
-    async fn emit_post_para_reconnect_home(&mut self, clear_screen_first: bool) -> Result<()> {
-        let _ = self
-            .emit_session_home_block(ReconnectOutcome::Connected, clear_screen_first, false)
-            .await?;
-        Ok(())
-    }
-
     async fn emit_command_loop_home(&mut self) -> Result<()> {
         if self.state != AppState::CommandLoop {
             return Ok(());
@@ -1698,10 +821,8 @@ impl Cli {
         let snap = self.config.snapshot();
         let lines = bootstrap::session_home_lines(
             ReconnectOutcome::Skipped,
-            &snap.server_name,
             &snap.network_id,
             &snap.virtual_ip,
-            &snap.role,
         );
         for line in lines.iter().filter(|l| !l.is_empty()) {
             crate::cli_println!("{line}");
@@ -1713,7 +834,7 @@ impl Cli {
         match line.as_str() {
             "1" => crate::cli_println!(
                 "{}",
-                term_style::fmt_bang_line(format_args!(" Create from the CLI client menu [1]."))
+                term_style::fmt_bang_line(format_args!(" Mint from the CLI client menu [1]."))
             ),
             "2" => {
                 if let Err(e) = self.handle_join_entry().await {
@@ -1735,8 +856,8 @@ impl Cli {
     async fn show_first_run_menu(&mut self) -> Result<()> {
         self.print_minteger_banner_slow(BANNER_DELAY_FIRST_RUN_MS)
             .await;
-        crate::cli_println!("  [1]  Create a new home");
-        crate::cli_println!("  [2]  Join an existing network");
+        crate::cli_println!("  [1]  Create unit");
+        crate::cli_println!("  [2]  Join unit");
         crate::cli_println!("  [3]  Exit");
         crate::cli_println!("  -----------");
         crate::cli_print!("> Select [1-3]: ");
@@ -1744,7 +865,7 @@ impl Cli {
         match self.read_line().await?.as_str() {
             "1" => crate::cli_println!(
                 "{}",
-                term_style::fmt_bang_line(format_args!(" Create from the CLI client menu [1]."))
+                term_style::fmt_bang_line(format_args!(" Mint from the CLI client menu [1]."))
             ),
             "2" => {
                 if let Err(e) = self.handle_join_entry().await {
@@ -1794,7 +915,6 @@ impl Cli {
             }
             "runtime" => self.handle_runtime_live().await,
             "ping" => self.handle_ping().await,
-            "kick" => self.handle_kick(parts.next()).await,
             "stun" => self.handle_stun().await,
             "punch" => {
                 let args: Vec<&str> = parts.collect();
@@ -1846,25 +966,31 @@ impl Cli {
 
     pub async fn create_network_with_params(
         &mut self,
-        name: String,
         port: u16,
         vip: String,
-        subnet_prefix: u8,
+        _subnet_prefix: u8,
     ) -> Result<()> {
-        self.stop_parasitic_passive_listener();
-        let vip = if vip.trim().is_empty() {
-            random_owner_vip()
-        } else {
-            vip
+        self.stop_lan_presence_listener();
+        // FloatUnit always uses a key-derived /24; prefix is forced to 24.
+        let subnet_prefix: u8 = 24;
+        let key = MintCrypto::generate_key();
+        let vip = {
+            let trimmed = vip.trim();
+            if trimmed.is_empty() {
+                crate::net::claim::random_member_vip_in_unit(&key)
+            } else if crate::net::claim::vip_in_floatunit_subnet(&key, trimmed) {
+                trimmed.to_string()
+            } else {
+                return Err(anyhow!(
+                    "VIP {trimmed} is outside this FloatUnit /24 (derived from network key); leave VIP empty to auto-pick"
+                ));
+            }
         };
         crate::cli_println!(
             "{}",
             term_style::fmt_nat_line(format_args!(" Attempting UPnP port mapping..."))
         );
         let local_ip = get_local_ip();
-        let local_ip_parsed: std::net::Ipv4Addr = local_ip
-            .parse()
-            .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1));
         self.upnp_cleanup_if_any().await;
         let upnp_result = tokio::time::timeout(
             std::time::Duration::from_secs(4),
@@ -1924,7 +1050,7 @@ impl Cli {
                 crate::cli_println!(
                     "{}",
                     term_style::fmt_bang_line(format_args!(
-                        " Owner appears behind double-NAT/CGNAT (UPnP vs STUN mismatch). \
+                        " Peer appears behind double-NAT/CGNAT (UPnP vs STUN mismatch). \
                          Decentralized join for new peers may be unstable until inbound UDP is reachable. \
                          Prefer port-forward on the router, a host with a public IP, or relay when available."
                     ))
@@ -1932,7 +1058,6 @@ impl Cli {
             }
         }
 
-        let key = MintCrypto::generate_key();
         let network_id = derive_network_id(&key);
         let node_id = hex::encode(rand::random::<[u8; 16]>());
 
@@ -1940,59 +1065,28 @@ impl Cli {
             ice::gather_candidates(&local_ip, port, stun_ep.as_ref(), upnp_result.as_ref());
         let _ = self.cmd_tx.send(EngineCmd::SetCandidates(candidates)).await;
 
-        let invite_ip: [u8; 4] = if let Some(ref ep) = stun_ep {
-            ep.ip
-                .parse::<std::net::Ipv4Addr>()
-                .map(|a| a.octets())
-                .unwrap_or(local_ip_parsed.octets())
-        } else {
-            local_ip_parsed.octets()
-        };
-        let invite_port = stun_ep.as_ref().map(|ep| ep.port).unwrap_or(port);
         let public_invite = encode_invite(&InvitePayload {
-            mode: 1,
-            owner_ip: invite_ip,
-            owner_port: invite_port,
-            key: key.0,
+            version: INVITE_VERSION,
             protocol: PROTO_UDP,
+            key: key.0,
         });
 
         ensure_netinfo_dir()?;
-        self.config.set_network_basics(
-            if name.is_empty() {
-                "Mint".to_string()
-            } else {
-                name.clone()
-            },
-            network_id.clone(),
-            "owner".to_string(),
-            vip.clone(),
-            node_id,
-            port,
-        );
+        self.config
+            .set_network_basics(network_id.clone(), vip.clone(), node_id, port);
         self.config.update(|cfg| {
             cfg.crypto_key = hex::encode(key.0);
-            cfg.owner_port = port;
-            cfg.owner_real_ip = local_ip.clone();
             cfg.public_invite_code = public_invite.clone();
-            cfg.parasitic_enabled = false;
-            cfg.parasitic_peer_vip.clear();
-            cfg.parasitic_self_vip.clear();
-            cfg.parasitic_peer_port = 0;
-            cfg.parasitic_peer_node_id.clear();
-            cfg.parasitic_self_is_owner = false;
-            cfg.parasitic_use_public = true;
-            cfg.subnet_prefix = subnet_prefix;
+            cfg.subnet_prefix = 24;
             cfg.decentralized_enabled = true;
             cfg.join_method = "decentralized".to_string();
         });
-        self.refresh_owner_vip_pool_from_config(true);
 
         #[cfg(windows)]
         {
             let vip_ip = vip
                 .parse::<std::net::Ipv4Addr>()
-                .map_err(|_| anyhow!("invalid owner vip: {vip}"))?;
+                .map_err(|_| anyhow!("invalid member vip: {vip}"))?;
             let snap = self.config.snapshot();
             let ring = effective_wintun_ring_bytes(snap.wintun_ring_bytes);
             let ipv4_metric =
@@ -2030,47 +1124,41 @@ impl Cli {
         let _ = self
             .cmd_tx
             .send(EngineCmd::SetIdentity {
-                is_owner: true,
                 my_vip: vip.clone(),
                 my_node_id: self.config.snapshot().node_id.clone(),
                 subnet_prefix: self.config.snapshot().subnet_prefix.clamp(8, 30),
+                vip_epoch: 0,
                 reply: None,
             })
             .await;
         let node_id = self.config.snapshot().node_id.clone();
         let _ = self
-            .start_decentralized_engine(None, false, None, None, &node_id)
+            .start_decentralized_engine(None, false, None, &node_id)
             .await;
         self.state = AppState::CommandLoop;
-        self.ensure_parasitic_passive_listener().await?;
+        self.ensure_lan_presence_listener().await?;
 
-        let display_name = if name.is_empty() { "Mint" } else { &name };
         crate::cli_println!();
-        crate::cli_println!("  [■■■■■■■■]");
-        crate::cli_println!("  │  Network : {:<46}", display_name);
-        crate::cli_println!("  │  Net ID  : {:<46}", network_id);
+        crate::cli_println!("  [------------]");
+        crate::cli_println!("  │  Unit ID   : {:<44}", network_id);
         crate::cli_println!(
-            "  │  VIP     : {:<46}",
-            format!("{vip}/{}  (owner)", self.config.snapshot().subnet_prefix)
+            "  │  VIP       : {:<44}",
+            format!("{vip}/{}", self.config.snapshot().subnet_prefix)
         );
-        crate::cli_println!("  │> Invite  : {public_invite}");
+        crate::cli_println!("  │> Invite    : {public_invite}");
         crate::cli_println!();
         Ok(())
     }
 
     async fn handle_join_entry(&mut self) -> Result<()> {
         crate::cli_println!("  Join mode:");
-        crate::cli_println!("    [1] Decentralized (default)");
-        crate::cli_println!("    [2] Parasitic");
-        crate::cli_println!("    [3] Manual");
-        crate::cli_print!("  Choose [1/2/3, default 1]: ");
+        crate::cli_println!("    [1] Decentralized");
+        crate::cli_println!("    [2] Manual");
+        crate::cli_print!("  Choose [1/2](1): ");
         io::stdout().flush()?;
         let mode = self.read_line().await?;
         let t = mode.trim();
         if t == "2" {
-            return self.handle_join_parasitic().await;
-        }
-        if t == "3" {
             crate::cli_print!("  Invite code: ");
             io::stdout().flush()?;
             let invite = self.read_line().await?;
@@ -2099,15 +1187,20 @@ impl Cli {
             "{}",
             term_style::fmt_join_line(format_args!(" Connection mode:"))
         );
-        crate::cli_println!("    [1] Public (STUN + punch, default)");
+        crate::cli_println!("    [1] Public");
         crate::cli_println!("    [2] LAN");
-        crate::cli_print!("  Choose [1/2, default 1]: ");
+        crate::cli_print!("  Choose [1/2](1): ");
         io::stdout().flush()?;
         let mode_line = self.read_line().await?;
         let use_public = !(mode_line.trim() == "2");
+        crate::cli_print!("  Peer endpoint (ip:port): ");
+        io::stdout().flush()?;
+        let ep_line = self.read_line().await?;
+        let target_endpoint = parse_join_endpoint(ep_line.trim())?;
         Ok(JoinInviteRunOpts {
             use_public,
             skip_share_gate: false,
+            target_endpoint: Some(target_endpoint),
         })
     }
 
@@ -2116,7 +1209,6 @@ impl Cli {
         network_key: Option<[u8; 32]>,
         is_joiner: bool,
         join_body: Option<Vec<u8>>,
-        join_owner_hint: Option<std::net::SocketAddr>,
         node_id: &str,
     ) -> Result<()> {
         let key_raw = match network_key {
@@ -2142,7 +1234,6 @@ impl Cli {
                 announce_secs,
                 is_joiner,
                 join_body,
-                join_owner_hint,
                 node_id: node_id.to_string(),
             })
             .await?;
@@ -2181,41 +1272,42 @@ impl Cli {
         parsed: &InvitePayload,
         local_node_id: String,
         port: u16,
-        owner_hint: SocketAddr,
     ) -> Result<()> {
-        let vip = ack.vip;
-        let owner_subnet = ack.subnet_prefix.clamp(8, 30);
-        let owner_udp = ack.owner_endpoint;
+        // Self-claimed VIP (may have been rerolled during handshake).
+        let vip = if !ack.local_vip.is_empty() {
+            ack.local_vip.clone()
+        } else {
+            self.config.snapshot().virtual_ip.clone()
+        };
+        let vip_epoch = ack.vip_epoch;
+        let subnet: u8 = 24;
+        let peer_udp = ack.peer_endpoint;
 
         ensure_netinfo_dir()?;
         self.config.set_network_basics(
-            "Mint".to_string(),
             derive_network_id(&Key(parsed.key)),
-            "peer".to_string(),
             vip.clone(),
             local_node_id.clone(),
             port,
         );
         self.config.update(|cfg| {
-            cfg.owner_real_ip = owner_udp.ip().to_string();
-            cfg.owner_port = owner_udp.port();
             cfg.crypto_key = hex::encode(parsed.key);
-            cfg.parasitic_enabled = false;
             cfg.decentralized_enabled = true;
             cfg.join_method = "decentralized".to_string();
-            cfg.subnet_prefix = owner_subnet;
+            cfg.subnet_prefix = 24;
+            cfg.vip_epoch = vip_epoch;
         });
 
         #[cfg(windows)]
         {
             let vip_ip = vip
                 .parse::<std::net::Ipv4Addr>()
-                .map_err(|_| anyhow!("invalid assigned vip: {vip}"))?;
+                .map_err(|_| anyhow!("invalid self vip: {vip}"))?;
             let snap = self.config.snapshot();
             let ring = effective_wintun_ring_bytes(snap.wintun_ring_bytes);
             let ipv4_metric =
                 effective_wintun_ipv4_interface_metric(snap.wintun_ipv4_interface_metric);
-            let wintun_prefix = owner_subnet;
+            let wintun_prefix = subnet;
             let adapter = tokio::task::spawn_blocking(move || -> Result<Arc<WintunAdapter>> {
                 Ok(Arc::new(
                     WintunAdapter::create(
@@ -2237,36 +1329,122 @@ impl Cli {
         let _ = self
             .cmd_tx
             .send(EngineCmd::SetIdentity {
-                is_owner: false,
                 my_vip: vip.clone(),
                 my_node_id: local_node_id,
-                subnet_prefix: owner_subnet,
+                subnet_prefix: subnet,
+                vip_epoch,
                 reply: None,
             })
             .await;
 
         let _ = self
-            .start_decentralized_engine(
-                None,
-                false,
-                None,
-                Some(owner_hint),
-                &self.config.snapshot().node_id,
-            )
+            .start_decentralized_engine(None, false, None, &self.config.snapshot().node_id)
             .await;
 
         self.state = AppState::CommandLoop;
-        self.ensure_parasitic_passive_listener().await?;
-        crate::cli_println!("  ✓ Joined network (Decentralized)!");
+        self.ensure_lan_presence_listener().await?;
+        crate::cli_println!("\n	>[ Joined FloatUnit ]");
+        crate::cli_println!("   >----------------------<");
         crate::cli_println!("    │  Virtual IP  : {}", vip);
-        crate::cli_println!("    │  Owner       : {}", owner_udp);
+        crate::cli_println!("    │  Peer        : {}", peer_udp);
         Ok(())
     }
 
+    async fn finalize_genesis_join(
+        &mut self,
+        parsed: &InvitePayload,
+        local_node_id: String,
+        port: u16,
+        vip: String,
+        vip_epoch: u64,
+        subnet: u8,
+    ) -> Result<()> {
+        ensure_netinfo_dir()?;
+        self.config.set_network_basics(
+            derive_network_id(&Key(parsed.key)),
+            vip.clone(),
+            local_node_id.clone(),
+            port,
+        );
+        self.config.update(|cfg| {
+            cfg.crypto_key = hex::encode(parsed.key);
+            cfg.decentralized_enabled = true;
+            cfg.join_method = "decentralized".to_string();
+            cfg.subnet_prefix = 24;
+            cfg.vip_epoch = vip_epoch;
+        });
+
+        #[cfg(windows)]
+        {
+            let vip_ip = vip
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| anyhow!("invalid self vip: {vip}"))?;
+            let snap = self.config.snapshot();
+            let ring = effective_wintun_ring_bytes(snap.wintun_ring_bytes);
+            let ipv4_metric =
+                effective_wintun_ipv4_interface_metric(snap.wintun_ipv4_interface_metric);
+            let wintun_prefix = 24u8;
+            let adapter = tokio::task::spawn_blocking(move || -> Result<Arc<WintunAdapter>> {
+                Ok(Arc::new(
+                    WintunAdapter::create(
+                        crate::tun::wintun::WINTUN_ADAPTER_NAME,
+                        vip_ip,
+                        wintun_prefix,
+                        ring,
+                        ipv4_metric,
+                    )
+                    .map_err(|e| anyhow!("failed to create Wintun adapter: {e}"))?,
+                ))
+            })
+            .await
+            .map_err(|e| anyhow!("wintun create task join failed: {e}"))??;
+            self.wire_adapter(adapter.clone());
+            self.vni = Some(adapter);
+        }
+
+        let _ = self
+            .cmd_tx
+            .send(EngineCmd::SetIdentity {
+                my_vip: vip.clone(),
+                my_node_id: local_node_id,
+                subnet_prefix: subnet.clamp(8, 30),
+                vip_epoch,
+                reply: None,
+            })
+            .await;
+
+        let _ = self
+            .start_decentralized_engine(None, false, None, &self.config.snapshot().node_id)
+            .await;
+
+        self.state = AppState::CommandLoop;
+        self.ensure_lan_presence_listener().await?;
+        crate::cli_println!("\n	>[ Genesis FloatUnit (solo) ]");
+        crate::cli_println!("   >----------------------<");
+        crate::cli_println!("    │  Virtual IP  : {}", vip);
+        Ok(())
+    }
+
+    async fn query_discovered_count(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(EngineCmd::QueryDiscoveredCount { reply: tx })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        tokio::time::timeout(Duration::from_millis(500), rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    }
+
     async fn handle_join_decentralized(&mut self, invite: &str) -> Result<()> {
-        self.stop_parasitic_passive_listener();
+        self.stop_lan_presence_listener();
         let parsed = decode_invite(invite)?;
-        let owner_hint = std::net::SocketAddr::from((parsed.owner_ip, parsed.owner_port));
         let local_ip = get_local_ip();
         let port = self.config.get_listen_port().max(7878);
         let local_node_id = {
@@ -2277,24 +1455,32 @@ impl Cli {
                 existing
             }
         };
-        let _room = room_id_20b(&Key(parsed.key), parsed.protocol);
+        let subnet: u8 = 24;
+        let unit_key = Key(parsed.key);
+        let (self_vip, vip_replaced) =
+            crate::net::claim::resolve_member_vip(&unit_key, &self.config.snapshot().virtual_ip);
+        let mut vip_epoch = self.config.snapshot().vip_epoch;
+        if vip_replaced {
+            vip_epoch = vip_epoch.saturating_add(1);
+        }
+        let _room = room_id_20b(&unit_key, parsed.protocol);
         crate::cli_println!(
             "{}",
             term_style::fmt_join_line(format_args!(
-                " Network ID hash: {}",
-                derive_network_id(&Key(parsed.key))
+                " FloatUnit ID: {}",
+                derive_network_id(&unit_key)
             ))
         );
         crate::cli_println!(
             "{}",
             term_style::fmt_join_line(format_args!(
-                " Decentralized room_id: {}",
-                room_id_hex(&Key(parsed.key), parsed.protocol)
+                " Tracker room_id: {}",
+                room_id_hex(&unit_key, parsed.protocol)
             ))
         );
         crate::cli_println!(
             "{}",
-            term_style::fmt_join_line(format_args!(" Owner hint (invite): {}", owner_hint))
+            term_style::fmt_join_line(format_args!(" Self VIP claim: {self_vip}"))
         );
 
         self.upnp_cleanup_if_any().await;
@@ -2322,6 +1508,8 @@ impl Cli {
         let body = serde_json::json!({
             "proto_ver": WIRE_PROTOCOL_VERSION,
             "node_id": local_node_id.clone(),
+            "vip": self_vip,
+            "vip_epoch": vip_epoch,
             "ts_ms": now_epoch_ms(),
             "rtt_hint_ms": 100,
             "nat_hint": "unknown",
@@ -2335,14 +1523,26 @@ impl Cli {
             .send(EngineCmd::SetCryptoKey(Key(parsed.key), None))
             .await;
 
-        self.start_decentralized_engine(
-            Some(parsed.key),
-            true,
-            Some(body.clone()),
-            Some(owner_hint),
-            &local_node_id,
-        )
-        .await?;
+        // Persist claim before fanout so genesis / ack finalize share the same VIP.
+        self.config.update(|cfg| {
+            cfg.virtual_ip = self_vip.clone();
+            cfg.vip_epoch = vip_epoch;
+            cfg.subnet_prefix = 24;
+            cfg.node_id = local_node_id.clone();
+        });
+        let _ = self
+            .cmd_tx
+            .send(EngineCmd::SetIdentity {
+                my_vip: self_vip.clone(),
+                my_node_id: local_node_id.clone(),
+                subnet_prefix: subnet,
+                vip_epoch,
+                reply: None,
+            })
+            .await;
+
+        self.start_decentralized_engine(Some(parsed.key), true, Some(body.clone()), &local_node_id)
+            .await?;
 
         let deadline_secs = self
             .config
@@ -2352,7 +1552,7 @@ impl Cli {
         crate::cli_println!(
             "{}",
             term_style::fmt_join_line(format_args!(
-                " Waiting for owner (MPJA) via tracker discovery (up to {deadline_secs}s)..."
+                " Waiting for peer ack via tracker discovery (up to {deadline_secs}s)..."
             ))
         );
 
@@ -2362,49 +1562,48 @@ impl Cli {
             .send(EngineCmd::PrepareJoin {
                 join_tx: tx,
                 key: Key(parsed.key),
-                owner: owner_hint,
+                target: None,
                 body: body.clone(),
             })
             .await;
 
         let ack = match tokio::time::timeout(Duration::from_secs(deadline_secs), rx).await {
-            Ok(Ok(Some(ack))) => ack,
+            Ok(Ok(Some(ack))) => Some(ack),
             Ok(Ok(None)) => {
                 let _ = self.cmd_tx.send(EngineCmd::CancelJoinWait).await;
-                return Err(anyhow!("join rejected by owner"));
+                return Err(anyhow!("join rejected"));
             }
-            Ok(Err(_)) => {
-                if let Some(ack) = self.wait_pending_join_ack(Duration::from_secs(3)).await {
-                    ack
-                } else {
-                    let _ = self.cmd_tx.send(EngineCmd::CancelJoinWait).await;
-                    crate::cli_println!(
-                        "{}",
-                        term_style::fmt_bang_line(format_args!(
-                            " Owner offline or unreachable. No profile saved; retry from the menu ([2] Join) when owner is online."
-                        ))
-                    );
-                    return Err(anyhow!("join timeout waiting owner response"));
-                }
-            }
-            Err(_) => {
-                if let Some(ack) = self.wait_pending_join_ack(Duration::from_secs(3)).await {
-                    ack
-                } else {
-                    let _ = self.cmd_tx.send(EngineCmd::CancelJoinWait).await;
-                    crate::cli_println!(
-                        "{}",
-                        term_style::fmt_bang_line(format_args!(
-                            " Owner offline or unreachable. No profile saved; retry from the menu ([2] Join) when owner is online."
-                        ))
-                    );
-                    return Err(anyhow!("join timeout waiting owner response"));
-                }
-            }
+            Ok(Err(_)) => self.wait_pending_join_ack(Duration::from_secs(3)).await,
+            Err(_) => self.wait_pending_join_ack(Duration::from_secs(3)).await,
         };
 
-        self.finalize_peer_join_from_ack(ack, &parsed, local_node_id, port, owner_hint)
-            .await
+        if let Some(ack) = ack {
+            return self
+                .finalize_peer_join_from_ack(ack, &parsed, local_node_id, port)
+                .await;
+        }
+
+        let _ = self.cmd_tx.send(EngineCmd::CancelJoinWait).await;
+        let discovered = self.query_discovered_count().await;
+        if discovered == 0 {
+            crate::cli_println!(
+                "{}",
+                term_style::fmt_join_line(format_args!(
+                    " No peers discovered — joining as genesis (solo) member."
+                ))
+            );
+            return self
+                .finalize_genesis_join(&parsed, local_node_id, port, self_vip, vip_epoch, subnet)
+                .await;
+        }
+
+        crate::cli_println!(
+            "{}",
+            term_style::fmt_bang_line(format_args!(
+                " Peers seen on tracker but no ack. Retry join when a member is online."
+            ))
+        );
+        Err(anyhow!("join timeout waiting peer ack"))
     }
 
     pub async fn join_decentralized_code(&mut self, invite: String) -> Result<()> {
@@ -2412,9 +1611,11 @@ impl Cli {
     }
 
     async fn handle_join(&mut self, invite: &str, opts: JoinInviteRunOpts) -> Result<()> {
-        self.stop_parasitic_passive_listener();
+        self.stop_lan_presence_listener();
         let parsed = decode_invite(invite)?;
-        let owner = std::net::SocketAddr::from((parsed.owner_ip, parsed.owner_port));
+        let target = opts
+            .target_endpoint
+            .ok_or_else(|| anyhow!("manual join requires peer endpoint (ip:port)"))?;
 
         let local_ip = get_local_ip();
         let port = self.config.get_listen_port().max(7878);
@@ -2430,13 +1631,13 @@ impl Cli {
         crate::cli_println!(
             "{}",
             term_style::fmt_join_line(format_args!(
-                " Network ID hash: {}",
+                " FloatUnit ID: {}",
                 crate::crypto::derive_network_id(&Key(parsed.key))
             ))
         );
         crate::cli_println!(
             "{}",
-            term_style::fmt_join_line(format_args!(" Target owner: {}", owner))
+            term_style::fmt_join_line(format_args!(" Target peer: {}", target))
         );
         crate::cli_println!(
             "{}",
@@ -2484,12 +1685,17 @@ impl Cli {
             .flatten();
             match &upnp_result {
                 Some(m) => crate::cli_println!(
-                    " ✓ UPnP mapping active (ext_port={}, ext_ip={}).",
-                    m.ext_port,
-                    m.external_ip
+                    "{}",
+                    term_style::fmt_ok_line(format_args!(
+                        " UPnP mapping active (ext_port={}, ext_ip={}).",
+                        m.ext_port, m.external_ip
+                    ))
                 ),
                 None => crate::cli_println!(
-                    " failed (router unsupported/disabled). Continuing without UPnP."
+                    "{}",
+                    term_style::fmt_info_line(format_args!(
+                        " failed (router unsupported/disabled). Continuing without UPnP."
+                    ))
                 ),
             }
         }
@@ -2500,9 +1706,7 @@ impl Cli {
         let stun_ep = if use_public {
             crate::cli_print!(
                 "{}",
-                term_style::fmt_join_line(format_args!(
-                    " Step 2/6: Gathering ICE candidates via STUN..."
-                ))
+                term_style::fmt_join_line(format_args!(" Gathering ICE candidates via STUN..."))
             );
             io::stdout().flush()?;
             self.query_public_endpoint_from_engine(std::time::Duration::from_secs(3))
@@ -2510,9 +1714,7 @@ impl Cli {
         } else {
             crate::cli_println!(
                 "{}",
-                term_style::fmt_join_line(format_args!(
-                    " Step 2/6: LAN mode — using host candidate only..."
-                ))
+                term_style::fmt_join_line(format_args!(" LAN mode — using host candidate only..."))
             );
             None
         };
@@ -2542,7 +1744,7 @@ impl Cli {
                         crate::cli_println!(
                             "{}",
                             term_style::fmt_join_line(format_args!(
-                                " [warn] Share STUN endpoint with owner."
+                                " [warn] Share STUN endpoint with target peer."
                             ))
                         );
                     }
@@ -2558,11 +1760,11 @@ impl Cli {
                     crate::cli_println!(
                         "{}",
                         term_style::fmt_join_line(format_args!(
-                            " Share this endpoint with the owner on the CLI client, then punching starts automatically."
+                            " Share this endpoint with the peer on the CLI client, then punching starts automatically."
                         ))
                     );
                 } else {
-                    crate::cli_println!("{}", term_style::fmt_join_line(format_args!(" Share this with owner, then press Enter to start manual retry punching...")));
+                    crate::cli_println!("{}", term_style::fmt_join_line(format_args!(" Share this with the peer, then press Enter to start manual retry punching...")));
                 }
             } else {
                 crate::cli_println!(" {} candidate(s) ready (no srflx).", candidates.len());
@@ -2585,22 +1787,45 @@ impl Cli {
         if use_public {
             crate::cli_println!(
                 "{}",
-                term_style::fmt_join_line(format_args!(
-                    " Step 3/6: Starting tiered hole punch toward owner..."
-                ))
+                term_style::fmt_join_line(format_args!(" Starting hole punch toward peer..."))
             );
         } else {
             crate::cli_println!(
                 "{}",
-                term_style::fmt_join_line(format_args!(
-                    " Step 3/6: LAN mode — tiered hole punch toward owner."
-                ))
+                term_style::fmt_join_line(format_args!(" LAN mode > hole punch toward peer."))
             );
         }
+
+        let subnet: u8 = 24;
+        let unit_key = Key(parsed.key);
+        let (self_vip, vip_replaced) =
+            crate::net::claim::resolve_member_vip(&unit_key, &self.config.snapshot().virtual_ip);
+        let mut vip_epoch = self.config.snapshot().vip_epoch;
+        if vip_replaced {
+            vip_epoch = vip_epoch.saturating_add(1);
+        }
+        self.config.update(|cfg| {
+            cfg.virtual_ip = self_vip.clone();
+            cfg.vip_epoch = vip_epoch;
+            cfg.subnet_prefix = 24;
+            cfg.node_id = local_node_id.clone();
+        });
+        let _ = self
+            .cmd_tx
+            .send(EngineCmd::SetIdentity {
+                my_vip: self_vip.clone(),
+                my_node_id: local_node_id.clone(),
+                subnet_prefix: subnet,
+                vip_epoch,
+                reply: None,
+            })
+            .await;
 
         let body = serde_json::json!({
             "proto_ver": WIRE_PROTOCOL_VERSION,
             "node_id": local_node_id.clone(),
+            "vip": self_vip,
+            "vip_epoch": vip_epoch,
             "ts_ms": now_epoch_ms(),
             "rtt_hint_ms": 100,
             "nat_hint": "unknown",
@@ -2613,20 +1838,16 @@ impl Cli {
             .cmd_tx
             .send(EngineCmd::StartPunchWorkflow {
                 key: JOIN_HANDSHAKE_PUNCH_KEY.to_string(),
-                bases: vec![owner],
+                bases: vec![target],
                 log_stages: true,
             })
             .await;
 
         crate::cli_println!(
             "{}",
-            term_style::fmt_join_line(format_args!(
-                " Step 4/6: Waiting for owner acknowledgment (MPJA)..."
-            ))
+            term_style::fmt_join_line(format_args!(" Waiting for peer acknowledgment..."))
         );
-        let mut assigned_vip: Option<String> = None;
-        let mut join_subnet_prefix: Option<u8> = None;
-        let mut owner_observed: Option<std::net::SocketAddr> = None;
+        let mut got_ack: Option<JoinAck> = None;
         let max_attempts = 5u32;
         for attempt in 1..=max_attempts {
             crate::cli_println!(
@@ -2641,17 +1862,21 @@ impl Cli {
                 .send(EngineCmd::PrepareJoin {
                     join_tx: tx,
                     key: Key(parsed.key),
-                    owner,
+                    target: Some(target),
                     body: body.clone(),
                 })
                 .await;
 
             match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
                 Ok(Ok(Some(ack))) => {
-                    crate::cli_println!("  ✓ Owner assigned virtual IP: {}", ack.vip);
-                    join_subnet_prefix = Some(ack.subnet_prefix);
-                    owner_observed = Some(ack.owner_endpoint);
-                    assigned_vip = Some(ack.vip);
+                    crate::cli_println!(
+                        "{}",
+                        term_style::fmt_ok_line(format_args!(
+                            " Peer ack from {} (vip={})",
+                            ack.peer_endpoint, ack.peer_vip
+                        ))
+                    );
+                    got_ack = Some(ack);
                     break;
                 }
                 Ok(Ok(None)) => {
@@ -2661,7 +1886,7 @@ impl Cli {
                             key: JOIN_HANDSHAKE_PUNCH_KEY.to_string(),
                         })
                         .await;
-                    return Err(anyhow!("join rejected by owner"));
+                    return Err(anyhow!("join rejected"));
                 }
                 Ok(Err(_)) => {}
                 Err(_) => {}
@@ -2676,978 +1901,64 @@ impl Cli {
             })
             .await;
 
-        let vip = match assigned_vip {
-            Some(v) => v,
-            None => {
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_bang_line(format_args!(
-                        " Owner did not respond within the join retry window (~{} seconds max).",
-                        20
-                    ))
-                );
-                return Err(anyhow!("join timeout waiting owner response"));
-            }
-        };
-        let owner_udp = owner_observed.unwrap_or(owner);
-
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_join_line(format_args!(
-                " Step 5/6: Config saved, initializing virtual interface..."
-            ))
-        );
-        ensure_netinfo_dir()?;
-        self.config.set_network_basics(
-            "Mint".to_string(),
-            derive_network_id(&Key(parsed.key)),
-            "peer".to_string(),
-            vip.clone(),
-            local_node_id,
-            port,
-        );
-        let owner_subnet = join_subnet_prefix.unwrap_or(24).clamp(8, 30);
-        self.config.update(|cfg| {
-            cfg.owner_real_ip = owner_udp.ip().to_string();
-            cfg.owner_port = owner_udp.port();
-            cfg.crypto_key = hex::encode(parsed.key);
-            cfg.parasitic_enabled = false;
-            cfg.parasitic_peer_vip.clear();
-            cfg.parasitic_self_vip.clear();
-            cfg.parasitic_peer_port = 0;
-            cfg.parasitic_peer_node_id.clear();
-            cfg.parasitic_self_is_owner = false;
-            cfg.subnet_prefix = owner_subnet;
-        });
-
-        #[cfg(windows)]
-        {
-            let vip_ip = vip
-                .parse::<std::net::Ipv4Addr>()
-                .map_err(|_| anyhow!("invalid assigned vip: {vip}"))?;
-            let snap = self.config.snapshot();
-            let ring = effective_wintun_ring_bytes(snap.wintun_ring_bytes);
-            let ipv4_metric =
-                effective_wintun_ipv4_interface_metric(snap.wintun_ipv4_interface_metric);
-            let wintun_prefix = owner_subnet;
-            let adapter = tokio::task::spawn_blocking(move || -> Result<Arc<WintunAdapter>> {
-                Ok(Arc::new(
-                    WintunAdapter::create(
-                        crate::tun::wintun::WINTUN_ADAPTER_NAME,
-                        vip_ip,
-                        wintun_prefix,
-                        ring,
-                        ipv4_metric,
-                    )
-                    .map_err(|e| anyhow!("failed to create Wintun adapter: {e}"))?,
-                ))
-            })
-            .await
-            .map_err(|e| anyhow!("wintun create task join failed: {e}"))??;
-            self.wire_adapter(adapter.clone());
-            self.vni = Some(adapter);
+        let Some(ack) = got_ack else {
             crate::cli_println!(
                 "{}",
-                term_style::fmt_info_line(format_args!(
-                    " Wintun adapter ready for {vip}/{owner_subnet}"
+                term_style::fmt_bang_line(format_args!(
+                    " Peer did not respond within the join retry window (~{} seconds max).",
+                    20
                 ))
             );
-        }
+            return Err(anyhow!("join timeout waiting peer ack"));
+        };
 
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_join_line(format_args!(" Step 6/6: Starting data plane..."))
-        );
-        let _ = self
-            .cmd_tx
-            .send(EngineCmd::SetIdentity {
-                is_owner: false,
-                my_vip: vip.clone(),
-                my_node_id: self.config.snapshot().node_id.clone(),
-                subnet_prefix: self.config.snapshot().subnet_prefix.clamp(8, 30),
-                reply: None,
-            })
-            .await;
-
-        self.state = AppState::CommandLoop;
-        self.ensure_parasitic_passive_listener().await?;
-        crate::cli_println!();
-        crate::cli_println!("  ✓ Joined network!");
-        crate::cli_println!(
-            "[■■■]================------------------------===========------------===------>>"
-        );
-        crate::cli_println!("    │  Network ID  : {}", self.config.snapshot().network_id);
-        crate::cli_println!("    │  Virtual IP  : {}", vip);
-        crate::cli_println!("    │  Node ID     : {}", self.config.snapshot().node_id);
-        crate::cli_println!("    │  Role        : Peer");
-        crate::cli_println!("    │  Owner       : {}", owner_udp);
-        crate::cli_println!(
-            "[■■■■■]================----------====----====----====----====----====-->>"
-        );
-        Ok(())
+        self.finalize_peer_join_from_ack(ack, &parsed, local_node_id, port)
+            .await
     }
 
-    pub async fn join_invite_code(&mut self, invite: String, lan_mode: Option<bool>) -> Result<()> {
-        let opts = JoinInviteRunOpts::from_ipc(lan_mode);
+    pub async fn join_invite_code(
+        &mut self,
+        invite: String,
+        lan_mode: Option<bool>,
+        endpoint: String,
+    ) -> Result<()> {
+        let target_endpoint = parse_join_endpoint(endpoint.trim())?;
+        let opts = JoinInviteRunOpts::from_ipc(lan_mode, target_endpoint);
         self.handle_join(&invite, opts).await
     }
 
-    async fn handle_join_parasitic(&mut self) -> Result<()> {
-        self.stop_parasitic_passive_listener();
+    /// Broadcast MPHI with local network_id; collect matching MPHR replies.
+    /// Requires a configured member unit (network_id + crypto_key + virtual_ip).
+    pub async fn discover_lan_members(&mut self) -> Result<Vec<crate::ipc::LanMemberPeer>> {
         let snap = self.config.snapshot();
-        if !snap.network_id.is_empty() && !snap.parasitic_enabled {
+        if snap.network_id.is_empty() || snap.crypto_key.is_empty() || snap.virtual_ip.is_empty() {
             return Err(anyhow!(
-                "active network exists. run 'remove' first, then choose [2] Join from the menu."
+                "unit not configured — network_id, crypto_key, and virtual_ip required"
             ));
         }
-        let listen_port = self.config.get_listen_port().max(7878);
-        drop(snap);
-
-        if self.headless {
-            return Err(anyhow!(
-                "interactive parasitic join must use the CLI client wizard (Public VIP or LAN discover)"
-            ));
-        }
-
-        crate::cli_println!("  Parasitic mode:");
-        crate::cli_println!("    [1] Public (VIP signaling, default)");
-        crate::cli_println!("    [2] LAN (UDP broadcast discover)");
-        crate::cli_print!("  Choose [1/2, default 1]: ");
-        io::stdout().flush()?;
-        let mode = self.read_line().await?;
-        if mode.trim() == "2" {
-            let owners = self.discover_parasitic_lan().await?;
-            let target = select_parasitic_lan_target_interactive(self, &owners).await?;
-            return self.join_parasitic_lan_with_target(target).await;
-        }
-
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(
-                " Use any pre-existing VPN/route as a signaling pipe."
-            ))
-        );
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(
-                " Both sides must reach each other on UDP at the VIP/port below."
-            ))
-        );
-        crate::cli_print!("  Peer VIP (ip or ip:port): ");
-        io::stdout().flush()?;
-        let peer_vip_input = self.read_line().await?;
-        crate::cli_print!("  Your VIP (ip or ip:port): ");
-        io::stdout().flush()?;
-        let self_vip_input = self.read_line().await?;
-        crate::cli_print!("  UPnP port (default {listen_port}): ");
-        io::stdout().flush()?;
-        let upnp_port = self.read_line().await?.parse::<u16>().ok();
-        self.join_parasitic_with_params(peer_vip_input, self_vip_input, upnp_port)
-            .await
-    }
-
-    pub async fn join_parasitic_with_params(
-        &mut self,
-        peer_vip_input: String,
-        self_vip_input: String,
-        upnp_port: Option<u16>,
-    ) -> Result<()> {
-        self.stop_parasitic_passive_listener();
-        let snap = self.config.snapshot();
-        if !snap.network_id.is_empty() && !snap.parasitic_enabled {
-            return Err(anyhow!(
-                "active network exists. run 'remove' first, then choose [2] Join from the menu."
-            ));
-        }
-        let listen_port = self.config.get_listen_port().max(7878);
-        let local_node_id = if snap.node_id.is_empty() {
-            let nid = hex::encode(rand::random::<[u8; 16]>());
-            self.config.update(|cfg| {
-                if cfg.node_id.is_empty() {
-                    cfg.node_id = nid.clone();
-                }
-            });
-            self.config.snapshot().node_id.clone()
-        } else {
-            snap.node_id.clone()
-        };
-        drop(snap);
-        let upnp_port_for_retry = upnp_port;
-        let upnp_port = upnp_port_for_retry.unwrap_or(listen_port);
-        let (peer_vip, peer_vip_target) = parse_vip_signal_target(&peer_vip_input, listen_port)?;
-        let (self_vip, _) = parse_vip_signal_target(&self_vip_input, listen_port)?;
-
-        if self_vip == peer_vip {
-            return Err(anyhow!(
-                "peer VIP and your VIP must be different (would self-loop the signaling pipe)"
-            ));
-        }
-
-        self.upnp_cleanup_if_any().await;
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(
-                " Step 1/6: Trying UPnP mapping on UDP {upnp_port}..."
-            ))
-        );
         let local_ip = get_local_ip();
-        let upnp_result = tokio::time::timeout(
-            Duration::from_secs(4),
-            upnp::discover_and_add_port(&local_ip, upnp_port, "MintegerP2P-Parasitic"),
-        )
-        .await
-        .ok()
-        .flatten();
-        if let Some(ref m) = upnp_result {
-            crate::cli_println!(
-                "{}",
-                term_style::fmt_para_line(format_args!(
-                    " UPnP mapped ext_port={}, ext_ip={}",
-                    m.ext_port, m.external_ip
-                ))
-            );
-            self.upnp_set_mapping(m.clone());
-        } else {
-            crate::cli_println!(
-                "{}",
-                term_style::fmt_para_line(format_args!(" UPnP unavailable, continuing."))
-            );
-        }
-
-        let stun_ep = if self.headless {
-            let mut found = None;
-            for attempt in 1..=HEADLESS_STUN_ATTEMPTS {
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_para_line(format_args!(
-                        " Step 2/6: STUN public endpoint lookup..."
-                    ))
-                );
-                let ep = self
-                    .query_public_endpoint_from_engine(Duration::from_secs(3))
-                    .await;
-                if let Some(ep) = ep {
-                    found = Some(ep);
-                    break;
-                }
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_para_line(format_args!(
-                        " STUN failed (attempt {attempt}/{HEADLESS_STUN_ATTEMPTS})."
-                    ))
-                );
-            }
-            found.ok_or_else(|| {
-                anyhow!(
-                    "STUN failed after {HEADLESS_STUN_ATTEMPTS} attempts. Check connectivity, then run remove and choose [2] Join → Parasitic from the menu."
-                )
-            })?
-        } else {
-            let stun_ep = loop {
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_para_line(format_args!(
-                        " Step 2/6: STUN public endpoint lookup..."
-                    ))
-                );
-                let ep = self
-                    .query_public_endpoint_from_engine(Duration::from_secs(3))
-                    .await;
-                if ep.is_some() {
-                    break ep;
-                }
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_para_line(format_args!(" STUN failed."))
-                );
-                if self
-                    .prompt_retry_or_invite(
-                        "  Choose [1] Retry STUN  [2] Back to invite (default 1): ",
-                    )
-                    .await?
-                {
-                    continue;
-                }
-                return self.fallback_to_invite_flow().await;
-            };
-            let Some(stun_ep) = stun_ep else {
-                return self.fallback_to_invite_flow().await;
-            };
-            stun_ep
-        };
-        let local_public = make_socket_addr(&stun_ep.ip, stun_ep.port)?;
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(" Local public endpoint: {}", local_public))
-        );
-        let local_candidates = gather_local_para_candidates(
-            &self.config.snapshot(),
-            &self.cmd_tx,
-            Duration::from_secs(3),
-        )
-        .await;
-
-        let existing_key_hex = self.config.snapshot().crypto_key.clone();
-        let proposed_key_hex = if existing_key_hex.is_empty() {
-            hex::encode(MintCrypto::generate_key().0)
-        } else {
-            existing_key_hex.clone()
-        };
-        let proposed_subnet = random_owner_vip();
-        let session_id = hex::encode(rand::random::<[u8; 8]>());
-        let proposed_start_at_ms = now_epoch_ms() + PARA_START_BUFFER_MS;
+        let listen_port = snap.listen_port.max(7878);
+        let local_node_id = snap.node_id.clone();
+        let network_id = snap.network_id.clone();
+        let local_candidates = local_only_para_candidates(&snap);
+        drop(snap);
 
         let (sig_tx, mut sig_rx) = mpsc::channel::<ParaSignal>(2048);
         let listener_id = register_para_listener(&self.cmd_tx, sig_tx, false).await;
 
-        let mut remote_candidates: Vec<SocketAddr> = Vec::new();
-        let mut remote_public: Option<SocketAddr> = None;
-        let mut remote_node_id = String::new();
-        let mut remote_key_hex: Option<String> = None;
-        let mut remote_subnet: Option<String> = None;
-        let mut assigned_local_vip: Option<String> = None;
-        let mut remote_vip: Option<String> = None;
-        let mut agreed_network_id: Option<String> = None;
-        let mut role_decided: Option<bool> = None;
-        let mut finalized_owner_is_local: Option<bool> = None;
-        let mut finalized_local_vip: Option<String> = None;
-        let mut finalized_key_hex: Option<String> = None;
-        let mut finalized_network_id: Option<String> = None;
-        let mut state = ParaState::HelloSent { attempts: 0 };
-        let mut seen_sessions = HashSet::new();
-
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(
-                " Step 3/6: Exchanging parasitic signals via VIP..."
-            ))
-        );
-        loop {
-            state = match state {
-                ParaState::HelloSent { attempts } => {
-                    if attempts >= PARA_SIGNAL_ATTEMPTS {
-                        ParaState::Failed {
-                            reason: "signaling timeout".to_string(),
-                        }
-                    } else {
-                        let hello = json!({
-                            "node_id": local_node_id,
-                            "public_ip": local_public.ip().to_string(),
-                            "public_port": local_public.port(),
-                            "proposed_key_hex": proposed_key_hex,
-                            "proposed_vip_subnet": proposed_subnet,
-                            "ts_ms": now_epoch_ms(),
-                            "candidates": local_candidates.clone(),
-                            "start_at_ms": proposed_start_at_ms,
-                            "session_id": session_id,
-                        })
-                        .to_string()
-                        .into_bytes();
-                        let _ = self
-                            .cmd_tx
-                            .send(EngineCmd::ParaSendHello {
-                                target_vip: peer_vip_target,
-                                payload: hello,
-                            })
-                            .await;
-                        crate::cli_println!(
-                            "{}",
-                            term_style::fmt_para_line(format_args!(
-                                " Signal attempt {}/{}",
-                                attempts + 1,
-                                PARA_SIGNAL_ATTEMPTS
-                            ))
-                        );
-                        let wait =
-                            tokio::time::timeout(para_signal_pause_duration(), sig_rx.recv()).await;
-                        match wait {
-                            Ok(Some(ParaSignal::HelloReceived {
-                                public_ip,
-                                public_port,
-                                proposed_key,
-                                proposed_vip_subnet,
-                                node_id,
-                                candidates,
-                                start_at_ms,
-                                session_id: remote_session_id,
-                                ..
-                            })) => {
-                                if !remote_session_id.is_empty()
-                                    && !seen_sessions.insert(remote_session_id.clone())
-                                {
-                                    ParaState::HelloSent {
-                                        attempts: attempts + 1,
-                                    }
-                                } else {
-                                    if let Ok(ep) = make_socket_addr(&public_ip, public_port) {
-                                        remote_public = Some(ep);
-                                    }
-                                    remote_candidates = candidates_to_socket_addrs(&candidates);
-                                    if let Some(ep) = remote_public {
-                                        if !remote_candidates.contains(&ep) {
-                                            remote_candidates.push(ep);
-                                        }
-                                    }
-                                    remote_node_id = node_id.clone();
-                                    remote_key_hex = Some(proposed_key.clone());
-                                    remote_subnet = Some(proposed_vip_subnet.clone());
-                                    let owner_is_local = local_node_id <= node_id;
-                                    let chosen_key_hex = if owner_is_local {
-                                        proposed_key_hex.clone()
-                                    } else {
-                                        proposed_key
-                                    };
-                                    let chosen_subnet = if owner_is_local {
-                                        proposed_subnet.clone()
-                                    } else {
-                                        proposed_vip_subnet
-                                    };
-                                    let assigned_for_remote =
-                                        vip_from_owner_subnet(&chosen_subnet, !owner_is_local)?;
-                                    let assigned_for_local =
-                                        vip_from_owner_subnet(&chosen_subnet, owner_is_local)?;
-                                    remote_vip = Some(assigned_for_remote.clone());
-                                    assigned_local_vip = Some(assigned_for_local.clone());
-                                    role_decided = Some(owner_is_local);
-                                    if let Ok(key_arr) = parse_key_hex_32(&chosen_key_hex) {
-                                        agreed_network_id = Some(derive_network_id(&Key(key_arr)));
-                                    }
-                                    let agreed_start_at_ms = compute_agreed_start_at_ms(
-                                        start_at_ms,
-                                        now_epoch_ms() + PARA_START_BUFFER_MS,
-                                    );
-                                    let reply = json!({
-                                        "node_id": local_node_id,
-                                        "public_ip": local_public.ip().to_string(),
-                                        "public_port": local_public.port(),
-                                        "assigned_vip": assigned_for_remote,
-                                        "network_id": agreed_network_id.clone().unwrap_or_default(),
-                                        "ts_ms": now_epoch_ms(),
-                                        "candidates": local_candidates.clone(),
-                                        "agreed_start_at_ms": agreed_start_at_ms,
-                                        "session_id": session_id,
-                                        "responder_vip": assigned_for_local,
-                                        "responder_is_owner": owner_is_local,
-                                    })
-                                    .to_string()
-                                    .into_bytes();
-                                    let _ = self
-                                        .cmd_tx
-                                        .send(EngineCmd::ParaSendReply {
-                                            target_vip: peer_vip_target,
-                                            payload: reply,
-                                        })
-                                        .await;
-                                    if let Some(ep) = remote_public {
-                                        ParaState::ReplyReceived {
-                                            peer_ep: ep,
-                                            start_at_ms: agreed_start_at_ms,
-                                        }
-                                    } else {
-                                        ParaState::HelloSent {
-                                            attempts: attempts + 1,
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(Some(ParaSignal::ReplyReceived {
-                                public_ip,
-                                public_port,
-                                assigned_vip,
-                                network_id,
-                                node_id,
-                                candidates,
-                                agreed_start_at_ms: peer_start,
-                                session_id: remote_session_id,
-                                responder_vip,
-                                responder_is_owner,
-                                ..
-                            })) => {
-                                if !remote_session_id.is_empty() && remote_session_id != session_id
-                                {
-                                    ParaState::HelloSent {
-                                        attempts: attempts + 1,
-                                    }
-                                } else if assigned_vip.is_empty() {
-                                    ParaState::Failed {
-                                        reason: "peer rejected parasitic (vip pool full)"
-                                            .to_string(),
-                                    }
-                                } else {
-                                    if let Ok(ep) = make_socket_addr(&public_ip, public_port) {
-                                        remote_public = Some(ep);
-                                    }
-                                    remote_candidates = candidates_to_socket_addrs(&candidates);
-                                    if let Some(ep) = remote_public {
-                                        if !remote_candidates.contains(&ep) {
-                                            remote_candidates.push(ep);
-                                        }
-                                    }
-                                    remote_node_id = node_id;
-                                    assigned_local_vip = Some(assigned_vip);
-
-                                    let owner_is_local_now = if responder_is_owner {
-                                        false
-                                    } else if remote_node_id.is_empty() {
-                                        true
-                                    } else {
-                                        local_node_id <= remote_node_id
-                                    };
-                                    role_decided = Some(owner_is_local_now);
-
-                                    remote_vip = if !responder_vip.is_empty() {
-                                        Some(responder_vip)
-                                    } else if owner_is_local_now {
-                                        Some(
-                                            vip_from_owner_subnet(
-                                                &owner_vip(
-                                                    assigned_local_vip
-                                                        .as_deref()
-                                                        .unwrap_or("10.0.0.1"),
-                                                ),
-                                                false,
-                                            )
-                                            .unwrap_or_else(|_| "10.0.0.2".to_string()),
-                                        )
-                                    } else {
-                                        Some(owner_vip(
-                                            assigned_local_vip.as_deref().unwrap_or("10.0.0.2"),
-                                        ))
-                                    };
-                                    agreed_network_id = Some(network_id);
-                                    let agreed_start_at_ms = compute_agreed_start_at_ms(
-                                        peer_start,
-                                        now_epoch_ms() + PARA_START_BUFFER_MS,
-                                    );
-                                    if let Some(ep) = remote_public {
-                                        ParaState::ReplyReceived {
-                                            peer_ep: ep,
-                                            start_at_ms: agreed_start_at_ms,
-                                        }
-                                    } else {
-                                        ParaState::HelloSent {
-                                            attempts: attempts + 1,
-                                        }
-                                    }
-                                }
-                            }
-                            _ => ParaState::HelloSent {
-                                attempts: attempts + 1,
-                            },
-                        }
-                    }
-                }
-                ParaState::ReplyReceived {
-                    peer_ep,
-                    start_at_ms,
-                } => {
-                    let _ = send_para_ok_redundant(
-                        &self.cmd_tx,
-                        peer_vip_target,
-                        &local_node_id,
-                        &session_id,
-                    )
-                    .await;
-                    ParaState::OkSent {
-                        peer_ep,
-                        start_at_ms,
-                    }
-                }
-                ParaState::OkSent {
-                    peer_ep,
-                    start_at_ms,
-                } => {
-                    let wait =
-                        tokio::time::timeout(Duration::from_millis(PARA_OK_WAIT_MS), sig_rx.recv())
-                            .await;
-                    match wait {
-                        Ok(Some(ParaSignal::OkReceived {
-                            session_id: sid, ..
-                        })) if sid.is_empty() || sid == session_id => ParaState::WaitingStart {
-                            peer_ep,
-                            start_at_ms,
-                            ok_confirmed: true,
-                        },
-                        _ => ParaState::WaitingStart {
-                            peer_ep,
-                            start_at_ms,
-                            ok_confirmed: false,
-                        },
-                    }
-                }
-                ParaState::WaitingStart {
-                    peer_ep,
-                    start_at_ms,
-                    ok_confirmed,
-                } => {
-                    let _ = peer_ep;
-                    if !ok_confirmed {
-                        let retry_wait_ms = (start_at_ms.saturating_sub(now_epoch_ms()))
-                            .min(PARA_OK_WAIT_MS)
-                            .max(200);
-                        let retry_wait = tokio::time::timeout(
-                            Duration::from_millis(retry_wait_ms),
-                            sig_rx.recv(),
-                        )
-                        .await;
-                        let got_ok = matches!(
-                            retry_wait,
-                            Ok(Some(ParaSignal::OkReceived { session_id: sid, .. }))
-                                if sid.is_empty() || sid == session_id
-                        );
-                        if !got_ok {
-                            crate::cli_eprintln!(
-                                "{}",
-                                term_style::fmt_para_line_stderr(format_args!(
-                                    " owner did not confirm OK within {}ms; proceeding optimistically.",
-                                    PARA_OK_WAIT_MS
-                                ))
-                            );
-                            wait_until_para_start(start_at_ms).await;
-                            ParaState::Punching
-                        } else {
-                            wait_until_para_start(start_at_ms).await;
-                            ParaState::Punching
-                        }
-                    } else {
-                        wait_until_para_start(start_at_ms).await;
-                        ParaState::Punching
-                    }
-                }
-                ParaState::Punching => {
-                    let owner_is_local_now = role_decided.unwrap_or_else(|| {
-                        if remote_node_id.is_empty() {
-                            true
-                        } else {
-                            local_node_id <= remote_node_id
-                        }
-                    });
-                    let rv = remote_vip.clone().unwrap_or_else(|| {
-                        if owner_is_local_now {
-                            vip_from_owner_subnet(
-                                &owner_vip(assigned_local_vip.as_deref().unwrap_or("10.0.0.1")),
-                                false,
-                            )
-                            .unwrap_or_else(|_| "10.0.0.2".to_string())
-                        } else {
-                            owner_vip(assigned_local_vip.as_deref().unwrap_or("10.0.0.2"))
-                        }
-                    });
-                    let chosen_key_hex = if owner_is_local_now {
-                        proposed_key_hex.clone()
-                    } else if let Some(ref k) = remote_key_hex {
-                        k.clone()
-                    } else if !existing_key_hex.is_empty() {
-                        existing_key_hex.clone()
-                    } else {
-                        crate::cli_println!(
-                            "{}",
-                            term_style::fmt_para_line(format_args!(
-                                " Key fallback: using local proposed key (reply-only path)."
-                            ))
-                        );
-                        proposed_key_hex.clone()
-                    };
-                    let chosen_subnet = if owner_is_local_now {
-                        proposed_subnet.clone()
-                    } else {
-                        remote_subnet.clone().unwrap_or_else(|| {
-                            owner_vip(assigned_local_vip.as_deref().unwrap_or("10.0.0.2"))
-                        })
-                    };
-                    let local_vip_now = assigned_local_vip.clone().unwrap_or_else(|| {
-                        vip_from_owner_subnet(&chosen_subnet, owner_is_local_now)
-                            .unwrap_or_else(|_| "10.0.0.2".to_string())
-                    });
-                    let network_id_now = if let Some(ref id) = agreed_network_id {
-                        id.clone()
-                    } else {
-                        derive_network_id(&Key(parse_key_hex_32(&chosen_key_hex)?))
-                    };
-                    if remote_candidates.is_empty() {
-                        if let Some(ep) = remote_public {
-                            remote_candidates.push(ep);
-                        }
-                    }
-                    if remote_candidates.is_empty() {
-                        ParaState::Failed {
-                            reason: "missing remote endpoint".to_string(),
-                        }
-                    } else {
-                        let peer_public_ep = remote_public
-                            .or_else(|| remote_candidates.first().copied())
-                            .ok_or_else(|| anyhow!("missing peer endpoint after signaling"))?;
-                        let key_raw = parse_key_hex_32(&chosen_key_hex)?;
-                        let mut bound_targets = HashSet::new();
-                        for candidate in &remote_candidates {
-                            if bound_targets.insert(*candidate) {
-                                let _ = self
-                                    .cmd_tx
-                                    .send(EngineCmd::BindPeerKey {
-                                        peer: *candidate,
-                                        key: Key(key_raw),
-                                    })
-                                    .await;
-                            }
-                        }
-                        self.apply_parasitic_identity(
-                            owner_is_local_now,
-                            &local_vip_now,
-                            &local_node_id,
-                            key_raw,
-                            peer_public_ep,
-                        )
-                        .await?;
-                        if self
-                            .run_parasitic_punch(
-                                &remote_candidates,
-                                &rv,
-                                PARA_PEER_PUNCH_MIN_WALL_MS,
-                            )
-                            .await
-                        {
-                            let ack_target =
-                                { self.routing.read().lookup(&rv).unwrap_or(peer_vip_target) };
-                            if !owner_is_local_now && ack_target != peer_public_ep {
-                                let _ = self
-                                    .cmd_tx
-                                    .send(EngineCmd::SetOwnerEndpoint(ack_target, None))
-                                    .await;
-                                let _ = self
-                                    .cmd_tx
-                                    .send(EngineCmd::BindPeerKey {
-                                        peer: ack_target,
-                                        key: Key(key_raw),
-                                    })
-                                    .await;
-                            }
-                            let ack_targets = {
-                                let rt = self.routing.read();
-                                collect_para_punch_ack_targets(
-                                    &rt,
-                                    &rv,
-                                    &remote_candidates,
-                                    &[peer_public_ep, peer_vip_target],
-                                )
-                            };
-                            let _ = send_para_punch_ack_redundant(
-                                &self.cmd_tx,
-                                &ack_targets,
-                                &local_node_id,
-                                &session_id,
-                            )
-                            .await;
-                            finalized_owner_is_local = Some(owner_is_local_now);
-                            finalized_local_vip = Some(local_vip_now);
-                            finalized_key_hex = Some(chosen_key_hex);
-                            finalized_network_id = Some(network_id_now);
-                            ParaState::Connected
-                        } else {
-                            ParaState::Failed {
-                                reason: "punch failed".to_string(),
-                            }
-                        }
-                    }
-                }
-                ParaState::Connected => break,
-                ParaState::Failed { reason } => {
-                    crate::cli_println!(
-                        "{}",
-                        term_style::fmt_para_line(format_args!(" {reason}."))
-                    );
-                    if self.headless {
-                        unregister_para_listener(&self.cmd_tx, listener_id).await;
-                        return Err(anyhow!(
-                            "parasitic join failed: {reason}. Run remove, then choose [2] Join → Parasitic from the menu."
-                        ));
-                    }
-                    if self
-                        .prompt_retry_or_invite(
-                            "  Choose [1] Retry parasitic  [2] Back to invite (default 1): ",
-                        )
-                        .await?
-                    {
-                        unregister_para_listener(&self.cmd_tx, listener_id).await;
-                        return Box::pin(self.join_parasitic_with_params(
-                            peer_vip_input.clone(),
-                            self_vip_input.clone(),
-                            upnp_port_for_retry,
-                        ))
-                        .await;
-                    }
-                    unregister_para_listener(&self.cmd_tx, listener_id).await;
-                    return self.fallback_to_invite_flow().await;
-                }
-            };
-            if matches!(state, ParaState::Connected) {
-                break;
-            }
-        }
-        unregister_para_listener(&self.cmd_tx, listener_id).await;
-
-        let _peer_public_ep = remote_public
-            .or_else(|| remote_candidates.first().copied())
-            .ok_or_else(|| anyhow!("missing peer endpoint after signaling"))?;
-        let owner_is_local = finalized_owner_is_local
-            .ok_or_else(|| anyhow!("missing finalized role after punch"))?;
-        let local_vip = finalized_local_vip
-            .ok_or_else(|| anyhow!("missing finalized local vip after punch"))?;
-        let chosen_key_hex =
-            finalized_key_hex.ok_or_else(|| anyhow!("missing finalized key after punch"))?;
-        let network_id = finalized_network_id
-            .ok_or_else(|| anyhow!("missing finalized network id after punch"))?;
-
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(" Step 4/6: Running punch sequences..."))
-        );
-
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(" Step 5/6: Saving profile..."))
-        );
-        ensure_netinfo_dir()?;
-        self.config.set_network_basics(
-            "Mint".to_string(),
-            network_id.clone(),
-            if owner_is_local {
-                "owner".to_string()
-            } else {
-                "peer".to_string()
-            },
-            local_vip.clone(),
-            local_node_id.clone(),
-            listen_port,
-        );
-        let remote_node_id_save = remote_node_id.clone();
-        self.config.update(|cfg| {
-            cfg.owner_real_ip.clear();
-            cfg.owner_port = 0;
-            cfg.owner_endpoints_cache.clear();
-            cfg.crypto_key = chosen_key_hex.clone();
-            cfg.parasitic_enabled = true;
-            cfg.parasitic_peer_vip = peer_vip.clone();
-            cfg.parasitic_self_vip = self_vip.clone();
-            cfg.parasitic_peer_port = peer_vip_target.port();
-            cfg.parasitic_peer_node_id = remote_node_id_save.clone();
-            cfg.parasitic_self_is_owner = owner_is_local;
-            cfg.parasitic_use_public = true;
-            cfg.join_method = "parasitic".to_string();
-        });
-        self.refresh_owner_vip_pool_from_config(owner_is_local);
-
-        #[cfg(windows)]
-        {
-            let vip_ip = local_vip
-                .parse::<std::net::Ipv4Addr>()
-                .map_err(|_| anyhow!("invalid parasitic vip: {local_vip}"))?;
-            let snap = self.config.snapshot();
-            let ring = effective_wintun_ring_bytes(snap.wintun_ring_bytes);
-            let ipv4_metric =
-                effective_wintun_ipv4_interface_metric(snap.wintun_ipv4_interface_metric);
-            let para_prefix = snap.subnet_prefix.clamp(8, 30);
-            let wintun_prefix = para_prefix;
-            let adapter = tokio::task::spawn_blocking(move || -> Result<Arc<WintunAdapter>> {
-                Ok(Arc::new(
-                    WintunAdapter::create(
-                        crate::tun::wintun::WINTUN_ADAPTER_NAME,
-                        vip_ip,
-                        wintun_prefix,
-                        ring,
-                        ipv4_metric,
-                    )
-                    .map_err(|e| anyhow!("failed to create Wintun adapter: {e}"))?,
-                ))
-            })
-            .await
-            .map_err(|e| anyhow!("wintun create task join failed: {e}"))??;
-            self.wire_adapter(adapter.clone());
-            self.vni = Some(adapter);
-            crate::cli_println!(
-                "{}",
-                term_style::fmt_info_line(format_args!(
-                    " Wintun adapter ready for {local_vip}/{para_prefix}"
-                ))
-            );
-        }
-        self.state = AppState::CommandLoop;
-        self.ensure_parasitic_passive_listener().await?;
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(" Step 6/6: Connected."))
-        );
-        crate::cli_println!(
-            "  \" Parasitic join completed ({})",
-            if owner_is_local { "owner" } else { "peer" }
-        );
-        Ok(())
-    }
-
-    /// Broadcast discover_only MPHI; return distinct owners (headless-safe).
-    pub async fn discover_parasitic_lan(&mut self) -> Result<Vec<crate::ipc::ParasiticLanOwner>> {
-        self.stop_parasitic_passive_listener();
-        let snap = self.config.snapshot();
-        if !snap.network_id.is_empty() && !snap.parasitic_enabled {
-            return Err(anyhow!(
-                "active network exists. run 'remove' first, then choose [2] Join from the menu."
-            ));
-        }
-        let listen_port = self.config.get_listen_port().max(7878);
-        let local_node_id = if snap.node_id.is_empty() {
-            let nid = hex::encode(rand::random::<[u8; 16]>());
-            self.config.update(|cfg| {
-                if cfg.node_id.is_empty() {
-                    cfg.node_id = nid.clone();
-                }
-            });
-            self.config.snapshot().node_id.clone()
-        } else {
-            snap.node_id.clone()
-        };
-        drop(snap);
-
-        let local_ip = get_local_ip();
-        let local_public = make_socket_addr(&local_ip, listen_port)?;
-        let local_candidates = gather_local_para_candidates_inner(
-            &self.config.snapshot(),
-            &self.cmd_tx,
-            Duration::from_secs(1),
-            false,
-            true,
-        )
-        .await;
         let session_id = hex::encode(rand::random::<[u8; 8]>());
-        let proposed_start_at_ms = now_epoch_ms() + PARA_START_BUFFER_MS;
-        let proposed_key_hex = hex::encode(MintCrypto::generate_key().0);
-        let proposed_subnet = random_owner_vip();
-
-        let (sig_tx, mut sig_rx) = mpsc::channel::<ParaSignal>(2048);
-        let listener_id = register_para_listener(&self.cmd_tx, sig_tx, false).await;
-
         let targets = para_lan_discovery_targets(&local_ip, listen_port);
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(
-                " LAN discover: broadcasting on {} target(s) for {PARA_LAN_DISCOVER_MS}ms…",
-                targets.len()
-            ))
-        );
-
         let hello = json!({
             "node_id": local_node_id,
-            "public_ip": local_public.ip().to_string(),
-            "public_port": local_public.port(),
-            "proposed_key_hex": proposed_key_hex,
-            "proposed_vip_subnet": proposed_subnet,
+            "public_ip": local_ip,
+            "public_port": listen_port,
+            "network_id": network_id,
             "ts_ms": now_epoch_ms(),
             "candidates": local_candidates,
-            "start_at_ms": proposed_start_at_ms,
             "session_id": session_id,
-            "discover_only": true,
         })
         .to_string()
         .into_bytes();
-
         for target in &targets {
             let _ = self
                 .cmd_tx
@@ -3659,7 +1970,7 @@ impl Cli {
         }
 
         let deadline = Instant::now() + Duration::from_millis(PARA_LAN_DISCOVER_MS);
-        let mut owners: HashMap<(String, String), crate::ipc::ParasiticLanOwner> = HashMap::new();
+        let mut members: HashMap<String, crate::ipc::LanMemberPeer> = HashMap::new();
         while Instant::now() < deadline {
             let remain = deadline.saturating_duration_since(Instant::now());
             if remain.is_zero() {
@@ -3668,642 +1979,147 @@ impl Cli {
             match tokio::time::timeout(remain, sig_rx.recv()).await {
                 Ok(Some(ParaSignal::ReplyReceived {
                     from,
-                    network_id,
+                    network_id: reply_nid,
                     node_id,
-                    responder_is_owner,
-                    network_name,
-                    assigned_vip,
+                    responder_vip,
                     ..
                 })) => {
-                    if !responder_is_owner || network_id.is_empty() {
+                    if reply_nid != network_id || responder_vip.is_empty() {
                         continue;
                     }
-                    // discover_only replies use empty assigned_vip
-                    let _ = assigned_vip;
-                    let key = (network_id.clone(), from.to_string());
-                    owners
-                        .entry(key)
-                        .or_insert_with(|| crate::ipc::ParasiticLanOwner {
-                            network_name,
-                            network_id,
+                    if lan_reply_is_self(&local_node_id, &local_ip, listen_port, from, &node_id) {
+                        continue;
+                    }
+                    members.entry(responder_vip.clone()).or_insert_with(|| {
+                        crate::ipc::LanMemberPeer {
+                            network_id: reply_nid,
                             from: from.to_string(),
                             node_id,
-                        });
+                        }
+                    });
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => break,
             }
         }
-
         unregister_para_listener(&self.cmd_tx, listener_id).await;
-        let mut list: Vec<_> = owners.into_values().collect();
-        list.sort_by(|a, b| {
-            a.network_name
-                .cmp(&b.network_name)
-                .then(a.network_id.cmp(&b.network_id))
-                .then(a.from.cmp(&b.from))
-        });
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(
-                " LAN discover: {} owner reply(ies).",
-                list.len()
-            ))
-        );
+        let mut list: Vec<_> = members.into_values().collect();
+        list.sort_by(|a, b| a.network_id.cmp(&b.network_id).then(a.from.cmp(&b.from)));
         Ok(list)
     }
 
-    /// Unicast admit Hello to owner LAN target and complete punch (headless-safe).
-    pub async fn join_parasitic_lan_from_str(&mut self, target: String) -> Result<()> {
-        let listen_port = self.config.get_listen_port().max(7878);
-        let addr = parse_vip_signal_target(target.trim(), listen_port)?.1;
-        self.join_parasitic_lan_with_target(addr).await
-    }
-
-    /// Unicast real Hello to owner LAN target and complete punch (headless-safe).
-    pub async fn join_parasitic_lan_with_target(&mut self, target: SocketAddr) -> Result<()> {
-        self.stop_parasitic_passive_listener();
+    /// Punch private candidates to a LAN member and send PrepareJoin (claim).
+    /// Target must be a private IP:port. Requires configured member unit.
+    pub async fn assist_lan_member(&mut self, target_str: String) -> Result<()> {
         let snap = self.config.snapshot();
-        if !snap.network_id.is_empty() && !snap.parasitic_enabled {
+        if snap.network_id.is_empty() || snap.crypto_key.is_empty() || snap.virtual_ip.is_empty() {
             return Err(anyhow!(
-                "active network exists. run 'remove' first, then choose [2] Join from the menu."
+                "unit not configured — network_id, crypto_key, and virtual_ip required"
             ));
         }
+        let listen_port = snap.listen_port.max(7878);
+        let target = parse_vip_signal_target(target_str.trim(), listen_port)?.1;
         if !is_rfc1918_private_ip(target.ip()) {
             return Err(anyhow!(
-                "LAN parasitic target must be a private IPv4 address (got {target})"
+                "LAN assist target must be a private IPv4 address (got {target})"
             ));
         }
-        let listen_port = self.config.get_listen_port().max(7878);
-        let local_node_id = if snap.node_id.is_empty() {
-            let nid = hex::encode(rand::random::<[u8; 16]>());
-            self.config.update(|cfg| {
-                if cfg.node_id.is_empty() {
-                    cfg.node_id = nid.clone();
-                }
-            });
-            self.config.snapshot().node_id.clone()
-        } else {
-            snap.node_id.clone()
-        };
+        let local_ip = get_local_ip();
+        if lan_reply_is_self(&snap.node_id, &local_ip, listen_port, target, "") {
+            return Err(anyhow!(
+                "LAN assist target resolves to this member; select a different LAN peer"
+            ));
+        }
+        let key_hex = snap.crypto_key.clone();
+        let local_node_id = snap.node_id.clone();
+        let self_vip = snap.virtual_ip.clone();
+        let vip_epoch = snap.vip_epoch;
+        let subnet = snap.subnet_prefix.clamp(8, 30);
         drop(snap);
 
-        let local_ip = get_local_ip();
-        let local_public = make_socket_addr(&local_ip, listen_port)?;
-        let self_vip = local_ip.clone();
-        let peer_vip = target.ip().to_string();
-        let peer_vip_target = target;
+        let key_arr = parse_key_hex_32(&key_hex)?;
+        let (key_tx, key_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCmd::SetCryptoKey(Key(key_arr), Some(key_tx)))
+            .await?;
+        let _ = tokio::time::timeout(Duration::from_secs(1), key_rx).await;
+
+        let candidates = ice::gather_candidates(&local_ip, listen_port, None, None);
+        let _ = self
+            .cmd_tx
+            .send(EngineCmd::SetCandidates(candidates.clone()))
+            .await;
+
+        let private_targets = filter_private_socket_addrs(&[target]);
+        let candidates_to_punch = if private_targets.is_empty() {
+            vec![target]
+        } else {
+            private_targets
+        };
 
         crate::cli_println!(
             "{}",
-            term_style::fmt_para_line(format_args!(
-                " LAN parasitic: joining owner at {peer_vip_target} (no STUN/UPnP)…"
+            term_style::fmt_join_line(format_args!(
+                " LAN assist: punching toward {target}\u{2026}"
             ))
         );
+        let _ = self.run_lan_punch(&candidates_to_punch, &self_vip, 0).await;
 
-        let local_candidates = gather_local_para_candidates_inner(
-            &self.config.snapshot(),
-            &self.cmd_tx,
-            Duration::from_secs(1),
-            false,
-            true,
-        )
-        .await;
-        let proposed_key_hex = hex::encode(MintCrypto::generate_key().0);
-        let proposed_subnet = random_owner_vip();
-        let session_id = hex::encode(rand::random::<[u8; 8]>());
-        let proposed_start_at_ms = now_epoch_ms() + PARA_START_BUFFER_MS;
-
-        let (sig_tx, mut sig_rx) = mpsc::channel::<ParaSignal>(2048);
-        let listener_id = register_para_listener(&self.cmd_tx, sig_tx, false).await;
-
-        let mut remote_candidates: Vec<SocketAddr> = Vec::new();
-        let mut remote_public: Option<SocketAddr> = None;
-        let mut remote_node_id = String::new();
-        let mut assigned_local_vip: Option<String> = None;
-        let mut remote_vip: Option<String> = None;
-        let mut agreed_network_id: Option<String> = None;
-        let mut network_key_hex: Option<String> = None;
-        let mut agreed_start: Option<u64> = None;
-        let mut state = ParaState::HelloSent { attempts: 0 };
-
-        loop {
-            state = match state {
-                ParaState::HelloSent { attempts } => {
-                    if attempts >= PARA_SIGNAL_ATTEMPTS {
-                        ParaState::Failed {
-                            reason: "LAN signaling timeout".to_string(),
-                        }
-                    } else {
-                        let hello = json!({
-                            "node_id": local_node_id,
-                            "public_ip": local_public.ip().to_string(),
-                            "public_port": local_public.port(),
-                            "proposed_key_hex": proposed_key_hex,
-                            "proposed_vip_subnet": proposed_subnet,
-                            "ts_ms": now_epoch_ms(),
-                            "candidates": local_candidates.clone(),
-                            "start_at_ms": proposed_start_at_ms,
-                            "session_id": session_id,
-                            "discover_only": false,
-                        })
-                        .to_string()
-                        .into_bytes();
-                        let _ = self
-                            .cmd_tx
-                            .send(EngineCmd::ParaSendHello {
-                                target_vip: peer_vip_target,
-                                payload: hello,
-                            })
-                            .await;
-                        crate::cli_println!(
-                            "{}",
-                            term_style::fmt_para_line(format_args!(
-                                " LAN signal attempt {}/{}",
-                                attempts + 1,
-                                PARA_SIGNAL_ATTEMPTS
-                            ))
-                        );
-                        let wait =
-                            tokio::time::timeout(para_signal_pause_duration(), sig_rx.recv()).await;
-                        match wait {
-                            Ok(Some(ParaSignal::ReplyReceived {
-                                from,
-                                public_ip,
-                                public_port,
-                                assigned_vip,
-                                network_id,
-                                node_id,
-                                candidates,
-                                agreed_start_at_ms: peer_start,
-                                session_id: remote_session_id,
-                                responder_vip,
-                                responder_is_owner,
-                                network_key_hex: reply_key,
-                                ..
-                            })) => {
-                                if !remote_session_id.is_empty() && remote_session_id != session_id
-                                {
-                                    ParaState::HelloSent {
-                                        attempts: attempts + 1,
-                                    }
-                                } else if !responder_is_owner {
-                                    ParaState::HelloSent {
-                                        attempts: attempts + 1,
-                                    }
-                                } else if assigned_vip.is_empty() {
-                                    ParaState::Failed {
-                                        reason: "owner rejected parasitic (vip pool full)"
-                                            .to_string(),
-                                    }
-                                } else if reply_key.trim().is_empty() {
-                                    ParaState::Failed {
-                                        reason: "owner reply missing network_key_hex".to_string(),
-                                    }
-                                } else {
-                                    remote_public = Some(from);
-                                    if is_rfc1918_private_ip(from.ip()) {
-                                        // prefer signal from
-                                    } else if let Ok(ep) = make_socket_addr(&public_ip, public_port)
-                                    {
-                                        if is_rfc1918_private_ip(ep.ip()) {
-                                            remote_public = Some(ep);
-                                        }
-                                    }
-                                    remote_candidates = filter_private_socket_addrs(
-                                        &candidates_to_socket_addrs(&candidates),
-                                    );
-                                    if let Some(ep) = remote_public {
-                                        if is_rfc1918_private_ip(ep.ip())
-                                            && !remote_candidates.contains(&ep)
-                                        {
-                                            remote_candidates.push(ep);
-                                        }
-                                    }
-                                    if !remote_candidates.contains(&peer_vip_target) {
-                                        remote_candidates.push(peer_vip_target);
-                                    }
-                                    remote_node_id = node_id;
-                                    assigned_local_vip = Some(assigned_vip);
-                                    remote_vip = if !responder_vip.is_empty() {
-                                        Some(responder_vip)
-                                    } else {
-                                        None
-                                    };
-                                    agreed_network_id = Some(network_id);
-                                    network_key_hex = Some(reply_key);
-                                    let start = compute_agreed_start_at_ms(
-                                        peer_start,
-                                        now_epoch_ms() + PARA_START_BUFFER_MS,
-                                    );
-                                    agreed_start = Some(start);
-                                    if let Some(ep) = remote_public {
-                                        ParaState::ReplyReceived {
-                                            peer_ep: ep,
-                                            start_at_ms: start,
-                                        }
-                                    } else {
-                                        ParaState::HelloSent {
-                                            attempts: attempts + 1,
-                                        }
-                                    }
-                                }
-                            }
-                            _ => ParaState::HelloSent {
-                                attempts: attempts + 1,
-                            },
-                        }
-                    }
-                }
-                ParaState::ReplyReceived {
-                    peer_ep,
-                    start_at_ms,
-                } => {
-                    let _ = send_para_ok_redundant(
-                        &self.cmd_tx,
-                        peer_vip_target,
-                        &local_node_id,
-                        &session_id,
-                    )
-                    .await;
-                    ParaState::OkSent {
-                        peer_ep,
-                        start_at_ms,
-                    }
-                }
-                ParaState::OkSent {
-                    peer_ep,
-                    start_at_ms,
-                } => {
-                    let wait =
-                        tokio::time::timeout(Duration::from_millis(PARA_OK_WAIT_MS), sig_rx.recv())
-                            .await;
-                    match wait {
-                        Ok(Some(ParaSignal::OkReceived {
-                            session_id: sid, ..
-                        })) if sid.is_empty() || sid == session_id => ParaState::WaitingStart {
-                            peer_ep,
-                            start_at_ms,
-                            ok_confirmed: true,
-                        },
-                        _ => ParaState::WaitingStart {
-                            peer_ep,
-                            start_at_ms,
-                            ok_confirmed: false,
-                        },
-                    }
-                }
-                ParaState::WaitingStart {
-                    peer_ep,
-                    start_at_ms,
-                    ok_confirmed,
-                } => {
-                    let _ = peer_ep;
-                    if !ok_confirmed {
-                        let retry_wait_ms = (start_at_ms.saturating_sub(now_epoch_ms()))
-                            .min(PARA_OK_WAIT_MS)
-                            .max(200);
-                        let retry_wait = tokio::time::timeout(
-                            Duration::from_millis(retry_wait_ms),
-                            sig_rx.recv(),
-                        )
-                        .await;
-                        let _ = matches!(
-                            retry_wait,
-                            Ok(Some(ParaSignal::OkReceived { session_id: sid, .. }))
-                                if sid.is_empty() || sid == session_id
-                        );
-                    }
-                    wait_until_para_start(start_at_ms).await;
-                    ParaState::Punching
-                }
-                ParaState::Punching => {
-                    let chosen_key_hex = network_key_hex.clone().unwrap_or_default();
-                    let local_vip_now = assigned_local_vip.clone().unwrap_or_default();
-                    let network_id_now = agreed_network_id.clone().unwrap_or_default();
-                    let rv = remote_vip
-                        .clone()
-                        .unwrap_or_else(|| owner_vip(local_vip_now.as_str()));
-                    if chosen_key_hex.is_empty()
-                        || local_vip_now.is_empty()
-                        || network_id_now.is_empty()
-                    {
-                        ParaState::Failed {
-                            reason: "incomplete LAN admit reply".to_string(),
-                        }
-                    } else if remote_candidates.is_empty() {
-                        ParaState::Failed {
-                            reason: "missing private remote endpoint".to_string(),
-                        }
-                    } else {
-                        let peer_public_ep = remote_public
-                            .or_else(|| remote_candidates.first().copied())
-                            .ok_or_else(|| anyhow!("missing peer endpoint after LAN signaling"))?;
-                        let key_raw = parse_key_hex_32(&chosen_key_hex)?;
-                        let mut bound_targets = HashSet::new();
-                        for candidate in &remote_candidates {
-                            if bound_targets.insert(*candidate) {
-                                let _ = self
-                                    .cmd_tx
-                                    .send(EngineCmd::BindPeerKey {
-                                        peer: *candidate,
-                                        key: Key(key_raw),
-                                    })
-                                    .await;
-                            }
-                        }
-                        self.apply_parasitic_identity(
-                            false,
-                            &local_vip_now,
-                            &local_node_id,
-                            key_raw,
-                            peer_public_ep,
-                        )
-                        .await?;
-                        if self
-                            .run_parasitic_punch(
-                                &remote_candidates,
-                                &rv,
-                                PARA_PEER_PUNCH_MIN_WALL_MS,
-                            )
-                            .await
-                        {
-                            let ack_target =
-                                { self.routing.read().lookup(&rv).unwrap_or(peer_vip_target) };
-                            if ack_target != peer_public_ep {
-                                let _ = self
-                                    .cmd_tx
-                                    .send(EngineCmd::SetOwnerEndpoint(ack_target, None))
-                                    .await;
-                                let _ = self
-                                    .cmd_tx
-                                    .send(EngineCmd::BindPeerKey {
-                                        peer: ack_target,
-                                        key: Key(key_raw),
-                                    })
-                                    .await;
-                            }
-                            let ack_targets = {
-                                let rt = self.routing.read();
-                                collect_para_punch_ack_targets(
-                                    &rt,
-                                    &rv,
-                                    &remote_candidates,
-                                    &[peer_public_ep, peer_vip_target],
-                                )
-                            };
-                            let _ = send_para_punch_ack_redundant(
-                                &self.cmd_tx,
-                                &ack_targets,
-                                &local_node_id,
-                                &session_id,
-                            )
-                            .await;
-                            // Stash for finalize via outer vars
-                            agreed_start = Some(agreed_start.unwrap_or(proposed_start_at_ms));
-                            network_key_hex = Some(chosen_key_hex);
-                            assigned_local_vip = Some(local_vip_now);
-                            agreed_network_id = Some(network_id_now);
-                            remote_vip = Some(rv);
-                            remote_public = Some(peer_public_ep);
-                            ParaState::Connected
-                        } else {
-                            ParaState::Failed {
-                                reason: "punch failed".to_string(),
-                            }
-                        }
-                    }
-                }
-                ParaState::Connected => break,
-                ParaState::Failed { reason } => {
-                    unregister_para_listener(&self.cmd_tx, listener_id).await;
-                    return Err(anyhow!(
-                        "LAN parasitic join failed: {reason}. Check AP isolation, owner listen port (default 7878), then retry."
-                    ));
-                }
-            };
-            if matches!(state, ParaState::Connected) {
-                break;
-            }
-        }
-        unregister_para_listener(&self.cmd_tx, listener_id).await;
-
-        let local_vip =
-            assigned_local_vip.ok_or_else(|| anyhow!("missing assigned VIP after LAN punch"))?;
-        let chosen_key_hex =
-            network_key_hex.ok_or_else(|| anyhow!("missing network key after LAN punch"))?;
-        let network_id =
-            agreed_network_id.ok_or_else(|| anyhow!("missing network_id after LAN punch"))?;
+        let body = serde_json::json!({
+            "proto_ver": WIRE_PROTOCOL_VERSION,
+            "node_id": local_node_id.clone(),
+            "vip": self_vip,
+            "vip_epoch": vip_epoch,
+            "ts_ms": now_epoch_ms(),
+            "rtt_hint_ms": 100,
+            "nat_hint": "lan",
+            "candidates": candidates,
+        })
+        .to_string()
+        .into_bytes();
 
         crate::cli_println!(
             "{}",
-            term_style::fmt_para_line(format_args!(" Saving LAN parasitic profile…"))
+            term_style::fmt_join_line(format_args!(
+                " LAN assist: sending PrepareJoin to {target}\u{2026}"
+            ))
         );
-        ensure_netinfo_dir()?;
-        self.config.set_network_basics(
-            "Mint".to_string(),
-            network_id,
-            "peer".to_string(),
-            local_vip.clone(),
-            local_node_id.clone(),
-            listen_port,
-        );
-        let remote_node_id_save = remote_node_id.clone();
-        self.config.update(|cfg| {
-            cfg.owner_real_ip.clear();
-            cfg.owner_port = 0;
-            cfg.owner_endpoints_cache.clear();
-            cfg.crypto_key = chosen_key_hex;
-            cfg.parasitic_enabled = true;
-            cfg.parasitic_peer_vip = peer_vip;
-            cfg.parasitic_self_vip = self_vip;
-            cfg.parasitic_peer_port = peer_vip_target.port();
-            cfg.parasitic_peer_node_id = remote_node_id_save;
-            cfg.parasitic_self_is_owner = false;
-            cfg.parasitic_use_public = false;
-            cfg.join_method = "parasitic".to_string();
-            cfg.decentralized_enabled = false;
-        });
-        self.refresh_owner_vip_pool_from_config(false);
-
-        #[cfg(windows)]
-        {
-            let vip_ip = local_vip
-                .parse::<std::net::Ipv4Addr>()
-                .map_err(|_| anyhow!("invalid parasitic vip: {local_vip}"))?;
-            let snap = self.config.snapshot();
-            let ring = effective_wintun_ring_bytes(snap.wintun_ring_bytes);
-            let ipv4_metric =
-                effective_wintun_ipv4_interface_metric(snap.wintun_ipv4_interface_metric);
-            let para_prefix = snap.subnet_prefix.clamp(8, 30);
-            let wintun_prefix = para_prefix;
-            let adapter = tokio::task::spawn_blocking(move || -> Result<Arc<WintunAdapter>> {
-                Ok(Arc::new(
-                    WintunAdapter::create(
-                        crate::tun::wintun::WINTUN_ADAPTER_NAME,
-                        vip_ip,
-                        wintun_prefix,
-                        ring,
-                        ipv4_metric,
-                    )
-                    .map_err(|e| anyhow!("failed to create Wintun adapter: {e}"))?,
-                ))
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(EngineCmd::PrepareJoin {
+                join_tx: tx,
+                key: Key(key_arr),
+                target: Some(target),
+                body,
             })
-            .await
-            .map_err(|e| anyhow!("wintun create task join failed: {e}"))??;
-            self.wire_adapter(adapter.clone());
-            self.vni = Some(adapter);
-            crate::cli_println!(
-                "{}",
-                term_style::fmt_info_line(format_args!(
-                    " Wintun adapter ready for {local_vip}/{para_prefix}"
-                ))
-            );
-        }
-        self.state = AppState::CommandLoop;
-        self.ensure_parasitic_passive_listener().await?;
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(" LAN parasitic join completed (peer)."))
-        );
-        Ok(())
-    }
+            .await;
 
-    async fn fallback_to_invite_flow(&mut self) -> Result<()> {
-        if self.headless {
-            return Err(anyhow!(
-                "parasitic join aborted. Run remove, then choose [2] Join from the menu (invite or parasitic)."
-            ));
-        }
-        crate::cli_print!("  Invite code: ");
-        io::stdout().flush()?;
-        let invite = self.read_line().await?;
-        if invite.is_empty() {
-            return Err(anyhow!("invite code is required"));
-        }
-        self.handle_join(&invite, self.resolve_join_invite_opts().await?)
+        let subnet_val = subnet;
+        let deadline_secs = self
+            .config
+            .snapshot()
+            .decentralized_join_deadline_secs
+            .max(30);
+        let ack = match tokio::time::timeout(Duration::from_secs(deadline_secs), rx).await {
+            Ok(Ok(Some(ack))) => ack,
+            _ => {
+                let _ = self.cmd_tx.send(EngineCmd::CancelJoinWait).await;
+                return Err(anyhow!("LAN assist: no acknowledgment from {target}"));
+            }
+        };
+
+        let parsed = InvitePayload {
+            key: key_arr,
+            version: INVITE_VERSION,
+            protocol: PROTO_UDP,
+        };
+        let _ = subnet_val; // subnet comes from JoinAck.subnet_prefix
+        self.finalize_peer_join_from_ack(ack, &parsed, local_node_id, listen_port)
             .await
     }
 
-    async fn prompt_retry_or_invite(&self, prompt: &str) -> Result<bool> {
-        if self.headless {
-            return Err(anyhow!(
-                "parasitic join needs a choice on the CLI client ({prompt}). Run remove, then choose [2] Join from the menu."
-            ));
-        }
-        crate::cli_print!("{prompt}");
-        io::stdout().flush()?;
-        let choice = self.read_line().await?;
-        Ok(choice.trim() != "2")
-    }
-
-    async fn sync_engine_from_saved_profile(&self) -> Result<()> {
-        let snap = self.config.snapshot();
-        if snap.virtual_ip.is_empty() || snap.network_id.is_empty() {
-            return Ok(());
-        }
-        if snap.role != "owner" && snap.role != "peer" {
-            return Ok(());
-        }
-        let node_id = snap.node_id.trim();
-        if node_id.is_empty() {
-            return Ok(());
-        }
-        let is_owner = snap.role == "owner";
-        let vip = snap.virtual_ip.trim().to_string();
-
-        if !snap.crypto_key.trim().is_empty() {
-            if let Ok(key_raw) = parse_key_hex_32(snap.crypto_key.trim()) {
-                let (key_tx, key_rx) = oneshot::channel();
-                self.cmd_tx
-                    .send(EngineCmd::SetCryptoKey(Key(key_raw), Some(key_tx)))
-                    .await?;
-                let _ = tokio::time::timeout(Duration::from_secs(1), key_rx).await;
-            }
-        }
-
-        let (id_tx, id_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(EngineCmd::SetIdentity {
-                is_owner,
-                my_vip: vip,
-                my_node_id: node_id.to_string(),
-                subnet_prefix: snap.subnet_prefix.clamp(8, 30),
-                reply: Some(id_tx),
-            })
-            .await?;
-        let _ = tokio::time::timeout(Duration::from_secs(1), id_rx).await;
-
-        if !is_owner
-            && !snap.parasitic_enabled
-            && !snap.owner_real_ip.trim().is_empty()
-            && snap.owner_port > 0
-        {
-            if let Ok(owner_ep) = make_socket_addr(snap.owner_real_ip.trim(), snap.owner_port) {
-                let (o_tx, o_rx) = oneshot::channel();
-                self.cmd_tx
-                    .send(EngineCmd::SetOwnerEndpoint(owner_ep, Some(o_tx)))
-                    .await?;
-                let _ = tokio::time::timeout(Duration::from_secs(1), o_rx).await;
-            }
-        }
-        if snap.decentralized_enabled {
-            let node_id = snap.node_id.clone();
-            let _ = self
-                .start_decentralized_engine(None, false, None, None, &node_id)
-                .await;
-        }
-        Ok(())
-    }
-
-    async fn apply_parasitic_identity(
-        &self,
-        owner_is_local: bool,
-        local_vip: &str,
-        local_node_id: &str,
-        key_raw: [u8; 32],
-        peer_public_ep: SocketAddr,
-    ) -> Result<()> {
-        let (key_tx, key_rx) = oneshot::channel();
-        let _ = self
-            .cmd_tx
-            .send(EngineCmd::SetCryptoKey(Key(key_raw), Some(key_tx)))
-            .await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), key_rx).await;
-        let _ = self
-            .cmd_tx
-            .send(EngineCmd::BindPeerKey {
-                peer: peer_public_ep,
-                key: Key(key_raw),
-            })
-            .await;
-
-        let snap = self.config.snapshot();
-        let (id_tx, id_rx) = oneshot::channel();
-        let _ = self
-            .cmd_tx
-            .send(EngineCmd::SetIdentity {
-                is_owner: owner_is_local,
-                my_vip: local_vip.to_string(),
-                my_node_id: local_node_id.to_string(),
-                subnet_prefix: snap.subnet_prefix.clamp(8, 30),
-                reply: Some(id_tx),
-            })
-            .await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), id_rx).await;
-
-        if !owner_is_local {
-            let (owner_tx, owner_rx) = oneshot::channel();
-            let _ = self
-                .cmd_tx
-                .send(EngineCmd::SetOwnerEndpoint(peer_public_ep, Some(owner_tx)))
-                .await;
-            let _ = tokio::time::timeout(Duration::from_secs(1), owner_rx).await;
-        }
-        Ok(())
-    }
-
-    async fn run_parasitic_punch(
+    async fn run_lan_punch(
         &self,
         remote_candidates: &[SocketAddr],
         remote_vip: &str,
@@ -4335,7 +2151,7 @@ impl Cli {
             })
             .await;
         let ok = self
-            .wait_for_parasitic_punch_ready(
+            .wait_for_lan_punch_ready(
                 remote_vip,
                 remote_candidates,
                 phase_start,
@@ -4350,7 +2166,7 @@ impl Cli {
         ok
     }
 
-    async fn wait_for_parasitic_punch_ready(
+    async fn wait_for_lan_punch_ready(
         &self,
         remote_vip: &str,
         peer_candidates: &[SocketAddr],
@@ -4358,7 +2174,7 @@ impl Cli {
         deadline: std::time::Instant,
         min_wall_ms: u64,
     ) -> bool {
-        wait_for_parasitic_punch_ready(
+        wait_for_lan_punch_ready(
             &self.routing,
             remote_vip,
             peer_candidates,
@@ -4370,412 +2186,79 @@ impl Cli {
         .await
     }
 
-    pub async fn parasitic_auto_reconnect(&mut self) -> Result<ReconnectOutcome> {
+    async fn sync_engine_from_saved_profile(&self) -> Result<()> {
         let snap = self.config.snapshot();
-        if !snap.parasitic_enabled
-            || snap.parasitic_peer_vip.is_empty()
-            || snap.crypto_key.is_empty()
-            || snap.role != "peer"
-        {
-            drop(snap);
-            self.ensure_parasitic_passive_listener().await?;
-            return Ok(ReconnectOutcome::Skipped);
+        if snap.virtual_ip.is_empty() || snap.network_id.is_empty() || snap.crypto_key.is_empty() {
+            return Ok(());
         }
-        self.stop_parasitic_passive_listener();
-        let listen_port = snap.listen_port.max(7878);
-        let local_node_id = snap.node_id.clone();
-        let local_vip = snap.virtual_ip.clone();
-        let role_owner = snap.role == "owner";
-        let peer_signal_port = if snap.parasitic_peer_port == 0 {
-            listen_port
-        } else {
-            snap.parasitic_peer_port
+        let node_id = snap.node_id.trim();
+        if node_id.is_empty() {
+            return Ok(());
+        }
+
+        let key_raw = match parse_key_hex_32(snap.crypto_key.trim()) {
+            Ok(k) => k,
+            Err(_) => return Ok(()),
         };
-        let peer_target = parse_vip_signal_target(&snap.parasitic_peer_vip, peer_signal_port)?.1;
-        let key_hex = snap.crypto_key.clone();
-        let use_public = snap.parasitic_use_public;
-        drop(snap);
+        let unit_key = Key(key_raw);
+        let (vip, vip_replaced) =
+            crate::net::claim::resolve_member_vip(&unit_key, snap.virtual_ip.trim());
+        let mut vip_epoch = snap.vip_epoch;
+        if vip_replaced {
+            vip_epoch = vip_epoch.saturating_add(1);
+            self.config.update(|cfg| {
+                cfg.virtual_ip = vip.clone();
+                cfg.vip_epoch = vip_epoch;
+                cfg.subnet_prefix = 24;
+            });
+        } else if snap.subnet_prefix != 24 {
+            self.config.update(|cfg| cfg.subnet_prefix = 24);
+        }
 
-        crate::cli_println_live!(
-            "{}",
-            term_style::fmt_para_line(format_args!(
-                " Auto-reconnect: signaling and hole punch toward {peer_target}…"
-            ))
-        );
-
-        let key_arr = parse_key_hex_32(&key_hex)?;
         let (key_tx, key_rx) = oneshot::channel();
         self.cmd_tx
-            .send(EngineCmd::SetCryptoKey(Key(key_arr), Some(key_tx)))
+            .send(EngineCmd::SetCryptoKey(unit_key, Some(key_tx)))
             .await?;
         let _ = tokio::time::timeout(Duration::from_secs(1), key_rx).await;
+
         let (id_tx, id_rx) = oneshot::channel();
         self.cmd_tx
             .send(EngineCmd::SetIdentity {
-                is_owner: role_owner,
-                my_vip: local_vip.clone(),
-                my_node_id: local_node_id.clone(),
-                subnet_prefix: self.config.snapshot().subnet_prefix.clamp(8, 30),
+                my_vip: vip,
+                my_node_id: node_id.to_string(),
+                subnet_prefix: 24,
+                vip_epoch,
                 reply: Some(id_tx),
             })
             .await?;
         let _ = tokio::time::timeout(Duration::from_secs(1), id_rx).await;
 
-        let local_ip = get_local_ip();
-        let local_public = if use_public {
-            self.upnp_cleanup_if_any().await;
-            if let Ok(Some(m)) = tokio::time::timeout(
-                Duration::from_secs(4),
-                upnp::discover_and_add_port(&local_ip, listen_port, "MintegerP2P-Parasitic-Auto"),
-            )
-            .await
-            {
-                self.upnp_set_mapping(m);
-            }
-            let Some(stun_ep) = self
-                .query_public_endpoint_from_engine_force(Duration::from_secs(3))
-                .await
-            else {
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_para_line(format_args!(
-                        " Auto reconnect skipped: STUN unavailable."
-                    ))
-                );
-                self.ensure_parasitic_passive_listener().await?;
-                return Ok(ReconnectOutcome::Failed);
-            };
-            make_socket_addr(&stun_ep.ip, stun_ep.port)?
-        } else {
-            make_socket_addr(&local_ip, listen_port)?
-        };
-        let local_candidates = gather_local_para_candidates_inner(
-            &self.config.snapshot(),
-            &self.cmd_tx,
-            Duration::from_secs(3),
-            true,
-            !use_public,
-        )
-        .await;
-        let session_id = hex::encode(rand::random::<[u8; 8]>());
-        let proposed_start_at_ms = now_epoch_ms() + PARA_START_BUFFER_MS;
-
-        let (sig_tx, mut sig_rx) = mpsc::channel::<ParaSignal>(2048);
-        let listener_id = register_para_listener(&self.cmd_tx, sig_tx, false).await;
-
-        let mut remote_public: Option<SocketAddr> = None;
-        let mut remote_vip: Option<String> = None;
-        let mut remote_candidates: Vec<SocketAddr> = Vec::new();
-        let mut ok_ready = false;
-        let mut agreed_start_at_ms: Option<u64> = None;
-        for _ in 0..PARA_SIGNAL_ATTEMPTS {
-            let hello = json!({
-                "node_id": local_node_id,
-                "public_ip": local_public.ip().to_string(),
-                "public_port": local_public.port(),
-                "proposed_key_hex": key_hex,
-                "proposed_vip_subnet": owner_vip(&local_vip),
-                "ts_ms": now_epoch_ms(),
-                "candidates": local_candidates.clone(),
-                "start_at_ms": proposed_start_at_ms,
-                "session_id": session_id,
-            })
-            .to_string()
-            .into_bytes();
+        if snap.decentralized_enabled {
+            let node_id = snap.node_id.clone();
             let _ = self
-                .cmd_tx
-                .send(EngineCmd::ParaSendHello {
-                    target_vip: peer_target,
-                    payload: hello,
-                })
+                .start_decentralized_engine(None, false, None, &node_id)
                 .await;
-            let wait = tokio::time::timeout(para_signal_pause_duration(), sig_rx.recv()).await;
-            if let Ok(Some(sig)) = wait {
-                match sig {
-                    ParaSignal::HelloReceived {
-                        public_ip,
-                        public_port,
-                        candidates,
-                        start_at_ms,
-                        session_id: sid,
-                        ..
-                    } => {
-                        if !sid.is_empty() && sid != session_id {
-                            continue;
-                        }
-                        if let Ok(ep) = make_socket_addr(&public_ip, public_port) {
-                            remote_public = Some(ep);
-                        }
-                        remote_candidates = candidates_to_socket_addrs(&candidates);
-                        if !use_public {
-                            remote_candidates = filter_private_socket_addrs(&remote_candidates);
-                            remote_public = Some(peer_target);
-                            if !remote_candidates.contains(&peer_target) {
-                                remote_candidates.push(peer_target);
-                            }
-                        } else if let Some(ep) = remote_public {
-                            if !remote_candidates.contains(&ep) {
-                                remote_candidates.push(ep);
-                            }
-                        }
-                        remote_vip =
-                            Some(vip_from_owner_subnet(&owner_vip(&local_vip), !role_owner)?);
-                        agreed_start_at_ms = Some(compute_agreed_start_at_ms(
-                            start_at_ms,
-                            now_epoch_ms() + PARA_START_BUFFER_MS,
-                        ));
-                        let reply = json!({
-                            "node_id": local_node_id,
-                            "public_ip": local_public.ip().to_string(),
-                            "public_port": local_public.port(),
-                            "assigned_vip": remote_vip.clone().unwrap_or_default(),
-                            "network_id": self.config.snapshot().network_id.clone(),
-                            "ts_ms": now_epoch_ms(),
-                            "candidates": local_candidates.clone(),
-                            "agreed_start_at_ms": agreed_start_at_ms.unwrap_or(proposed_start_at_ms),
-                            "session_id": session_id,
-                            "responder_vip": local_vip.clone(),
-                            "responder_is_owner": role_owner,
-                        })
-                        .to_string()
-                        .into_bytes();
-                        let _ = self
-                            .cmd_tx
-                            .send(EngineCmd::ParaSendReply {
-                                target_vip: peer_target,
-                                payload: reply,
-                            })
-                            .await;
-                    }
-                    ParaSignal::ReplyReceived {
-                        public_ip,
-                        public_port,
-                        assigned_vip,
-                        candidates,
-                        agreed_start_at_ms: peer_start,
-                        session_id: sid,
-                        ..
-                    } => {
-                        if !sid.is_empty() && sid != session_id {
-                            continue;
-                        }
-                        if assigned_vip.is_empty() {
-                            crate::cli_eprintln!(
-                                "{}",
-                                term_style::fmt_para_line_stderr(format_args!(
-                                    " Auto-reconnect rejected by owner (pool full or error reply)."
-                                ))
-                            );
-                            break;
-                        }
-                        if let Ok(ep) = make_socket_addr(&public_ip, public_port) {
-                            remote_public = Some(ep);
-                        }
-                        remote_candidates = candidates_to_socket_addrs(&candidates);
-                        if !use_public {
-                            remote_candidates = filter_private_socket_addrs(&remote_candidates);
-                            remote_public = Some(peer_target);
-                            if !remote_candidates.contains(&peer_target) {
-                                remote_candidates.push(peer_target);
-                            }
-                        } else if let Some(ep) = remote_public {
-                            if !remote_candidates.contains(&ep) {
-                                remote_candidates.push(ep);
-                            }
-                        }
-                        agreed_start_at_ms = Some(compute_agreed_start_at_ms(
-                            peer_start,
-                            now_epoch_ms() + PARA_START_BUFFER_MS,
-                        ));
-                        remote_vip =
-                            Some(vip_from_owner_subnet(&owner_vip(&local_vip), !role_owner)?);
-                        let _ = send_para_ok_redundant(
-                            &self.cmd_tx,
-                            peer_target,
-                            &local_node_id,
-                            &session_id,
-                        )
-                        .await;
-                        ok_ready = true;
-                    }
-                    ParaSignal::OkReceived {
-                        session_id: sid, ..
-                    } => {
-                        if !sid.is_empty() && sid != session_id {
-                            continue;
-                        }
-                        ok_ready = true;
-                    }
-                    ParaSignal::PunchAckReceived { .. } => {}
-                }
-            }
-            if remote_public.is_some() && ok_ready {
-                break;
-            }
         }
-
-        if let (Some(peer_public_ep), Some(rv)) = (remote_public, remote_vip) {
-            if !role_owner {
-                let _ = self
-                    .cmd_tx
-                    .send(EngineCmd::SetOwnerEndpoint(peer_public_ep, None))
-                    .await;
-            }
-            wait_until_para_start(agreed_start_at_ms.unwrap_or(proposed_start_at_ms)).await;
-            if remote_candidates.is_empty() {
-                remote_candidates.push(peer_public_ep);
-            }
-            let mut bound_targets = HashSet::new();
-            for candidate in &remote_candidates {
-                if bound_targets.insert(*candidate) {
-                    let _ = self
-                        .cmd_tx
-                        .send(EngineCmd::BindPeerKey {
-                            peer: *candidate,
-                            key: Key(key_arr),
-                        })
-                        .await;
-                }
-            }
-            self.apply_parasitic_identity(
-                role_owner,
-                &local_vip,
-                &local_node_id,
-                key_arr,
-                peer_public_ep,
-            )
-            .await?;
-            if self
-                .run_parasitic_punch(&remote_candidates, &rv, PARA_PEER_PUNCH_MIN_WALL_MS)
-                .await
-            {
-                if !role_owner {
-                    let ack_target = { self.routing.read().lookup(&rv).unwrap_or(peer_public_ep) };
-                    if ack_target != peer_public_ep {
-                        let _ = self
-                            .cmd_tx
-                            .send(EngineCmd::SetOwnerEndpoint(ack_target, None))
-                            .await;
-                        let _ = self
-                            .cmd_tx
-                            .send(EngineCmd::BindPeerKey {
-                                peer: ack_target,
-                                key: Key(key_arr),
-                            })
-                            .await;
-                    }
-                }
-                #[cfg(windows)]
-                {
-                    if self.vni.is_none() {
-                        let vip_ip = local_vip
-                            .parse::<std::net::Ipv4Addr>()
-                            .map_err(|_| anyhow!("invalid parasitic vip: {local_vip}"))?;
-                        let snap_now = self.config.snapshot();
-                        let ring = effective_wintun_ring_bytes(snap_now.wintun_ring_bytes);
-                        let ipv4_metric = effective_wintun_ipv4_interface_metric(
-                            snap_now.wintun_ipv4_interface_metric,
-                        );
-                        let para_prefix = snap_now.subnet_prefix.clamp(8, 30);
-                        let mtu_to_apply = snap_now.adapter_mtu;
-                        let adapter = match self
-                            .wintun_create_with_timeout(
-                                vip_ip,
-                                para_prefix,
-                                ring,
-                                ipv4_metric,
-                                mtu_to_apply,
-                            )
-                            .await
-                        {
-                            Ok(a) => a,
-                            Err(e) => {
-                                crate::cli_println!(
-                                    "{}",
-                                    term_style::fmt_info_line(format_args!(" {e}"))
-                                );
-                                unregister_para_listener(&self.cmd_tx, listener_id).await;
-                                self.ensure_parasitic_passive_listener().await?;
-                                return Ok(ReconnectOutcome::Failed);
-                            }
-                        };
-                        self.wire_adapter(adapter.clone());
-                        self.vni = Some(adapter);
-                        crate::cli_println!(
-                            "{}",
-                            term_style::fmt_info_line(format_args!(
-                                " Wintun adapter ready for {local_vip}/{para_prefix}"
-                            ))
-                        );
-                    }
-                }
-                let ack_targets = {
-                    let rt = self.routing.read();
-                    collect_para_punch_ack_targets(
-                        &rt,
-                        &rv,
-                        &remote_candidates,
-                        &[peer_public_ep, peer_target],
-                    )
-                };
-                let _ = send_para_punch_ack_redundant(
-                    &self.cmd_tx,
-                    &ack_targets,
-                    &local_node_id,
-                    &session_id,
-                )
-                .await;
-                if self.headless {
-                    // Home block emitted in daemon_bootstrap_finalize.
-                } else {
-                    self.emit_post_para_reconnect_home(true).await?;
-                }
-                unregister_para_listener(&self.cmd_tx, listener_id).await;
-                self.ensure_parasitic_passive_listener().await?;
-                return Ok(ReconnectOutcome::Connected);
-            } else {
-                let hint = if use_public {
-                    " Auto-reconnect failed. Use punch, or run remove and choose [2] Join → Parasitic from the menu."
-                } else {
-                    " Auto-reconnect failed (LAN). Owner IP may have changed — run remove, then Join → Parasitic → LAN."
-                };
-                crate::cli_println_live!("{}", term_style::fmt_para_line(format_args!("{hint}")));
-            }
-        } else {
-            let hint = if use_public {
-                " Auto-reconnect timeout."
-            } else {
-                " Auto-reconnect timeout (LAN). Re-run Join → Parasitic → LAN if the owner DHCP address changed."
-            };
-            crate::cli_println_live!("{}", term_style::fmt_para_line(format_args!("{hint}")));
-        }
-        unregister_para_listener(&self.cmd_tx, listener_id).await;
-        self.ensure_parasitic_passive_listener().await?;
-        Ok(if remote_public.is_some() {
-            ReconnectOutcome::Failed
-        } else {
-            ReconnectOutcome::TimedOut
-        })
+        Ok(())
     }
+
     fn handle_list(&self) {
         let s = self.config.snapshot();
         crate::cli_println!();
-        crate::cli_println!("     [status]");
-        crate::cli_println!("[■■■■]======[■■■■]");
-        crate::cli_println!("  │|  Server Name : {}", s.server_name);
-        crate::cli_println!("  │|  Network ID  : {}", s.network_id);
-        crate::cli_println!("  │|  Role        : {}", s.role);
-        crate::cli_println!("  │|  Virtual IP  : {}", s.virtual_ip);
-        crate::cli_println!("  │|  Node ID     : {}", s.node_id);
-        crate::cli_println!("  │|  Listen Port : {}", s.listen_port);
-        crate::cli_println!("  │|  Peers       : {}/{}", s.peers.len(), MAX_PEERS);
+        crate::cli_println!(" --[STATUS]");
+        crate::cli_println!("-=======================>:>");
+        crate::cli_println!("  > Unit ID     : {}", s.network_id);
+        crate::cli_println!("  > Virtual IP  : {}", s.virtual_ip);
+        crate::cli_println!("  > Node ID     : {}", s.node_id);
+        crate::cli_println!("  > Listen Port : {}", s.listen_port);
+        crate::cli_println!("  > Peers       : {}/{}", s.peers.len(), MEMBER_ROSTER_MAX);
         if !s.public_invite_code.is_empty() {
-            crate::cli_println!("  │|> Invite ID <-  {}", s.public_invite_code);
+            crate::cli_println!("-=- Invite ID <-> {}", s.public_invite_code);
         }
 
         let routes = self.routing.read().snapshot();
         if !routes.is_empty() {
-            crate::cli_println!("  ├── Routing Table ({} entries)", routes.len());
+            crate::cli_println!("-==> Routing Table ({} entries)", routes.len());
             for (vip, entry) in &routes {
                 let rtt = if entry.last_rtt_ms < 0 {
                     "  --".to_string()
@@ -4783,17 +2266,13 @@ impl Cli {
                     format!("{:4}ms", entry.last_rtt_ms)
                 };
                 crate::cli_println!(
-                    "  │  {:<15}  {:21}  RTT:{rtt}  Q:{:3}  {:?}",
+                    "  0│  {:<15}  {:21}  RTT:{rtt}  Q:{:3}  {:?}",
                     vip,
                     entry.endpoint,
                     entry.quality_score,
                     entry.state,
                 );
             }
-        }
-
-        for (idx, p) in s.peers.iter().enumerate() {
-            crate::cli_println!("  [{:>2}] {:<15} {:<21}", idx + 1, p.virtual_ip, p.real_ip,);
         }
     }
 
@@ -4993,7 +2472,7 @@ impl Cli {
             a.pmtud.stable_downgrade_batches
         );
         crate::cli_println!(
-            "  congestion: congestion_enabled={} gain={:.2} hol_escape_ms={} initial_rate_bps={:.0} add_inc_bps={:.0} min_dec={:.2} rate_smooth={:.2} min_rate_bps={:.0} max_rate_bps={:.0} loss_md={:.2} burst_cap_bytes={} delivery_window_ms={} delivery_ewma_a={:.2} delivery_anchor={:.2} delivery_decouple={:.2} rtt_base_tracking={} loss_classifier={} target_q_delay_ms={} loss_thr={:.2} base_rtt_window_s={} stale_windows={} owd_jump_ms={} probe_interval_ms={} fec_recovery_recency_ms={}",
+            "  congestion: congestion_enabled={} gain={:.2} hol_escape_ms={} initial_rate_bps={:.0} add_inc_bps={:.0} min_dec={:.2} rate_smooth={:.2} min_rate_bps={:.0} max_rate_bps={:.0} loss_md={:.2} burst_cap_bytes={} delivery_window_ms={} delivery_ewma_a={:.2} delivery_anchor={:.2} delivery_decouple={:.2} rtt_base_tracking={} loss_classifier={} target_q_delay_ms={} loss_thr={:.2} base_rtt_window_s={} stale_windows={} owd_jump_ms={} owd_rtt_consistency_ms={} owd_prefer_after={} probe_interval_ms={} fec_recovery_recency_ms={}",
             a.congestion.enabled,
             a.congestion.gain,
             a.congestion.hol_escape_ms,
@@ -5016,6 +2495,8 @@ impl Cli {
             a.congestion.base_rtt_window_secs,
             a.congestion.base_rtt_stale_windows,
             a.congestion.owd_clock_jump_reject_ms,
+            a.congestion.owd_rtt_consistency_ms,
+            a.congestion.owd_prefer_after_samples,
             a.congestion.probe_interval_ms,
             a.congestion.fec_recovery_recency_ms
         );
@@ -5077,7 +2558,10 @@ impl Cli {
         let sub = args.first().copied().unwrap_or("show");
         match sub {
             "show" | "" => {
-                crate::cli_println!("\n[Saved config (persisted performance)]");
+                crate::cli_println!(
+                    "\n{}",
+                    term_style::fmt_ok_line(format_args!(" [Saved config]"))
+                );
                 self.print_persisted_performance_config();
                 Ok(())
             }
@@ -5203,7 +2687,7 @@ impl Cli {
             } else {
                 crate::cli_println!(
                     "{}",
-                    term_style::fmt_info_line(format_args!(
+                    term_style::fmt_ok_line(format_args!(
                         " CPU affinity: default (exclude logical CPUs 0,1)"
                     ))
                 );
@@ -5298,7 +2782,10 @@ impl Cli {
             );
         }
         crate::cli_println!(
-            "  ✓ Performance settings reloaded from NetInfo/config.toml (applied live)."
+            "{}",
+            term_style::fmt_ok_line(format_args!(
+                " Performance settings reloaded from NetInfo/config.toml (applied)."
+            ))
         );
         Ok(())
     }
@@ -5343,7 +2830,7 @@ impl Cli {
         snap: Option<&RuntimeSnapshot>,
         rates: Option<&RuntimeRateView>,
     ) {
-        lines.push("  --- VPN traffic (1s rate) ---".to_string());
+        lines.push("  [--- traffic ---]".to_string());
         let r = rates.cloned().unwrap_or_default();
         lines.push(Self::runtime_rate_line(
             "tun egress (host→vpn)",
@@ -5365,7 +2852,7 @@ impl Cli {
             r.wire_rx_mbps,
             r.wire_rx_mib,
         ));
-        lines.push("  --- buffers / queues ---".to_string());
+        lines.push("  [--- buffers / queues ---]".to_string());
         if let Some(s) = snap {
             let p = &s.pacing;
             lines.push(format!(
@@ -5440,7 +2927,7 @@ impl Cli {
         use std::time::Instant;
 
         let mut lines = Vec::with_capacity(RUNTIME_DISPLAY_LINE_COUNT);
-        lines.push("  --- runtime (refresh 1s) ---".to_string());
+        lines.push("  [--- runtime ---]".to_string());
         let relay_gauge = self.routing.read().count_under_relay_path(Instant::now());
         lines.push(format!(
             "  relay_path_routes      : {} (snapshot: prefer-relay / hold-down)",
@@ -5630,6 +3117,10 @@ impl Cli {
                     m.pmtud_probe_acks.load(Ordering::Relaxed)
                 ));
                 metric_items.push(format!(
+                    "  pmtud_pmar_ignored     : {}",
+                    m.pmtud_pmar_ignored.load(Ordering::Relaxed)
+                ));
+                metric_items.push(format!(
                     "  pmtud_probe_timeouts   : {}",
                     m.pmtud_probe_timeouts.load(Ordering::Relaxed)
                 ));
@@ -5762,6 +3253,7 @@ impl Cli {
                     "pmtud_revalidate_hints",
                     "pmtud_probes_sent",
                     "pmtud_probe_acks",
+                    "pmtud_pmar_ignored",
                     "pmtud_probe_timeouts",
                     "pmtud_revalidate_fails",
                     "pmtud_recheck_recovered",
@@ -5903,7 +3395,10 @@ impl Cli {
                         ))
                     );
                 } else {
-                    crate::cli_println!("  ✓ MTU set to {mtu} on '{name}'.");
+                    crate::cli_println!(
+                        "{}",
+                        term_style::fmt_ok_line(format_args!(" MTU set to {mtu} on '{name}'."))
+                    );
                 }
                 if metric_for_apply > 0 {
                     if let Err(e) = metric_res {
@@ -5915,7 +3410,10 @@ impl Cli {
                         );
                     } else {
                         crate::cli_println!(
-                            "  ✓ IPv4 interface metric set to {metric_for_apply} on '{name}'."
+                            "{}",
+                            term_style::fmt_ok_line(format_args!(
+                                " IPv4 interface metric set to {metric_for_apply} on '{name}'."
+                            ))
                         );
                     }
                 }
@@ -5935,7 +3433,7 @@ impl Cli {
 
         crate::cli_println!(
             "{}",
-            term_style::fmt_info_line(format_args!(" Saved to NetInfo/config.toml."))
+            term_style::fmt_ok_line(format_args!(" Saved to NetInfo/config.toml."))
         );
         Ok(())
     }
@@ -5946,24 +3444,23 @@ impl Cli {
             .await;
         match result {
             Some(ep) => {
-                crate::cli_println!("Public endpoint: {}:{}", ep.ip, ep.port);
+                crate::cli_println!(" -> Public endpoint: {}:{}", ep.ip, ep.port);
                 let snap = self.config.snapshot();
-                if snap.role == "owner" && !snap.network_id.is_empty() {
+                if !snap.network_id.is_empty() && !snap.crypto_key.is_empty() {
                     if let Ok(key) = parse_key_hex_32(&snap.crypto_key) {
-                        if let Ok(owner_ip) = ep.ip.parse::<Ipv4Addr>() {
-                            let invite = encode_invite(&InvitePayload {
-                                mode: 1,
-                                owner_ip: owner_ip.octets(),
-                                owner_port: ep.port,
-                                key,
-                                protocol: PROTO_UDP,
-                            });
-                            crate::cli_println!("  Public invite: {invite}");
-                        }
+                        let invite = encode_invite(&InvitePayload {
+                            version: INVITE_VERSION,
+                            protocol: PROTO_UDP,
+                            key,
+                        });
+                        crate::cli_println!(" -> FloatUnit ID: {invite}");
                     }
                 }
             }
-            None => crate::cli_println!("No STUN response (check firewall/router UDP policy)"),
+            None => crate::cli_println!(
+                "{}",
+                term_style::fmt_info_line(format_args!(" No STUN response"))
+            ),
         }
         Ok(())
     }
@@ -5973,14 +3470,6 @@ impl Cli {
         timeout: std::time::Duration,
     ) -> Option<stun::PublicEndpoint> {
         self.query_public_endpoint_from_engine_inner(timeout, false)
-            .await
-    }
-
-    async fn query_public_endpoint_from_engine_force(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Option<stun::PublicEndpoint> {
-        self.query_public_endpoint_from_engine_inner(timeout, true)
             .await
     }
 
@@ -6033,7 +3522,7 @@ impl Cli {
         crate::cli_println!(
             "{}",
             term_style::fmt_punch_line(format_args!(
-                " Tiered punch workflow started toward {target_ip}:{target_port}."
+                " Punch started toward {target_ip}:{target_port}."
             ))
         );
         Ok(())
@@ -6052,64 +3541,23 @@ impl Cli {
 
         let mut targets: Vec<PingTarget> = Vec::new();
         let s = self.config.snapshot();
-        let owner_vip = crate::routing::owner_vip(&s.virtual_ip);
-
-        if s.role == "owner" {
-            let routes = self.routing.read().snapshot();
-            for (vip, entry) in routes {
-                if vip == s.virtual_ip {
-                    continue;
-                }
-                let label = vip.clone();
-                targets.push(PingTarget {
-                    label,
-                    ip: entry.endpoint.ip().to_string(),
-                    port: entry.endpoint.port(),
-                });
+        let routes = self.routing.read().snapshot();
+        for (vip, entry) in routes {
+            if vip == s.virtual_ip {
+                continue;
             }
-            if targets.is_empty() {
-                crate::cli_println!(
-                    "\n{}",
-                    term_style::fmt_info_line(format_args!(" No peers connected."))
-                );
-                return Ok(());
-            }
-        } else {
-            let routes = self.routing.read().snapshot();
-            let owner_route_ep = routes
-                .iter()
-                .find(|(vip, _)| vip == &owner_vip)
-                .map(|(_, e)| e.endpoint);
-            if let Some(ep) = owner_route_ep {
-                targets.push(PingTarget {
-                    label: owner_vip.clone(),
-                    ip: ep.ip().to_string(),
-                    port: ep.port(),
-                });
-            } else if !s.owner_real_ip.is_empty() && s.owner_port != 0 {
-                targets.push(PingTarget {
-                    label: owner_vip.clone(),
-                    ip: s.owner_real_ip.clone(),
-                    port: s.owner_port,
-                });
-            }
-            for (vip, entry) in routes {
-                if vip == s.virtual_ip || vip == owner_vip {
-                    continue;
-                }
-                targets.push(PingTarget {
-                    label: vip,
-                    ip: entry.endpoint.ip().to_string(),
-                    port: entry.endpoint.port(),
-                });
-            }
-            if targets.is_empty() {
-                crate::cli_println!(
-                    "\n{}",
-                    term_style::fmt_info_line(format_args!(" No targets to ping."))
-                );
-                return Ok(());
-            }
+            targets.push(PingTarget {
+                label: vip,
+                ip: entry.endpoint.ip().to_string(),
+                port: entry.endpoint.port(),
+            });
+        }
+        if targets.is_empty() {
+            crate::cli_println!(
+                "\n{}",
+                term_style::fmt_info_line(format_args!(" No peers connected."))
+            );
+            return Ok(());
         }
 
         let mut results = vec![[-1_i64; ROUNDS]; targets.len()];
@@ -6212,91 +3660,17 @@ impl Cli {
         Ok(())
     }
 
-    async fn handle_kick(&self, arg: Option<&str>) -> Result<()> {
-        if self.config.get_role() != "owner" {
-            crate::cli_println!(
-                "\n{}",
-                term_style::fmt_bang_line(format_args!(" Only the owner can kick peers."))
-            );
-            return Ok(());
-        }
-        let Some(n_str) = arg else {
-            return Err(anyhow!("usage: kick <name | N | ip:port>"));
-        };
-        let snap = self.config.snapshot();
-        if let Ok(n) = n_str.parse::<usize>() {
-            if n == 0 || n > snap.peers.len() {
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_bang_line(format_args!(
-                        " Invalid peer number. Use 'list' to see peers."
-                    ))
-                );
-            } else {
-                let vip = snap.peers[n - 1].virtual_ip.clone();
-                let ep = self.routing.read().lookup(&vip);
-                if let Some(ep) = ep {
-                    let _ = self.cmd_tx.send(EngineCmd::Kick(ep)).await;
-                    crate::cli_println!("  Kicked peer #{n} ({vip})");
-                } else {
-                    crate::cli_println!(
-                        "{}",
-                        term_style::fmt_bang_line(format_args!(
-                            " Peer #{n} ({vip}) not found in routing table."
-                        ))
-                    );
-                }
-            }
-        } else if let Ok(ep) = n_str.parse::<std::net::SocketAddr>() {
-            let _ = self.cmd_tx.send(EngineCmd::Kick(ep)).await;
-            crate::cli_println!("  Kicked {ep}");
-        } else {
-            let peer = snap.peers.iter().find(|p| {
-                p.name.eq_ignore_ascii_case(n_str)
-                    || p.node_id.eq_ignore_ascii_case(n_str)
-                    || p.virtual_ip == n_str
-            });
-            if let Some(p) = peer {
-                let ep_opt = self.routing.read().lookup(&p.virtual_ip);
-                if let Some(ep) = ep_opt {
-                    let _ = self.cmd_tx.send(EngineCmd::Kick(ep)).await;
-                    crate::cli_println!("  Kicked '{}' ({})", p.name, p.virtual_ip);
-                } else if let Ok(ep) = p.real_ip.parse::<SocketAddr>() {
-                    let _ = self.cmd_tx.send(EngineCmd::Kick(ep)).await;
-                    crate::cli_println!("  Kicked '{}' ({})", p.name, p.virtual_ip);
-                } else {
-                    crate::cli_println!(
-                        "{}",
-                        term_style::fmt_bang_line(format_args!(
-                            " Peer '{}' has no reachable endpoint.",
-                            p.name
-                        ))
-                    );
-                }
-            } else {
-                crate::cli_println!(
-                    "{}",
-                    term_style::fmt_bang_line(format_args!(
-                        " Invalid argument. Use peer name, number or ip:port."
-                    ))
-                );
-            }
-        }
-        Ok(())
-    }
-
     async fn handle_remove(&mut self) -> Result<()> {
-        self.stop_parasitic_passive_listener();
+        self.stop_lan_presence_listener();
         let snap = self.config.snapshot();
         if !snap.virtual_ip.is_empty() {
-            let leave = serde_json::json!({
-                "event_id": format!("leave-{}-{}", snap.node_id, now_epoch_ms()),
-                "type": "leave",
-                "vip": snap.virtual_ip,
-                "node_id": snap.node_id,
-                "endpoint": "",
+            let event_id = format!("leave-{}-{}", snap.node_id, now_epoch_ms());
+            let _ = self.cmd_tx.try_send(EngineCmd::BroadcastLeave {
+                node_id: snap.node_id.clone(),
+                vip: snap.virtual_ip.clone(),
+                vip_epoch: snap.vip_epoch,
+                event_id,
             });
-            let _ = self.cmd_tx.try_send(EngineCmd::BroadcastMsmd(leave));
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         self.upnp_cleanup_if_any().await;
@@ -6323,7 +3697,6 @@ impl Cli {
         }
 
         self.config.clear_and_delete()?;
-        self.owner_vip_pool = None;
         {
             let mut rt = self.routing.write();
             *rt = RoutingTable::new();
@@ -6353,7 +3726,10 @@ impl Cli {
             return Ok(());
         }
 
-        crate::cli_println!("session cleared; restarting in 3s…");
+        crate::cli_println!(
+            "{}",
+            term_style::fmt_ok_line(format_args!(" session cleared; restarting in 3s…"))
+        );
         for s in (1..=3).rev() {
             crate::cli_println!("  {s}…");
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -6387,17 +3763,16 @@ impl Cli {
     }
 
     pub async fn handle_exit(&mut self) {
-        self.stop_parasitic_passive_listener();
+        self.stop_lan_presence_listener();
         let snap = self.config.snapshot();
         if !snap.virtual_ip.is_empty() {
-            let leave = serde_json::json!({
-                "event_id": format!("leave-{}-{}", snap.node_id, now_epoch_ms()),
-                "type": "leave",
-                "vip": snap.virtual_ip,
-                "node_id": snap.node_id,
-                "endpoint": "",
+            let event_id = format!("leave-{}-{}", snap.node_id, now_epoch_ms());
+            let _ = self.cmd_tx.try_send(EngineCmd::BroadcastLeave {
+                node_id: snap.node_id.clone(),
+                vip: snap.virtual_ip.clone(),
+                vip_epoch: snap.vip_epoch,
+                event_id,
             });
-            let _ = self.cmd_tx.try_send(EngineCmd::BroadcastMsmd(leave));
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         self.upnp_cleanup_if_any().await;
@@ -6425,14 +3800,85 @@ impl Cli {
             );
         }
         crate::cli_println!(
-            "  ✓ Performance settings reset to factory defaults (saved to config)."
+            "{}",
+            term_style::fmt_ok_line(format_args!(
+                " Performance settings reset to factory defaults."
+            ))
         );
         Ok(())
     }
 
-    /// Apply UDP socket buffers and/or recreate Wintun for a new ring size.
-    ///
-    /// Wintun recreate briefly drops the adapter — only call with
+    /// Persist VIP identity after an engine fight/reroll and recreate Wintun (/24).
+    pub async fn apply_identity_changed(&mut self, new_vip: &str, vip_epoch: u64) -> Result<()> {
+        self.config.update(|cfg| {
+            cfg.virtual_ip = new_vip.to_string();
+            cfg.vip_epoch = vip_epoch;
+        });
+
+        #[cfg(windows)]
+        {
+            if let Some(ref old_adapter) = self.vni {
+                let Ok(vip_ip) = new_vip.parse::<std::net::Ipv4Addr>() else {
+                    crate::cli_eprintln!(
+                        "{}",
+                        term_style::fmt_bang_line(format_args!(
+                            " Identity change: invalid VIP '{new_vip}'"
+                        ))
+                    );
+                    return Ok(());
+                };
+                let snap = self.config.snapshot();
+                let adapter_name = old_adapter.name().to_string();
+                *self.vni_slot.write() = None;
+                old_adapter.close();
+                self.vni = None;
+
+                let mtu_to_apply = snap.adapter_mtu;
+                let ring = effective_wintun_ring_bytes(snap.wintun_ring_bytes);
+                let ipv4_metric =
+                    effective_wintun_ipv4_interface_metric(snap.wintun_ipv4_interface_metric);
+                let wintun_prefix = 24u8;
+                let adapter_name_for_task = adapter_name.clone();
+                let new_adapter =
+                    tokio::task::spawn_blocking(move || -> Result<Arc<WintunAdapter>> {
+                        let adapter = Arc::new(
+                            WintunAdapter::create(
+                                &adapter_name_for_task,
+                                vip_ip,
+                                wintun_prefix,
+                                ring,
+                                ipv4_metric,
+                            )
+                            .map_err(|e| {
+                                anyhow!("failed to recreate Wintun after identity change: {e}")
+                            })?,
+                        );
+                        if (576..=1500).contains(&mtu_to_apply) {
+                            let _ = adapter.set_mtu(mtu_to_apply as u16);
+                        }
+                        Ok(adapter)
+                    })
+                    .await
+                    .map_err(|e| anyhow!("wintun create task join failed: {e}"))??;
+                self.wire_adapter(new_adapter.clone());
+                self.vni = Some(new_adapter);
+                crate::cli_println!(
+                    "{}",
+                    term_style::fmt_info_line(format_args!(
+                        " Identity changed: Wintun recreated for {new_vip}/{wintun_prefix}"
+                    ))
+                );
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = (new_vip, vip_epoch);
+        }
+
+        Ok(())
+    }
+
     /// `recreate_wintun_ring = true` when the effective ring size changed.
     async fn apply_performance_buffers_live(
         &mut self,
@@ -6542,22 +3988,18 @@ impl Cli {
     }
 
     fn print_help(&self) {
-        crate::cli_println!("\n#===--> Commands ===#");
-        crate::cli_println!("   > [ list ]        ------- Routing table");
-        crate::cli_println!("   > [ runtime ]        ------- Performance live view");
-        crate::cli_println!("   > [ ping ]           --- Ping peers");
-        crate::cli_println!("   > [ stun ]      ----------- Query public endpoint");
-        crate::cli_println!("   > [ punch <ip:port> ] --- Manual NAT hole punch");
-        crate::cli_println!(
-            "   > [ autoclear-on|off ]  --- Clear screen each command (on default)"
-        );
-        crate::cli_println!(
-            "   > [ config show|reload|reset ] --- Performance via NetInfo/config.toml"
-        );
-        crate::cli_println!("   > [ kick <name|N|ip:port> ] [Owner] Remove peer");
-        crate::cli_println!("   > [ remove ] ----------- Clear session and config (destructive)");
-        crate::cli_println!("   > [ stop ] --------------   Disconnect and quit");
-        crate::cli_println!("---");
+        crate::cli_println!("\n#===--> COMMANDS ===#");
+        crate::cli_println!("   > [ lan ] - LAN discover");
+        crate::cli_println!("   > [ list ] - Routing table");
+        crate::cli_println!("   > [ ping ] - Ping peers");
+        crate::cli_println!("   > [ stun ] - Query public endpoint");
+        crate::cli_println!("   > [ stop ] - Disconnect and quit");
+        crate::cli_println!("   > [ remove ] - Clear session and config");
+        crate::cli_println!("   > [ runtime ] - Performance live view");
+        crate::cli_println!("   > [ punch <ip:port> ] - Manual NAT hole punch");
+        crate::cli_println!("   > [ autoclear-on|off ] - Auto clear terminal");
+        crate::cli_println!("   > [ config show|reload|reset ] - config.toml");
+        crate::cli_println!("-----");
     }
 
     fn has_active_profile(&self) -> bool {
@@ -6651,106 +4093,6 @@ async fn read_line_async() -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-async fn query_stun_via_engine(
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    timeout: Duration,
-) -> Option<stun::PublicEndpoint> {
-    query_stun_via_engine_inner(cmd_tx, timeout, false).await
-}
-
-async fn query_stun_via_engine_force(
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    timeout: Duration,
-) -> Option<stun::PublicEndpoint> {
-    query_stun_via_engine_inner(cmd_tx, timeout, true).await
-}
-
-async fn query_stun_via_engine_inner(
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    timeout: Duration,
-    force_refresh: bool,
-) -> Option<stun::PublicEndpoint> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if cmd_tx
-        .send(EngineCmd::QueryPublicEndpoint {
-            timeout,
-            force_refresh,
-            reply: reply_tx,
-        })
-        .await
-        .is_err()
-    {
-        return None;
-    }
-    match reply_rx.await {
-        Ok(Some(ep)) => Some(ep),
-        _ => None,
-    }
-}
-
-async fn gather_local_para_candidates(
-    snap: &crate::config::NetworkConfig,
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    timeout: Duration,
-) -> Vec<ParaCandidate> {
-    gather_local_para_candidates_inner(snap, cmd_tx, timeout, false, false).await
-}
-
-async fn gather_local_para_candidates_force(
-    snap: &crate::config::NetworkConfig,
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    timeout: Duration,
-) -> Vec<ParaCandidate> {
-    gather_local_para_candidates_inner(snap, cmd_tx, timeout, true, false).await
-}
-
-async fn gather_local_para_candidates_inner(
-    snap: &crate::config::NetworkConfig,
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    timeout: Duration,
-    force_refresh: bool,
-    skip_stun: bool,
-) -> Vec<ParaCandidate> {
-    let mut out = Vec::new();
-    if !skip_stun {
-        let stun_ep = if force_refresh {
-            query_stun_via_engine_force(cmd_tx, timeout).await
-        } else {
-            query_stun_via_engine(cmd_tx, timeout).await
-        };
-        if let Some(ep) = stun_ep {
-            out.push(ParaCandidate {
-                ip: ep.ip,
-                port: ep.port,
-                kind: "stun".to_string(),
-            });
-        }
-    }
-    let local_ip = get_local_ip();
-    out.push(ParaCandidate {
-        ip: local_ip,
-        port: snap.listen_port.max(7878),
-        kind: "local".to_string(),
-    });
-    if !force_refresh {
-        for raw in &snap.owner_endpoints_cache {
-            if let Ok(ep) = raw.parse::<SocketAddr>() {
-                if skip_stun && !is_rfc1918_private_ip(ep.ip()) {
-                    continue;
-                }
-                out.push(ParaCandidate {
-                    ip: ep.ip().to_string(),
-                    port: ep.port(),
-                    kind: "cached".to_string(),
-                });
-            }
-        }
-    }
-    let mut uniq = HashSet::new();
-    out.retain(|c| uniq.insert(format!("{}:{}:{}", c.ip, c.port, c.kind)));
-    out
-}
-
 fn local_only_para_candidates(snap: &crate::config::NetworkConfig) -> Vec<ParaCandidate> {
     vec![ParaCandidate {
         ip: get_local_ip(),
@@ -6759,60 +4101,7 @@ fn local_only_para_candidates(snap: &crate::config::NetworkConfig) -> Vec<ParaCa
     }]
 }
 
-async fn owner_reply_para_candidates(
-    snap: &crate::config::NetworkConfig,
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    from: SocketAddr,
-    force_timeout: Duration,
-) -> Vec<ParaCandidate> {
-    if is_rfc1918_private_ip(from.ip()) {
-        return local_only_para_candidates(snap);
-    }
-    gather_local_para_candidates_force(snap, cmd_tx, force_timeout).await
-}
-
-fn build_owner_para_reply_bytes(
-    snap: &crate::config::NetworkConfig,
-    local_candidates: &[ParaCandidate],
-    assigned_vip: &str,
-    network_id: &str,
-    agreed_start_at_ms: u64,
-    session_id: &str,
-    include_network_key: bool,
-) -> Vec<u8> {
-    let public_ip = local_candidates
-        .first()
-        .map(|c| c.ip.clone())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let public_port = local_candidates
-        .first()
-        .map(|c| c.port)
-        .unwrap_or(snap.listen_port.max(7878));
-    let network_key_hex = if include_network_key {
-        snap.crypto_key.clone()
-    } else {
-        String::new()
-    };
-    json!({
-        "node_id": snap.node_id,
-        "public_ip": public_ip,
-        "public_port": public_port,
-        "assigned_vip": assigned_vip,
-        "network_id": network_id,
-        "ts_ms": now_epoch_ms(),
-        "candidates": local_candidates,
-        "agreed_start_at_ms": agreed_start_at_ms,
-        "session_id": session_id,
-        "responder_vip": snap.virtual_ip,
-        "responder_is_owner": true,
-        "network_name": snap.server_name,
-        "network_key_hex": network_key_hex,
-    })
-    .to_string()
-    .into_bytes()
-}
-
-/// UDP targets for LAN parasitic discover broadcasts.
+/// UDP targets for LAN discover broadcasts.
 fn para_lan_discovery_targets(local_ip: &str, listen_port: u16) -> Vec<SocketAddr> {
     let mut ports = vec![7878u16, listen_port.max(7878)];
     ports.sort_unstable();
@@ -6844,128 +4133,21 @@ fn filter_private_socket_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
         .collect()
 }
 
-async fn select_parasitic_lan_target_interactive(
-    cli: &Cli,
-    owners: &[crate::ipc::ParasiticLanOwner],
-) -> Result<SocketAddr> {
-    let listen_port = cli.config.get_listen_port().max(7878);
-    if owners.is_empty() {
-        crate::cli_println!(
-            "{}",
-            term_style::fmt_para_line(format_args!(
-                " No owners replied. AP client isolation may block UDP broadcast."
-            ))
-        );
-        crate::cli_print!("  Owner ip:port (or empty to abort): ");
-        io::stdout().flush()?;
-        let line = cli.read_line().await?;
-        if line.trim().is_empty() {
-            return Err(anyhow!(
-                "LAN discover found no owners and no fallback target"
-            ));
-        }
-        return Ok(parse_vip_signal_target(line.trim(), listen_port)?.1);
-    }
-    if owners.len() == 1 {
-        return Ok(parse_vip_signal_target(&owners[0].from, listen_port)?.1);
-    }
-    crate::cli_println!("  Multiple Mint owners on LAN:");
-    for (i, o) in owners.iter().enumerate() {
-        let name = if o.network_name.is_empty() {
-            "(unnamed)"
-        } else {
-            o.network_name.as_str()
-        };
-        let short_id = if o.network_id.len() > 12 {
-            &o.network_id[..12]
-        } else {
-            o.network_id.as_str()
-        };
-        crate::cli_println!(
-            "    [{}] {}  id={}…  from={}",
-            i + 1,
-            name,
-            short_id,
-            o.from
-        );
-    }
-    crate::cli_print!("  Choose owner [1-{}]: ", owners.len());
-    io::stdout().flush()?;
-    let line = cli.read_line().await?;
-    let idx: usize = line
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("invalid owner selection"))?;
-    if idx == 0 || idx > owners.len() {
-        return Err(anyhow!("owner selection out of range"));
-    }
-    Ok(parse_vip_signal_target(&owners[idx - 1].from, listen_port)?.1)
-}
-
-fn candidates_to_socket_addrs(cands: &[ParaEngineCandidate]) -> Vec<SocketAddr> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for c in cands {
-        if let Ok(ep) = make_socket_addr(&c.ip, c.port) {
-            if seen.insert(ep) {
-                out.push(ep);
-            }
-        }
-    }
-    out
-}
-
-fn candidates_to_ice(eps: &[SocketAddr]) -> Vec<serde_json::Value> {
-    eps.iter()
-        .map(|ep| {
-            json!({
-                "ip": ep.ip().to_string(),
-                "port": ep.port(),
-                "type": "para",
-            })
-        })
-        .collect()
-}
-
-fn compute_agreed_start_at_ms(peer_value: u64, local_default: u64) -> u64 {
-    let mut agreed = peer_value.max(local_default);
-    let now = now_epoch_ms();
-    if agreed <= now {
-        agreed = now;
-    }
-    let max_future = now.saturating_add(PARA_MAX_CLOCK_SKEW_MS);
-    if agreed > max_future {
-        agreed = max_future;
-    }
-    agreed
-}
-
-fn para_signal_pause_duration() -> Duration {
-    let base = PARA_SIGNAL_PAUSE_MS;
-    let jitter = (base.saturating_mul(PARA_SIGNAL_JITTER_PCT) / 100).max(1);
-    let lower = base.saturating_sub(jitter);
-    let upper = base.saturating_add(jitter);
-    let ms = if lower >= upper {
-        base
-    } else {
-        use rand::Rng;
-        rand::thread_rng().gen_range(lower..=upper)
-    };
-    Duration::from_millis(ms)
-}
-
-fn vip_owner_matches(
-    vip_owners: &HashMap<String, (String, u64)>,
-    vip: &str,
-    session_id: &str,
-    lease_token: u64,
+fn lan_reply_is_self(
+    local_node_id: &str,
+    local_ip: &str,
+    listen_port: u16,
+    from: SocketAddr,
+    reply_node_id: &str,
 ) -> bool {
-    vip_owners
-        .get(vip)
-        .map(|(sid, lease)| sid == session_id && *lease == lease_token)
-        .unwrap_or(false)
+    if !local_node_id.is_empty() && !reply_node_id.is_empty() && reply_node_id == local_node_id {
+        return true;
+    }
+    if let Ok(ip) = local_ip.parse::<Ipv4Addr>() {
+        return from == SocketAddr::from((ip, listen_port));
+    }
+    false
 }
-
 async fn register_para_listener(
     cmd_tx: &mpsc::Sender<EngineCmd>,
     notify_tx: mpsc::Sender<ParaSignal>,
@@ -6993,38 +4175,6 @@ async fn unregister_para_listener(cmd_tx: &mpsc::Sender<EngineCmd>, listener_id:
     }
 }
 
-async fn send_para_ok_redundant(
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    target_vip: SocketAddr,
-    local_node_id: &str,
-    session_id: &str,
-) -> Result<()> {
-    for i in 0..PARA_OK_REDUNDANCY {
-        let ok = json!({
-            "node_id": local_node_id,
-            "ts_ms": now_epoch_ms(),
-            "session_id": session_id,
-        })
-        .to_string()
-        .into_bytes();
-        let _ = cmd_tx
-            .send(EngineCmd::ParaSendOk {
-                target_vip,
-                payload: ok,
-            })
-            .await;
-        if i + 1 < PARA_OK_REDUNDANCY {
-            tokio::time::sleep(Duration::from_millis(PARA_OK_GAP_MS)).await;
-        }
-    }
-    Ok(())
-}
-
-fn stop_para_passive_punch_loops(cmd_tx: &mpsc::Sender<EngineCmd>, session_id: &str) {
-    let key = format!("para-passive-{session_id}");
-    let _ = cmd_tx.try_send(EngineCmd::StopPunchWorkflow { key });
-}
-
 fn prepare_para_punch_route(
     routing: &Arc<RwLock<RoutingTable>>,
     cmd_tx: &mpsc::Sender<EngineCmd>,
@@ -7037,69 +4187,6 @@ fn prepare_para_punch_route(
     let _ = cmd_tx.try_send(EngineCmd::PeerRouteRemoved {
         vip: remote_vip.to_string(),
     });
-}
-
-fn collect_para_punch_ack_targets(
-    rt: &RoutingTable,
-    remote_vip: &str,
-    remote_candidates: &[SocketAddr],
-    fallbacks: &[SocketAddr],
-) -> Vec<SocketAddr> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    if let Some(ep) = rt.lookup(remote_vip) {
-        if seen.insert(ep) {
-            out.push(ep);
-        }
-    }
-    for ep in remote_candidates.iter().chain(fallbacks.iter()) {
-        if seen.insert(*ep) {
-            out.push(*ep);
-        }
-    }
-    out
-}
-
-async fn send_para_punch_ack_redundant(
-    cmd_tx: &mpsc::Sender<EngineCmd>,
-    targets: &[SocketAddr],
-    local_node_id: &str,
-    session_id: &str,
-) -> Result<()> {
-    let mut seen = HashSet::new();
-    for target in targets {
-        if !seen.insert(*target) {
-            continue;
-        }
-        for i in 0..PARA_PUNCH_ACK_REDUNDANCY {
-            let ack = json!({
-                "node_id": local_node_id,
-                "ts_ms": now_epoch_ms(),
-                "session_id": session_id,
-            })
-            .to_string()
-            .into_bytes();
-            let _ = cmd_tx
-                .send(EngineCmd::ParaSendPunchAck {
-                    target: *target,
-                    payload: ack,
-                })
-                .await;
-            if i + 1 < PARA_PUNCH_ACK_REDUNDANCY {
-                tokio::time::sleep(Duration::from_millis(PARA_PUNCH_ACK_GAP_MS)).await;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn wait_until_para_start(start_at_ms: u64) {
-    let now = now_epoch_ms();
-    if start_at_ms <= now {
-        return;
-    }
-    let wait_ms = start_at_ms.saturating_sub(now).min(PARA_MAX_CLOCK_SKEW_MS);
-    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
 }
 
 fn punch_route_ready(rt: &RoutingTable, remote_vip: &str, peer_candidates: &[SocketAddr]) -> bool {
@@ -7131,7 +4218,7 @@ fn punch_route_ready(rt: &RoutingTable, remote_vip: &str, peer_candidates: &[Soc
     false
 }
 
-async fn wait_for_parasitic_punch_ready(
+async fn wait_for_lan_punch_ready(
     routing: &Arc<RwLock<RoutingTable>>,
     remote_vip: &str,
     peer_candidates: &[SocketAddr],
@@ -7175,61 +4262,13 @@ async fn wait_for_parasitic_punch_ready(
     false
 }
 
-async fn run_parasitic_punch_worker(
-    cmd_tx: mpsc::Sender<EngineCmd>,
-    routing: Arc<RwLock<RoutingTable>>,
-    remote_candidates: Vec<SocketAddr>,
-    remote_vip: String,
-    workflow_key: String,
-    punch_cancel: Arc<AtomicBool>,
-) -> bool {
-    if remote_candidates.is_empty() {
-        return false;
+fn parse_join_endpoint(raw: &str) -> Result<SocketAddr> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("peer endpoint (ip:port) is required"));
     }
-    let cancel = Some(punch_cancel.clone());
-    prepare_para_punch_route(&routing, &cmd_tx, &remote_vip);
-    for target in &remote_candidates {
-        let _ = cmd_tx
-            .send(EngineCmd::ManualPunch {
-                target: *target,
-                count: PARA_KEEPALIVE_COUNT as usize,
-            })
-            .await;
-        tokio::time::sleep(Duration::from_millis(PARA_KEEPALIVE_GAP_MS)).await;
-    }
-
-    let phase_start = std::time::Instant::now();
-    let _ = cmd_tx
-        .send(EngineCmd::StartPunchWorkflow {
-            key: workflow_key.clone(),
-            bases: remote_candidates.clone(),
-            log_stages: true,
-        })
-        .await;
-
-    let ok = wait_for_parasitic_punch_ready(
-        &routing,
-        &remote_vip,
-        &remote_candidates,
-        phase_start,
-        std::time::Instant::now() + Duration::from_secs(PARA_PUNCH_WORKFLOW_DEADLINE_SECS),
-        PARA_OWNER_PASSIVE_MIN_BURST_WALL_MS,
-        cancel,
-    )
-    .await;
-    let _ = cmd_tx
-        .send(EngineCmd::StopPunchWorkflow { key: workflow_key })
-        .await;
-    ok
-}
-
-fn random_owner_vip() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let a: u8 = rng.gen_range(10..=255);
-    let b: u8 = rng.gen_range(1..=255);
-    let c: u8 = rng.gen_range(1..=255);
-    format!("{a}.{b}.{c}.1")
+    raw.parse::<SocketAddr>()
+        .map_err(|_| anyhow!("invalid peer endpoint (expected ip:port): {raw}"))
 }
 
 /// Commands whose output should survive screen autoclear.
@@ -7271,7 +4310,7 @@ fn parse_vip_signal_target(input: &str, default_port: u16) -> Result<(String, So
     }
     if let Some((ip_s, port_s)) = raw.rsplit_once(':') {
         if ip_s.contains(':') {
-            return Err(anyhow!("IPv6 is not supported for parasitic mode"));
+            return Err(anyhow!("IPv6 is not supported"));
         }
         let ip: Ipv4Addr = ip_s.parse().map_err(|_| anyhow!("invalid IPv4 address"))?;
         let port: u16 = port_s.parse().map_err(|_| anyhow!("invalid port"))?;
@@ -7285,26 +4324,6 @@ fn parse_vip_signal_target(input: &str, default_port: u16) -> Result<(String, So
     let port = default_port.clamp(PORT_MIN, PORT_MAX);
     let ip_text = ip.to_string();
     Ok((ip_text.clone(), SocketAddr::from((ip, port))))
-}
-
-fn make_socket_addr(ip: &str, port: u16) -> Result<SocketAddr> {
-    let ip_v4: Ipv4Addr = ip.parse().map_err(|_| anyhow!("invalid IPv4 address"))?;
-    if !(PORT_MIN..=PORT_MAX).contains(&port) {
-        return Err(anyhow!("invalid port range {PORT_MIN}-{PORT_MAX}"));
-    }
-    Ok(SocketAddr::from((ip_v4, port)))
-}
-
-fn vip_from_owner_subnet(owner_vip: &str, owner_slot: bool) -> Result<String> {
-    let ip: Ipv4Addr = owner_vip
-        .parse()
-        .map_err(|_| anyhow!("invalid owner vip subnet"))?;
-    let [a, b, c, _] = ip.octets();
-    Ok(if owner_slot {
-        format!("{a}.{b}.{c}.1")
-    } else {
-        format!("{a}.{b}.{c}.2")
-    })
 }
 
 fn parse_punch_target_args(
@@ -7619,9 +4638,8 @@ fn pace_spin_style_hint(tick_us: u64, spin_window_us: u64) -> &'static str {
 
 #[cfg(test)]
 mod punch_route_ready_tests {
-    use super::{punch_route_ready, vip_owner_matches};
+    use super::punch_route_ready;
     use crate::routing::{RouteState, RoutingTable};
-    use std::collections::HashMap;
     use std::net::SocketAddr;
 
     #[test]
@@ -7661,21 +4679,11 @@ mod punch_route_ready_tests {
         let candidates = vec!["198.51.100.4:8888".parse().unwrap()];
         assert!(!punch_route_ready(&rt, "10.0.0.8", &candidates));
     }
-
-    #[test]
-    fn vip_owner_match_requires_exact_session_and_lease() {
-        let mut owners = HashMap::new();
-        owners.insert("10.0.0.2".to_string(), ("sid-a".to_string(), 9));
-        assert!(vip_owner_matches(&owners, "10.0.0.2", "sid-a", 9));
-        assert!(!vip_owner_matches(&owners, "10.0.0.2", "sid-b", 9));
-        assert!(!vip_owner_matches(&owners, "10.0.0.2", "sid-a", 10));
-        assert!(!vip_owner_matches(&owners, "10.0.0.9", "sid-a", 9));
-    }
 }
 
 #[cfg(test)]
-mod parasitic_lan_helpers_tests {
-    use super::{filter_private_socket_addrs, para_lan_discovery_targets};
+mod lan_helpers_tests {
+    use super::{filter_private_socket_addrs, lan_reply_is_self, para_lan_discovery_targets};
     use crate::pmtud::is_rfc1918_private_ip;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -7704,6 +4712,140 @@ mod parasitic_lan_helpers_tests {
             8, 8, 8, 8
         ))));
         let _: SocketAddr = filtered[0];
+    }
+
+    #[test]
+    fn filter_private_only_candidates_returns_private() {
+        let addrs: Vec<SocketAddr> = vec![
+            "10.0.0.5:7878".parse().unwrap(),
+            "172.16.0.1:7878".parse().unwrap(),
+            "203.0.113.1:7878".parse().unwrap(),
+        ];
+        let private = filter_private_socket_addrs(&addrs);
+        assert_eq!(private.len(), 2);
+        assert!(private.iter().all(|a| is_rfc1918_private_ip(a.ip())));
+    }
+
+    #[test]
+    fn lan_reply_is_self_by_node_id() {
+        let from: SocketAddr = "192.168.1.10:7878".parse().unwrap();
+        assert!(lan_reply_is_self(
+            "node-local",
+            "192.168.1.9",
+            7878,
+            from,
+            "node-local"
+        ));
+    }
+
+    #[test]
+    fn lan_reply_is_self_by_endpoint() {
+        let from: SocketAddr = "192.168.1.9:7878".parse().unwrap();
+        assert!(lan_reply_is_self(
+            "node-local",
+            "192.168.1.9",
+            7878,
+            from,
+            "node-remote"
+        ));
+    }
+
+    #[test]
+    fn lan_reply_from_other_peer_is_not_self() {
+        let from: SocketAddr = "192.168.1.10:7878".parse().unwrap();
+        assert!(!lan_reply_is_self(
+            "node-local",
+            "192.168.1.9",
+            7878,
+            from,
+            "node-remote"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod same_key_lan_discover_tests {
+    use crate::net::engine::ParaSignal;
+    use std::net::SocketAddr;
+
+    fn make_hello_signal(network_id: &str, session_id: &str) -> ParaSignal {
+        ParaSignal::HelloReceived {
+            from: "192.168.1.10:7878".parse::<SocketAddr>().unwrap(),
+            public_ip: "192.168.1.10".into(),
+            public_port: 7878,
+            network_id: network_id.into(),
+            node_id: "nodeA".into(),
+            candidates: vec![],
+            start_at_ms: 0,
+            session_id: session_id.into(),
+        }
+    }
+
+    fn make_reply_signal(network_id: &str, responder_vip: &str) -> ParaSignal {
+        ParaSignal::ReplyReceived {
+            from: "192.168.1.11:7878".parse::<SocketAddr>().unwrap(),
+            public_ip: "192.168.1.11".into(),
+            public_port: 7878,
+            network_id: network_id.into(),
+            node_id: "nodeB".into(),
+            candidates: vec![],
+            agreed_start_at_ms: 0,
+            session_id: "sess1".into(),
+            responder_vip: responder_vip.into(),
+        }
+    }
+
+    #[test]
+    fn hello_signal_carries_network_id() {
+        let sig = make_hello_signal("net-abc", "sess1");
+        if let ParaSignal::HelloReceived {
+            network_id,
+            session_id,
+            ..
+        } = sig
+        {
+            assert_eq!(network_id, "net-abc");
+            assert_eq!(session_id, "sess1");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn reply_signal_carries_responder_vip_not_key() {
+        let sig = make_reply_signal("net-abc", "10.0.0.1");
+        if let ParaSignal::ReplyReceived {
+            responder_vip,
+            network_id,
+            ..
+        } = sig
+        {
+            assert_eq!(responder_vip, "10.0.0.1");
+            assert_eq!(network_id, "net-abc");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn mismatched_network_id_is_ignored_by_presence_listener() {
+        let local_network_id = "net-abc";
+        let sig = make_hello_signal("net-xyz", "sess1");
+        if let ParaSignal::HelloReceived { network_id, .. } = sig {
+            assert_ne!(
+                network_id, local_network_id,
+                "mismatch should not trigger reply"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_network_id_triggers_reply() {
+        let local_network_id = "net-abc";
+        let sig = make_hello_signal("net-abc", "sess2");
+        if let ParaSignal::HelloReceived { network_id, .. } = sig {
+            assert_eq!(network_id, local_network_id, "match should trigger reply");
+        }
     }
 }
 

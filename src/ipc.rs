@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 
 pub const IPC_ADDR: &str = "127.0.0.1:48787";
 pub const IPC_UI_ADDR: &str = "127.0.0.1:48788";
-pub const IPC_PROTOCOL: u32 = 3;
+pub const IPC_PROTOCOL: u32 = 4;
 
 /// First frame on UI socket must be this; daemon replies with replay then streams live lines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +54,7 @@ pub enum IpcRequest {
     /// Client UI disconnected (window close / exit); daemon may auto-exit if idle profile.
     ClientDisconnect,
     HasActiveProfile,
-    /// Daemon bootstrap / parasitic auto-reconnect progress for session-open ceremony.
+    /// Daemon bootstrap progress for session-open ceremony.
     BootstrapSnapshot,
     /// Atomically take session-open home lines (once per daemon bootstrap).
     TakeSessionHome,
@@ -66,25 +66,21 @@ pub enum IpcRequest {
     /// Disable + reset runtime dashboard counters when leaving the view.
     RuntimeViewEnd,
     CreateNetwork {
-        name: String,
         listen_port: u16,
-        owner_vip: String,
+        virtual_ip: String,
         subnet_prefix: u8,
     },
     JoinInvite {
         invite: String,
         /// `Some(true)` = LAN (skip public STUN path); default public.
         lan_mode: Option<bool>,
+        /// Peer punch target (`ip:port`); invite is key-only.
+        endpoint: String,
     },
-    JoinParasitic {
-        peer_vip: String,
-        self_vip: String,
-        upnp_port: Option<u16>,
-    },
-    /// Broadcast discover_only MPHI; returns `ParasiticLanOwners`.
-    DiscoverParasiticLan,
-    /// Unicast admit Hello to a LAN owner (`ip` or `ip:port`).
-    JoinParasiticLan {
+    /// Broadcast MPHI with local network_id; returns `LanMembers`.
+    DiscoverLanMembers,
+    /// Punch private candidates to LAN target, then PrepareJoin using local key.
+    AssistLanMember {
         target: String,
     },
     ResetPerformanceDefaults,
@@ -94,8 +90,7 @@ pub enum IpcRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParasiticLanOwner {
-    pub network_name: String,
+pub struct LanMemberPeer {
     pub network_id: String,
     pub from: String,
     pub node_id: String,
@@ -109,7 +104,7 @@ pub enum IpcResponse {
     Pong,
     RuntimeSnapshot { payload: Vec<u8> },
     BootstrapSnapshot { payload: Vec<u8> },
-    ParasiticLanOwners { owners: Vec<ParasiticLanOwner> },
+    LanMembers { members: Vec<LanMemberPeer> },
 }
 
 pub async fn write_frame(stream: &mut TcpStream, req: &IpcRequest) -> Result<()> {
@@ -157,16 +152,14 @@ impl IpcClient {
 
     pub async fn create_network(
         &self,
-        name: String,
         listen_port: u16,
-        owner_vip: String,
+        virtual_ip: String,
         subnet_prefix: u8,
     ) -> Result<()> {
         match self
             .call(IpcRequest::CreateNetwork {
-                name,
                 listen_port,
-                owner_vip,
+                virtual_ip,
                 subnet_prefix,
             })
             .await?
@@ -180,39 +173,16 @@ impl IpcClient {
         }
     }
 
-    pub async fn join_parasitic(
-        &self,
-        peer_vip: String,
-        self_vip: String,
-        upnp_port: Option<u16>,
-    ) -> Result<()> {
-        match self
-            .call(IpcRequest::JoinParasitic {
-                peer_vip,
-                self_vip,
-                upnp_port,
-            })
-            .await?
-        {
-            IpcResponse::Ok { lines } => {
-                crate::cli_emit::render_lines_to_user_terminal(&lines).await;
-                Ok(())
-            }
+    pub async fn discover_lan_members(&self) -> Result<Vec<LanMemberPeer>> {
+        match self.call(IpcRequest::DiscoverLanMembers).await? {
+            IpcResponse::LanMembers { members } => Ok(members),
             IpcResponse::Err { message } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected ipc response: {other:?}")),
         }
     }
 
-    pub async fn discover_parasitic_lan(&self) -> Result<Vec<ParasiticLanOwner>> {
-        match self.call(IpcRequest::DiscoverParasiticLan).await? {
-            IpcResponse::ParasiticLanOwners { owners } => Ok(owners),
-            IpcResponse::Err { message } => Err(anyhow!(message)),
-            other => Err(anyhow!("unexpected ipc response: {other:?}")),
-        }
-    }
-
-    pub async fn join_parasitic_lan(&self, target: String) -> Result<()> {
-        match self.call(IpcRequest::JoinParasiticLan { target }).await? {
+    pub async fn assist_lan_member(&self, target: String) -> Result<()> {
+        match self.call(IpcRequest::AssistLanMember { target }).await? {
             IpcResponse::Ok { lines } => {
                 crate::cli_emit::render_lines_to_user_terminal(&lines).await;
                 Ok(())
@@ -244,9 +214,18 @@ impl IpcClient {
         }
     }
 
-    pub async fn join_invite(&self, invite: String, lan_mode: Option<bool>) -> Result<()> {
+    pub async fn join_invite(
+        &self,
+        invite: String,
+        lan_mode: Option<bool>,
+        endpoint: String,
+    ) -> Result<()> {
         match self
-            .call(IpcRequest::JoinInvite { invite, lan_mode })
+            .call(IpcRequest::JoinInvite {
+                invite,
+                lan_mode,
+                endpoint,
+            })
             .await?
         {
             IpcResponse::Ok { lines } => {
@@ -331,24 +310,17 @@ pub fn is_transient_para_ui_line(line: &str) -> bool {
     crate::banner::is_banner_art_line(line)
         || line.contains("[TRACKER]")
         || line.contains("Tracker discovery active")
-        || line.contains("[PARA-BURST")
-        || line.contains("[PARA-NARROW]")
-        || line.contains("[PARA-WIDE]")
-        || line.contains("[PARA-PASSIVE-")
         || line.contains("Auto-reconnect: signaling")
         || line.contains("Auto-reconnect failed")
         || line.contains("Auto-reconnect timeout")
         || (line.contains("Attempt:") && line.contains("Sent:") && !line.contains("Finished"))
         || line.contains("Finished (stopped early")
-        // Owner join confirm is one-shot; older daemons may still have it in the replay ring.
-        || line.contains("Owner confirmed peer join")
         // Daemon bootstrap one-shots: show on first VPN start, never on CLI re-attach replay.
         || line.contains("Restored Wintun adapter")
-        || line.contains("Passive listener armed")
         // Session-open home is delivered once via TakeSessionHome; strip leftover ring lines.
-        || line.contains("Server profile loaded")
-        || (line.contains("Try again later?") && line.contains("Your home is"))
-        || (line.contains("Network:") && line.contains("VIP:") && line.contains("Role:"))
+        || line.contains("Unit profile loaded")
+        || line.contains("Try again later?")
+        || (line.contains("Network:") && line.contains("VIP:"))
 }
 
 /// Full-screen clear from an old session-open ceremony — never replay on CLI re-attach.
@@ -496,9 +468,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn owner_confirmed_peer_join_is_transient_for_replay() {
-        let line = "  [JOIN] Owner confirmed peer join: node=abc vip=10.66.0.2 from=1.2.3.4:51820";
-        assert!(is_transient_para_ui_line(line));
+    fn peer_join_confirm_is_not_special_cased_as_transient() {
         assert!(!is_transient_para_ui_line(
             "  [JOIN] MPJA received. Join handshake confirmed."
         ));
@@ -507,10 +477,11 @@ mod tests {
     #[test]
     fn session_home_ceremony_lines_are_transient_for_replay() {
         assert!(is_transient_para_ui_line(
-            "  [CONFIG] Server profile loaded! Your home is: 'Mint'"
+            "  [CONFIG] Unit profile loaded!"
         ));
+        assert!(is_transient_para_ui_line("  Try again later?"));
         assert!(is_transient_para_ui_line(
-            "  Network: netid  VIP: 10.66.0.1  Role: owner"
+            "  Network: netid  VIP: 10.66.0.1"
         ));
         assert!(is_replay_only_skip_line(crate::ui_events::MARK_CLEAR));
     }
@@ -519,9 +490,6 @@ mod tests {
     fn daemon_bootstrap_one_shots_are_transient_for_replay() {
         assert!(is_transient_para_ui_line(
             "[i] Restored Wintun adapter for 22.136.40.1/24"
-        ));
-        assert!(is_transient_para_ui_line(
-            "  [PARA] Passive listener armed (owner mode)."
         ));
         // Unrelated [i] / [PARA] lines must still pass through.
         assert!(!is_transient_para_ui_line("[i] Screen autoclear: on"));

@@ -26,7 +26,6 @@ pub const JOIN_OVERLAY_RANDOM_PPS: u32 = 64;
 pub const JOIN_OVERLAY_RANDOM_MAX_SECS: u64 = 10;
 pub const JOIN_OVERLAY_INVITE_PRE_WIDTH: usize = 256;
 const SYMMETRIC_SCAN_WIDTH: usize = 128;
-const SYMMETRIC_SCAN_WIDTH_OWNER_HINT: usize = 256;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DECENTRALIZED_RESOLVE_TIMEOUT: Duration = RESOLVE_TIMEOUT;
 const PORT_MIN: u16 = 1;
@@ -62,7 +61,6 @@ pub struct DecentralizedState {
     slots: Vec<TrackerSlot>,
     is_joiner: bool,
     join_body: Option<Vec<u8>>,
-    join_owner_hint: Option<SocketAddr>,
     pending: HashMap<[u8; 4], PendingOp>,
     connections: HashMap<SocketAddr, TrackerConn>,
     discovered: HashMap<SocketAddr, Instant>,
@@ -192,7 +190,6 @@ impl DecentralizedState {
         announce_secs: u64,
         is_joiner: bool,
         join_body: Option<Vec<u8>>,
-        join_owner_hint: Option<SocketAddr>,
         listen_port: u16,
     ) {
         let announce_secs = announce_secs.max(60);
@@ -208,7 +205,6 @@ impl DecentralizedState {
             .collect();
         self.is_joiner = is_joiner;
         self.join_body = join_body;
-        self.join_owner_hint = join_owner_hint;
         self.pending.clear();
         self.connections.clear();
         self.discovered.clear();
@@ -244,10 +240,6 @@ impl DecentralizedState {
 
     pub fn discovered_endpoints(&self) -> Vec<SocketAddr> {
         self.discovered.keys().copied().collect()
-    }
-
-    pub fn join_owner_hint(&self) -> Option<SocketAddr> {
-        self.join_owner_hint
     }
 
     pub fn join_punch_base_targets(
@@ -439,18 +431,12 @@ impl DecentralizedState {
         let mut entries: Vec<(SocketAddr, Instant)> =
             self.discovered.iter().map(|(e, t)| (*e, *t)).collect();
         entries.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
-        let mut targets: Vec<SocketAddr> = entries
+        entries
             .into_iter()
             .map(|(e, _)| e)
             .filter(|ep| self_public_ep.map(|s| s != *ep).unwrap_or(true))
             .take(MAX_PUNCH_TARGETS)
-            .collect();
-        if let Some(hint) = self.join_owner_hint {
-            if !targets.contains(&hint) {
-                targets.push(hint);
-            }
-        }
-        targets
+            .collect()
     }
 
     pub fn handle_datagram(&mut self, from: SocketAddr, data: &[u8]) -> DatagramHandleResult {
@@ -636,26 +622,17 @@ impl DecentralizedState {
 
         let targets = self.exact_targets(self_public_ep);
         if !targets.is_empty() {
-            out.punch_targets = expand_symmetric_targets(
-                &targets,
-                self.join_owner_hint,
-                MAX_EXPANDED_PUNCH_TARGETS,
-            );
+            out.punch_targets = expand_symmetric_targets(&targets, MAX_EXPANDED_PUNCH_TARGETS);
         }
 
         if self.is_joiner && join_pending {
             if let Some(body) = self.join_body.clone() {
                 let mut fan: Vec<SocketAddr> = Vec::with_capacity(MAX_FANOUT_MPJN_PER_TICK);
-                if let Some(hint) = self.join_owner_hint {
-                    fan.push(hint);
-                }
                 for ep in &targets {
                     if fan.len() >= MAX_FANOUT_MPJN_PER_TICK {
                         break;
                     }
-                    if !fan.contains(ep) {
-                        fan.push(*ep);
-                    }
+                    fan.push(*ep);
                 }
                 for ep in fan {
                     out.join_fanout.push((ep, body.clone()));
@@ -687,11 +664,7 @@ fn build_symmetric_punch_targets(ip: std::net::IpAddr, port: u16, width: usize) 
     out
 }
 
-fn expand_symmetric_targets(
-    base_targets: &[SocketAddr],
-    owner_hint: Option<SocketAddr>,
-    max_total: usize,
-) -> Vec<SocketAddr> {
+fn expand_symmetric_targets(base_targets: &[SocketAddr], max_total: usize) -> Vec<SocketAddr> {
     let mut dedup = HashSet::with_capacity(max_total.min(1024));
     let mut expanded = Vec::with_capacity(max_total.min(1024));
 
@@ -705,12 +678,7 @@ fn expand_symmetric_targets(
     }
 
     for ep in base_targets {
-        let width = if Some(*ep) == owner_hint {
-            SYMMETRIC_SCAN_WIDTH_OWNER_HINT
-        } else {
-            SYMMETRIC_SCAN_WIDTH
-        };
-        for cand in build_symmetric_punch_targets(ep.ip(), ep.port(), width) {
+        for cand in build_symmetric_punch_targets(ep.ip(), ep.port(), SYMMETRIC_SCAN_WIDTH) {
             if dedup.insert(cand) {
                 expanded.push(cand);
                 if expanded.len() >= max_total {
@@ -875,7 +843,6 @@ mod tests {
             vec!["udp://192.0.2.1:1337/announce".into()],
             60,
             false,
-            None,
             None,
             7878,
         );
@@ -1133,7 +1100,7 @@ mod tests {
             bases.push(SocketAddr::from((Ipv4Addr::new(i, 0, 0, 1), 4000)));
         }
         let cap = 512usize;
-        let expanded = expand_symmetric_targets(&bases, None, cap);
+        let expanded = expand_symmetric_targets(&bases, cap);
         for ep in &bases {
             assert!(
                 expanded.contains(ep),
@@ -1148,7 +1115,7 @@ mod tests {
         let urls: Vec<String> = (0..40)
             .map(|i| format!("udp://t{i}.example.com:1337/announce"))
             .collect();
-        d.start([0; 20], "node", urls, 180, false, None, None, 7878);
+        d.start([0; 20], "node", urls, 180, false, None, 7878);
         assert_eq!(d.slots.len(), MAX_ACTIVE_TRACKERS);
     }
 
@@ -1160,7 +1127,7 @@ mod tests {
         d.note_discovered(SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 5000)));
         let targets = d.exact_targets(None);
         d.note_discovered(SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 5001)));
-        let expanded = expand_symmetric_targets(&d.exact_targets(None), None, 512);
+        let expanded = expand_symmetric_targets(&d.exact_targets(None), 512);
         let new_ep = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 5001));
         assert!(targets.contains(&SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 5000))));
         assert!(expanded.contains(&new_ep));
@@ -1175,7 +1142,6 @@ mod tests {
             vec!["http://tracker.example.com:8080/announce".into()],
             60,
             true,
-            None,
             None,
             7878,
         );
@@ -1214,7 +1180,6 @@ mod tests {
             60,
             false,
             None,
-            None,
             7878,
         );
         let work = d.take_pending_http_announces(7878);
@@ -1244,7 +1209,6 @@ mod tests {
             ],
             60,
             false,
-            None,
             None,
             7878,
         );

@@ -8,19 +8,20 @@ use tokio::net::UdpSocket;
 
 use super::background_cc::{BackgroundCcConfig, BackgroundCcEngine, CcUpdateCounters};
 use super::pacing_defaults::{
-    PaceRateMode, APD_SOJOURN_MS_MAX, APD_SOJOURN_MS_MIN, APD_SOJOURN_TARGET_MAX_GAP_MS,
-    APD_TARGET_SOJOURN_MS_MAX, APD_TARGET_SOJOURN_MS_MIN, DEFAULT_APD_CONFIRM_TICKS,
-    DEFAULT_APD_COOLDOWN_MS, DEFAULT_APD_DRAIN_FREEZE_DRR, DEFAULT_APD_DRAIN_TICK_US,
-    DEFAULT_APD_ENABLED, DEFAULT_APD_HIGH_WM, DEFAULT_APD_LOW_WM, DEFAULT_APD_MAX_SOJOURN_MS,
-    DEFAULT_APD_REQUIRE_CC_HEADROOM, DEFAULT_APD_SOJOURN_ENABLED, DEFAULT_APD_SPINLOOP_BUDGET_MS,
-    DEFAULT_APD_TARGET_SOJOURN_MS, DEFAULT_DRAIN_MAX_BURST, DEFAULT_DRR_SMALL_PACKET_PRIORITY,
-    DEFAULT_DRR_SMALL_PACKET_THRESHOLD_BYTES, DEFAULT_MAX_TICK_WORK_US,
-    DEFAULT_PACE_BUDGET_PACKETS, DEFAULT_PACE_BURST_PER_TICK, DEFAULT_PACE_MAX_QUEUE,
-    DEFAULT_PACE_TARGET_PPS, DEFAULT_PACE_TICK_US, DEFAULT_RAMP_MAX_BURST, DEFAULT_SHED_ENABLED,
-    DEFAULT_SHED_MAX_PER_TICK, DEFAULT_SHED_MAX_SOJOURN_MS, DEFAULT_SHED_MIN_FILL,
-    DRR_BULK_HOL_FORCE_MS, DRR_SMALL_BULK_FORCE_AFTER, DRR_SMALL_PACKET_THRESHOLD_MAX,
-    DRR_SMALL_PACKET_THRESHOLD_MIN, SHED_MAX_PER_TICK_MAX, SHED_MAX_PER_TICK_MIN, SHED_MIN_FILL_HI,
-    SHED_MIN_FILL_LO, SHED_SOJOURN_MS_MAX, SHED_SOJOURN_MS_MIN,
+    PaceRateMode, APD_LOW_WM_MAX, APD_LOW_WM_MIN, APD_SOJOURN_MS_MAX, APD_SOJOURN_MS_MIN,
+    APD_SOJOURN_TARGET_MAX_GAP_MS, APD_TARGET_SOJOURN_MS_MAX, APD_TARGET_SOJOURN_MS_MIN,
+    DEFAULT_APD_CONFIRM_TICKS, DEFAULT_APD_COOLDOWN_MS, DEFAULT_APD_DRAIN_FREEZE_DRR,
+    DEFAULT_APD_DRAIN_TICK_US, DEFAULT_APD_ENABLED, DEFAULT_APD_HIGH_WM, DEFAULT_APD_LOW_WM,
+    DEFAULT_APD_MAX_SOJOURN_MS, DEFAULT_APD_REQUIRE_CC_HEADROOM, DEFAULT_APD_SOJOURN_ENABLED,
+    DEFAULT_APD_SPINLOOP_BUDGET_MS, DEFAULT_APD_TARGET_SOJOURN_MS, DEFAULT_DRAIN_MAX_BURST,
+    DEFAULT_DRR_SMALL_PACKET_PRIORITY, DEFAULT_DRR_SMALL_PACKET_THRESHOLD_BYTES,
+    DEFAULT_MAX_TICK_WORK_US, DEFAULT_PACE_BUDGET_PACKETS, DEFAULT_PACE_BURST_PER_TICK,
+    DEFAULT_PACE_MAX_QUEUE, DEFAULT_PACE_TARGET_PPS, DEFAULT_PACE_TICK_US, DEFAULT_RAMP_MAX_BURST,
+    DEFAULT_SHED_ENABLED, DEFAULT_SHED_MAX_PER_TICK, DEFAULT_SHED_MAX_SOJOURN_MS,
+    DEFAULT_SHED_MIN_FILL, DRR_BULK_HOL_FORCE_MS, DRR_SMALL_BULK_FORCE_AFTER,
+    DRR_SMALL_PACKET_THRESHOLD_MAX, DRR_SMALL_PACKET_THRESHOLD_MIN, SHED_MAX_PER_TICK_MAX,
+    SHED_MAX_PER_TICK_MIN, SHED_MIN_FILL_HI, SHED_MIN_FILL_LO, SHED_SOJOURN_MS_MAX,
+    SHED_SOJOURN_MS_MIN,
 };
 
 // ── APD types ────────────────────────────────────────────────────────────────
@@ -89,7 +90,7 @@ impl Default for ApdConfig {
 impl ApdConfig {
     /// Enforce `high >= low` and `high >= low + gap` (or single cap when equal), then absolute bounds.
     pub fn enforce_watermark_pair(low_wm: f32, high_wm: f32) -> (f32, f32) {
-        let low = low_wm.clamp(0.10, 0.80);
+        let low = low_wm.clamp(APD_LOW_WM_MIN, APD_LOW_WM_MAX);
         let high = high_wm;
         if (high - low).abs() < APD_WM_EPS {
             let cap = low.clamp(0.20, 0.95);
@@ -102,9 +103,12 @@ impl ApdConfig {
 
     /// Clamp to documented user ranges (APD plan §7.1) before `sanitize()`.
     pub fn clamp_to_user_ranges(&mut self, base_tick_us: u64, base_burst_per_tick: u64) {
-        self.low_watermark = self.low_watermark.clamp(0.10, 0.80);
+        self.low_watermark = self.low_watermark.clamp(APD_LOW_WM_MIN, APD_LOW_WM_MAX);
         if apd_is_cap_mode(*self) {
-            let cap = self.low_watermark.clamp(0.20, 0.95).clamp(0.10, 0.80);
+            let cap = self
+                .low_watermark
+                .clamp(0.20, 0.95)
+                .clamp(APD_LOW_WM_MIN, APD_LOW_WM_MAX);
             self.low_watermark = cap;
             self.high_watermark = cap;
         } else {
@@ -2436,14 +2440,14 @@ mod tests {
         let net = NetworkConfig::default();
         let apd = super::apd_config_from_network(&net);
         assert!(apd.enabled);
-        assert!((apd.high_watermark - 0.4).abs() < f32::EPSILON);
-        assert!((apd.low_watermark - 0.1).abs() < f32::EPSILON);
+        assert!((apd.high_watermark - 0.3).abs() < f32::EPSILON);
+        assert!((apd.low_watermark - 0.02).abs() < f32::EPSILON);
         assert_eq!(apd.ramp_max_burst, 6);
         assert_eq!(apd.drain_max_burst, 3);
-        assert_eq!(apd.drain_tick_us, 100);
-        assert_eq!(apd.confirm_ticks, 4);
+        assert_eq!(apd.drain_tick_us, 80);
+        assert_eq!(apd.confirm_ticks, 3);
         assert_eq!(apd.cooldown_ms, 2);
-        assert_eq!(apd.spinloop_budget_ms, 3);
+        assert_eq!(apd.spinloop_budget_ms, 8);
         assert!(apd.sojourn_enabled);
         assert!((apd.max_sojourn_ms - 10.0).abs() < f32::EPSILON);
         assert!((apd.target_sojourn_ms - 2.0).abs() < f32::EPSILON);
@@ -2463,10 +2467,10 @@ mod tests {
     #[test]
     fn apd_clamp_to_user_ranges_watermark_bounds() {
         let mut apd = ApdConfig::default();
-        apd.low_watermark = 0.05;
+        apd.low_watermark = 0.001;
         apd.high_watermark = 0.15;
         apd.clamp_to_user_ranges(500, 12);
-        assert!((apd.low_watermark - 0.10).abs() < f32::EPSILON);
+        assert!((apd.low_watermark - APD_LOW_WM_MIN).abs() < f32::EPSILON);
         assert!((apd.high_watermark - 0.20).abs() < f32::EPSILON);
         apd.low_watermark = 0.9;
         apd.high_watermark = 0.99;

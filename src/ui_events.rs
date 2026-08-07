@@ -104,9 +104,7 @@ mod tests {
     fn emit_plain_live_omitted_from_replay_ring() {
         let ui = UiEventBus::new();
         ui.emit_plain("persisted line".to_string());
-        ui.emit_plain_live(
-            "  [JOIN] Owner confirmed peer join: node=n vip=10.0.0.2 from=1.2.3.4:5".to_string(),
-        );
+        ui.emit_plain_live("  [JOIN] MPJA received. Join handshake confirmed.".to_string());
         let replay = ui.replay(100);
         assert_eq!(replay, vec!["persisted line".to_string()]);
     }

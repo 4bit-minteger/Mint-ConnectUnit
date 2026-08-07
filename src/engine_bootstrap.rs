@@ -14,15 +14,14 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{ConfigManager, IPPool, PeerInfo};
+use crate::config::ConfigManager;
 use crate::metrics::EngineMetrics;
 use crate::net::engine::{EngineCmd, P2PEngine, RosterChange};
 use crate::net::pacing::PacingConfig;
 use crate::net::pacing_defaults as pace_def;
-use crate::net::pmtud_probe::bind_pmtud_probe_socket;
 use crate::netinfo;
 use crate::peer_cache::{load_peer_cache, remember_endpoint, save_peer_cache, PeerCache};
-use crate::routing::{owner_vip, owner_vip_with_prefix, RoutingTable};
+use crate::routing::RoutingTable;
 use crate::runtime_trace::RuntimeTrace;
 use crate::ui_events::{UiEventBus, UiSink};
 
@@ -32,6 +31,13 @@ pub struct EndpointLearned {
     pub endpoint: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct IdentityChanged {
+    pub old_vip: String,
+    pub new_vip: String,
+    pub vip_epoch: u64,
+}
+
 pub struct EngineRuntime {
     pub config: Arc<ConfigManager>,
     pub routing: Arc<RwLock<RoutingTable>>,
@@ -39,7 +45,7 @@ pub struct EngineRuntime {
     pub tun_from_tun_tx: mpsc::Sender<Bytes>,
     pub tun_inject_rx: broadcast::Receiver<Bytes>,
     pub peer_cache_reset_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
-    pub owner_vip_pool: Option<Arc<parking_lot::Mutex<IPPool>>>,
+    pub identity_changed_rx: mpsc::UnboundedReceiver<IdentityChanged>,
     pub engine_metrics: Arc<EngineMetrics>,
     pub runtime_trace: Arc<RuntimeTrace>,
     pub engine: P2PEngine,
@@ -75,12 +81,11 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
     let routing = Arc::new(RwLock::new(RoutingTable::new()));
 
     let snap = config.snapshot();
-    if snap.role == "peer" {
+    if !snap.virtual_ip.is_empty() {
         let my_vip = snap.virtual_ip.clone();
-        let owner_vip = owner_vip_with_prefix(&my_vip, snap.subnet_prefix.clamp(8, 30));
         let mut rt = routing.write();
         for p in &snap.peers {
-            if p.virtual_ip.is_empty() || p.virtual_ip == my_vip || p.virtual_ip == owner_vip {
+            if p.virtual_ip.is_empty() || p.virtual_ip == my_vip {
                 continue;
             }
             if let Ok(ep) = p.real_ip.parse::<SocketAddr>() {
@@ -106,7 +111,6 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
             }
         }
     }
-    sync_owner_endpoint_cache_from_peer_cache(&config, &peer_cache);
     let ui = UiEventBus::new();
     let (endpoint_tx, peer_cache_reset_tx) = start_endpoint_cache_worker(
         cache_path.clone(),
@@ -114,6 +118,7 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
         peer_cache.clone(),
         ui.clone(),
     );
+    let (identity_tx, identity_changed_rx) = mpsc::unbounded_channel::<IdentityChanged>();
 
     let tun_from_adapter_cap =
         pace_def::effective_tun_from_adapter_queue_packets(snap.tun_from_adapter_queue_packets);
@@ -134,7 +139,6 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
     let engine_metrics = Arc::new(EngineMetrics::new());
     let runtime_trace = Arc::new(RuntimeTrace::new());
     let subnet_prefix = config.snapshot().subnet_prefix.clamp(8, 30);
-    let pmtud_probe_socket = bind_pmtud_probe_socket()?;
     let cfg = config.snapshot();
     let pace_clock_apply =
         crate::net::pace_clock::PaceClockApply::from_network_config(cfg.as_ref());
@@ -177,12 +181,10 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
     };
     let mut engine = P2PEngine::new(
         socket,
-        pmtud_probe_socket,
         routing.clone(),
         tun_from_tun_rx,
         tun_inject_tx,
         cmd_rx,
-        config.get_role() == "owner",
         vip,
         node_id,
         subnet_prefix,
@@ -199,52 +201,6 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
     engine.apply_advanced_tuning(crate::advanced_tuning::AdvancedTuning::from_network_config(
         cfg.as_ref(),
     ));
-    let mut owner_vip_pool: Option<Arc<parking_lot::Mutex<IPPool>>> = None;
-    if config.get_role() == "owner" {
-        let pool = Arc::new(parking_lot::Mutex::new(IPPool::new(&vip.to_string())));
-        owner_vip_pool = Some(pool.clone());
-        for used in config.used_virtual_ips() {
-            if used != vip.to_string() {
-                pool.lock().mark_used(&used);
-            }
-        }
-        for p in config.snapshot().peers.iter() {
-            if !p.node_id.is_empty() && !p.virtual_ip.is_empty() {
-                pool.lock().ensure_allocated(&p.node_id, &p.virtual_ip);
-            }
-        }
-        let join_pool = pool.clone();
-        let join_cfg = config.clone();
-        let join_rt = routing.clone();
-        engine.set_join_handler(Arc::new(move |node_id, from| {
-            let endpoint = from.to_string();
-            let removed = join_cfg.remove_peers_by_endpoint(&endpoint, &node_id);
-            for p in removed {
-                if !p.virtual_ip.is_empty() {
-                    join_rt.write().remove(&p.virtual_ip);
-                    join_pool.lock().release(&p.virtual_ip);
-                }
-            }
-            if let Some(existing) = join_cfg.find_peer_by_node_id(&node_id) {
-                return Some(existing.virtual_ip);
-            }
-            let assigned = join_pool.lock().allocate(&node_id);
-            if let Some(ref vip) = assigned {
-                join_cfg.add_peer(PeerInfo {
-                    node_id: node_id.clone(),
-                    name: node_id.clone(),
-                    virtual_ip: vip.clone(),
-                    real_ip: endpoint,
-                });
-            }
-            assigned
-        }));
-        let leave_cfg = config.clone();
-        engine.set_leave_handler(Arc::new(move |vip| {
-            pool.lock().release(&vip);
-            leave_cfg.remove_peer_by_vip(&vip);
-        }));
-    }
     {
         let endpoint_tx = endpoint_tx.clone();
         engine.set_endpoint_learned_handler(Arc::new(move |vip, ep| {
@@ -254,11 +210,26 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
             });
         }));
     }
-    if config.get_role() == "peer" {
+    {
         let roster_cfg = config.clone();
         engine.set_roster_changed_handler(Arc::new(move |change| match change {
-            RosterChange::Upsert(peer) => roster_cfg.upsert_joiner_roster_peer(peer),
-            RosterChange::Remove(vip) => roster_cfg.remove_joiner_roster_vip(&vip),
+            RosterChange::Upsert(peer) => roster_cfg.upsert_member_roster_peer(peer),
+            RosterChange::Remove(vip) => roster_cfg.remove_member_roster_vip(&vip),
+        }));
+    }
+    {
+        let identity_cfg = config.clone();
+        let identity_tx = identity_tx;
+        engine.set_identity_changed_handler(Arc::new(move |old_vip, new_vip, vip_epoch| {
+            identity_cfg.update(|cfg| {
+                cfg.virtual_ip = new_vip.clone();
+                cfg.vip_epoch = vip_epoch;
+            });
+            let _ = identity_tx.send(IdentityChanged {
+                old_vip,
+                new_vip,
+                vip_epoch,
+            });
         }));
     }
 
@@ -269,7 +240,7 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
         tun_from_tun_tx,
         tun_inject_rx,
         peer_cache_reset_tx,
-        owner_vip_pool,
+        identity_changed_rx,
         engine_metrics,
         runtime_trace,
         engine,
@@ -280,7 +251,7 @@ pub async fn build_engine_runtime(config: Arc<ConfigManager>) -> Result<EngineRu
 
 pub fn start_endpoint_cache_worker(
     cache_path: PathBuf,
-    config: Arc<ConfigManager>,
+    _config: Arc<ConfigManager>,
     initial_cache: PeerCache,
     ui: UiSink,
 ) -> (
@@ -310,7 +281,6 @@ pub fn start_endpoint_cache_worker(
                         let _ = std::fs::remove_file(&path_rm);
                     })
                     .await;
-                    sync_owner_endpoint_cache_from_peer_cache(&config, &cache);
                     let _ = done.send(());
                 }
                 msg = rx.recv() => {
@@ -323,7 +293,6 @@ pub fn start_endpoint_cache_worker(
                                 Ok(Err(e)) => ui.emit_stderr(format!("peer_cache save failed: {e}")),
                                 Err(e) => ui.emit_stderr(format!("peer_cache save task: {e}")),
                             }
-                            sync_owner_endpoint_cache_from_peer_cache(&config, &cache);
                         }
                         break;
                     };
@@ -339,7 +308,6 @@ pub fn start_endpoint_cache_worker(
                             Ok(Err(e)) => ui.emit_stderr(format!("peer_cache save failed: {e}")),
                             Err(e) => ui.emit_stderr(format!("peer_cache save task: {e}")),
                         }
-                        sync_owner_endpoint_cache_from_peer_cache(&config, &cache);
                         dirty = false;
                     }
                 }
@@ -347,27 +315,4 @@ pub fn start_endpoint_cache_worker(
         }
     });
     (tx, reset_tx)
-}
-
-pub fn sync_owner_endpoint_cache_from_peer_cache(config: &Arc<ConfigManager>, cache: &PeerCache) {
-    let snap = config.snapshot();
-    if snap.role != "peer" || snap.virtual_ip.is_empty() {
-        return;
-    }
-    let owner_vip_key = owner_vip(&snap.virtual_ip);
-    let endpoints: Vec<String> = cache
-        .by_vip
-        .get(&owner_vip_key)
-        .map(|v| v.iter().map(|c| c.endpoint.clone()).collect())
-        .unwrap_or_default();
-    config.update(|cfg| {
-        cfg.owner_endpoints_cache = endpoints.clone();
-        if cfg.owner_real_ip.is_empty() {
-            if let Some(first) = cfg.owner_endpoints_cache.first() {
-                if let Some((ip, _)) = first.rsplit_once(':') {
-                    cfg.owner_real_ip = ip.to_string();
-                }
-            }
-        }
-    });
 }

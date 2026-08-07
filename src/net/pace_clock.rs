@@ -429,11 +429,11 @@ mod tests {
     }
 
     #[test]
-    fn default_network_config_applies_spin_window_50() {
+    fn default_network_config_applies_spin_window_70() {
         let cfg = NetworkConfig::default();
-        assert_eq!(cfg.pace_spin_window_us, 50);
+        assert_eq!(cfg.pace_spin_window_us, 70);
         assert_eq!(cfg.pace_clock_mode, "hybrid");
-        assert_eq!(spin_window_from_config(&cfg, 250), 50);
+        assert_eq!(spin_window_from_config(&cfg, 250), 70);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::ipc::{self, IpcClient};
 /// Wait for daemon session-open UI (home block) before the input prompt.
 async fn wait_for_session_open(ipc: &IpcClient, session_ready: Arc<AtomicBool>) {
     const POLL_MS: u64 = 50;
-    const MAX_WAIT_MS: u64 = (crate::bootstrap::PARA_AUTO_RECONNECT_DEADLINE_SECS + 15) * 1000;
+    const MAX_WAIT_MS: u64 = (crate::bootstrap::RECONNECT_DEADLINE_SECS + 15) * 1000;
     let deadline = Instant::now() + Duration::from_millis(MAX_WAIT_MS);
     while Instant::now() < deadline {
         if session_ready.load(Ordering::Acquire) {
@@ -172,6 +172,10 @@ async fn dispatch_line(ipc: &IpcClient, line: &str) -> Result<DispatchOutcome> {
             run_runtime_view(ipc).await?;
             Ok(DispatchOutcome::Continue)
         }
+        "lan" => {
+            run_lan_assist_wizard(ipc).await?;
+            Ok(DispatchOutcome::Continue)
+        }
         _ => {
             print_ipc_lines(ipc, line.to_string()).await?;
             Ok(DispatchOutcome::Continue)
@@ -188,16 +192,12 @@ async fn dispatch_first_run(ipc: &IpcClient, key: &str) -> Result<()> {
 }
 
 async fn run_create_wizard(ipc: &IpcClient) -> Result<()> {
-    println!("  Server name: ");
-    std::io::stdout().flush()?;
-    let mut name = String::new();
-    std::io::stdin().read_line(&mut name)?;
     println!("  Listen port (default 7878): ");
     std::io::stdout().flush()?;
     let mut port_s = String::new();
     std::io::stdin().read_line(&mut port_s)?;
     let port = port_s.trim().parse::<u16>().unwrap_or(7878);
-    println!("  Owner VIP (blank = auto): ");
+    println!("  VIP (blank = auto): ");
     std::io::stdout().flush()?;
     let mut vip = String::new();
     std::io::stdin().read_line(&mut vip)?;
@@ -206,29 +206,20 @@ async fn run_create_wizard(ipc: &IpcClient) -> Result<()> {
     let mut prefix_s = String::new();
     std::io::stdin().read_line(&mut prefix_s)?;
     let prefix = prefix_s.trim().parse::<u8>().unwrap_or(24);
-    ipc.create_network(
-        name.trim().to_string(),
-        port,
-        vip.trim().to_string(),
-        prefix,
-    )
-    .await
+    ipc.create_network(port, vip.trim().to_string(), prefix)
+        .await
 }
 
 async fn run_join_entry_wizard(ipc: &IpcClient) -> Result<()> {
     println!("  Join mode:");
-    println!("    [1] Decentralized (default)");
-    println!("    [2] Parasitic");
-    println!("    [3] Manual");
-    print!("  Choose [1/2/3, default 1]: ");
+    println!("    [1] Decentralized");
+    println!("    [2] Manual");
+    print!("  Choose [1/2](1): ");
     std::io::stdout().flush()?;
     let mut mode = String::new();
     std::io::stdin().read_line(&mut mode)?;
     let t = mode.trim();
     if t == "2" {
-        return run_join_parasitic_wizard(ipc).await;
-    }
-    if t == "3" {
         println!("  Invite code: ");
         std::io::stdout().flush()?;
         let mut invite = String::new();
@@ -250,98 +241,48 @@ async fn run_join_entry_wizard(ipc: &IpcClient) -> Result<()> {
     ipc.join_decentralized(invite).await
 }
 
-async fn run_join_parasitic_wizard(ipc: &IpcClient) -> Result<()> {
-    println!("  Parasitic mode:");
-    println!("    [1] Public (VIP signaling, default)");
-    println!("    [2] LAN (UDP broadcast discover)");
-    print!("  Choose [1/2, default 1]: ");
-    std::io::stdout().flush()?;
-    let mut mode = String::new();
-    std::io::stdin().read_line(&mut mode)?;
-    if mode.trim() == "2" {
-        return run_join_parasitic_lan_wizard(ipc).await;
-    }
-    println!("  Use any pre-existing VPN/route as a signaling pipe.");
-    println!("  Both sides must reach each other on UDP at the VIP/port below.");
-    println!("  Peer VIP (ip or ip:port): ");
-    std::io::stdout().flush()?;
-    let mut peer = String::new();
-    std::io::stdin().read_line(&mut peer)?;
-    println!("  Your VIP (ip or ip:port): ");
-    std::io::stdout().flush()?;
-    let mut self_vip = String::new();
-    std::io::stdin().read_line(&mut self_vip)?;
-    println!("  UPnP port (Enter=default listen port): ");
-    std::io::stdout().flush()?;
-    let mut port_s = String::new();
-    std::io::stdin().read_line(&mut port_s)?;
-    let upnp_port = port_s.trim().parse::<u16>().ok();
-    ipc.join_parasitic(
-        peer.trim().to_string(),
-        self_vip.trim().to_string(),
-        upnp_port,
-    )
-    .await
-}
-
-async fn run_join_parasitic_lan_wizard(ipc: &IpcClient) -> Result<()> {
-    println!("  Discovering Mint owners on LAN…");
-    let owners = ipc.discover_parasitic_lan().await?;
-    let target = if owners.is_empty() {
-        println!("  No owners replied. AP client isolation may block UDP broadcast.");
-        println!("  Owner listen port defaults to 7878 (non-default needs ip:port fallback).");
-        print!("  Owner ip:port (or empty to abort): ");
+async fn run_lan_assist_wizard(ipc: &IpcClient) -> Result<()> {
+    println!("  Discovering FloatUnit members on LAN…");
+    let members = ipc.discover_lan_members().await?;
+    let target = if members.is_empty() {
+        println!("  No members replied. AP client isolation may block UDP broadcast.");
+        println!("  Member listen port defaults to 7878 (non-default needs ip:port).");
+        print!("  Member ip:port (or empty to abort): ");
         std::io::stdout().flush()?;
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         let t = line.trim().to_string();
         if t.is_empty() {
-            anyhow::bail!("LAN discover found no owners and no fallback target");
+            anyhow::bail!("LAN discover found no members and no fallback target");
         }
         t
-    } else if owners.len() == 1 {
+    } else if members.len() == 1 {
         println!(
-            "  Found owner: {} ({}) at {}",
-            if owners[0].network_name.is_empty() {
-                "(unnamed)"
-            } else {
-                owners[0].network_name.as_str()
-            },
-            &owners[0].network_id.chars().take(12).collect::<String>(),
-            owners[0].from
+            "  Found member: {}… at {}",
+            &members[0].network_id.chars().take(12).collect::<String>(),
+            members[0].from
         );
-        owners[0].from.clone()
+        members[0].from.clone()
     } else {
-        println!("  Multiple Mint owners on LAN:");
-        for (i, o) in owners.iter().enumerate() {
-            let name = if o.network_name.is_empty() {
-                "(unnamed)"
-            } else {
-                o.network_name.as_str()
-            };
-            let short_id: String = o.network_id.chars().take(12).collect();
-            println!(
-                "    [{}] {}  id={}…  from={}",
-                i + 1,
-                name,
-                short_id,
-                o.from
-            );
+        println!("  Multiple FloatUnit members on LAN:");
+        for (i, m) in members.iter().enumerate() {
+            let short_id: String = m.network_id.chars().take(12).collect();
+            println!("    [{}]  id={}…  from={}", i + 1, short_id, m.from);
         }
-        print!("  Choose owner [1-{}]: ", owners.len());
+        print!("  Choose member [1-{}]: ", members.len());
         std::io::stdout().flush()?;
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         let idx: usize = line
             .trim()
             .parse()
-            .map_err(|_| anyhow::anyhow!("invalid owner selection"))?;
-        if idx == 0 || idx > owners.len() {
-            anyhow::bail!("owner selection out of range");
+            .map_err(|_| anyhow::anyhow!("invalid member selection"))?;
+        if idx == 0 || idx > members.len() {
+            anyhow::bail!("member selection out of range");
         }
-        owners[idx - 1].from.clone()
+        members[idx - 1].from.clone()
     };
-    ipc.join_parasitic_lan(target).await
+    ipc.assist_lan_member(target).await
 }
 
 async fn run_runtime_view(ipc: &IpcClient) -> Result<()> {

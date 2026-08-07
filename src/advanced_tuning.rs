@@ -356,6 +356,10 @@ pub struct CongestionTuning {
     pub base_rtt_stale_windows: u8,
     /// Reject forward OWD sample (and reset base cold) when `|sample − base|` exceeds this (ms).
     pub owd_clock_jump_reject_ms: u64,
+    /// Reject when `|(2·owd − rtt) − residual_ewma|` exceeds this (ms). Peer clock step ≈ half.
+    pub owd_rtt_consistency_ms: u64,
+    /// Applied OWD samples after cold before preferring forward QD (`1` = trust immediately).
+    pub owd_prefer_after_samples: u8,
     /// Compact ping probe period for congestion telemetry (`0` = off). Independent of `keepalive_secs`.
     pub probe_interval_ms: u64,
     /// How long after last congestive delay sample FEC recovery step-down may fire (`0` = off).
@@ -395,6 +399,8 @@ impl Default for CongestionTuning {
             base_rtt_window_secs: 4,
             base_rtt_stale_windows: 3,
             owd_clock_jump_reject_ms: crate::routing::DEFAULT_OWD_CLOCK_JUMP_REJECT_MS,
+            owd_rtt_consistency_ms: crate::routing::DEFAULT_OWD_RTT_CONSISTENCY_MS,
+            owd_prefer_after_samples: crate::routing::DEFAULT_OWD_PREFER_AFTER_SAMPLES,
             probe_interval_ms: 40,
             fec_recovery_recency_ms: 1_200,
             enabled: true,
@@ -488,7 +494,7 @@ impl Default for PmtudTuning {
         Self {
             probe_timeout_ms: 500,
             confirm_count: 3,
-            resolve_epsilon: 8,
+            resolve_epsilon: 4,
             raise_step: 32,
             max_probes_per_search: 64,
             max_concurrent_peers: 4,
@@ -596,6 +602,10 @@ impl AdvancedTuning {
             .congestion
             .owd_clock_jump_reject_ms
             .clamp(1_000, 600_000);
+        self.congestion.owd_rtt_consistency_ms =
+            self.congestion.owd_rtt_consistency_ms.clamp(500, 120_000);
+        self.congestion.owd_prefer_after_samples =
+            self.congestion.owd_prefer_after_samples.clamp(1, 64);
         if self.congestion.probe_interval_ms != 0 {
             self.congestion.probe_interval_ms = self.congestion.probe_interval_ms.clamp(20, 1000);
         }
@@ -669,7 +679,7 @@ mod tests {
 
         assert_eq!(d.pmtud.probe_timeout_ms, 500);
         assert_eq!(d.pmtud.confirm_count, 3);
-        assert_eq!(d.pmtud.resolve_epsilon, 8);
+        assert_eq!(d.pmtud.resolve_epsilon, 4);
         assert_eq!(d.pmtud.raise_step, 32);
         assert_eq!(d.pmtud.max_probes_per_search, 64);
         assert_eq!(d.pmtud.max_concurrent_peers, 4);
@@ -686,7 +696,7 @@ mod tests {
 
         assert!(d.congestion.rtt_base_tracking);
         assert!(d.congestion.loss_classifier_enabled);
-        assert_eq!(d.congestion.target_queue_delay_ms, 15);
+        assert_eq!(d.congestion.target_queue_delay_ms, 20);
         assert_eq!(d.congestion.congestion_loss_threshold, 0.7);
         assert_eq!(d.congestion.base_rtt_window_secs, 4);
         assert_eq!(d.congestion.base_rtt_stale_windows, 3);
@@ -694,19 +704,27 @@ mod tests {
             d.congestion.owd_clock_jump_reject_ms,
             crate::routing::DEFAULT_OWD_CLOCK_JUMP_REJECT_MS
         );
+        assert_eq!(
+            d.congestion.owd_rtt_consistency_ms,
+            crate::routing::DEFAULT_OWD_RTT_CONSISTENCY_MS
+        );
+        assert_eq!(
+            d.congestion.owd_prefer_after_samples,
+            crate::routing::DEFAULT_OWD_PREFER_AFTER_SAMPLES
+        );
         assert_eq!(d.congestion.probe_interval_ms, 40);
         assert_eq!(d.congestion.fec_recovery_recency_ms, 1_200);
         assert!(d.congestion.enabled);
         assert_eq!(d.congestion.gain, 0.1);
-        assert_eq!(d.congestion.hol_escape_ms, 12);
-        assert_eq!(d.congestion.initial_rate_bps, 2_000_000.0);
-        assert_eq!(d.congestion.additive_increase_bps, 28_000.0);
+        assert_eq!(d.congestion.hol_escape_ms, 8);
+        assert_eq!(d.congestion.initial_rate_bps, 4_000_000.0);
+        assert_eq!(d.congestion.additive_increase_bps, 32_000.0);
         assert_eq!(d.congestion.min_decrease_factor, 0.9);
         assert_eq!(d.congestion.rate_smoothing_alpha, 0.9);
         assert_eq!(d.congestion.loss_multiplicative_decrease, 0.9);
-        assert_eq!(d.congestion.min_rate_bps, 1_800_000.0);
+        assert_eq!(d.congestion.min_rate_bps, 1_500_000.0);
         assert_eq!(d.congestion.max_rate_bps, 25_000_000.0);
-        assert_eq!(d.congestion.burst_cap_bytes, 16_000);
+        assert_eq!(d.congestion.burst_cap_bytes, 24_000);
         assert_eq!(d.congestion.delivery_rate_window_ms, 750);
         assert_eq!(d.congestion.delivery_rate_ewma_alpha, 0.25);
         assert_eq!(d.congestion.delivery_anchor_factor, 0.95);
@@ -866,6 +884,8 @@ congestion_loss_threshold = 0.8
 base_rtt_window_secs = 20
 base_rtt_stale_windows = 5
 owd_clock_jump_reject_ms = 45000
+owd_rtt_consistency_ms = 8000
+owd_prefer_after_samples = 4
 delivery_rate_window_ms = 250
 delivery_rate_ewma_alpha = 0.4
 delivery_anchor_factor = 0.85
@@ -884,6 +904,8 @@ delivery_decouple_ratio = 1.5
         assert_eq!(t.congestion.target_queue_delay_ms, 150);
         assert_eq!(t.congestion.base_rtt_window_secs, 1);
         assert_eq!(t.congestion.owd_clock_jump_reject_ms, 45_000);
+        assert_eq!(t.congestion.owd_rtt_consistency_ms, 8_000);
+        assert_eq!(t.congestion.owd_prefer_after_samples, 4);
         assert_eq!(t.congestion.delivery_rate_window_ms, 250);
         assert_eq!(t.congestion.delivery_rate_ewma_alpha, 0.4);
         assert_eq!(t.congestion.delivery_anchor_factor, 0.85);

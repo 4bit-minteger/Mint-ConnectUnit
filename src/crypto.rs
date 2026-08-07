@@ -298,6 +298,22 @@ pub fn derive_network_id(key: &Key) -> String {
     hex::encode(&digest[..5])
 }
 
+const FLOATUNIT_SUBNET_INFO: &[u8] = b"floatunit-subnet-v1";
+
+/// Derive a stable RFC1918 `/24` prefix `10.H1.H2` from the FloatUnit network key.
+pub fn derive_floatunit_subnet24(key: &Key) -> [u8; 3] {
+    let hk = Hkdf::<Sha256>::new(None, &key.0);
+    let mut okm = [0u8; 2];
+    let _ = hk.expand(FLOATUNIT_SUBNET_INFO, &mut okm);
+    [10, okm[0], okm[1]]
+}
+
+/// First host address in the key-derived FloatUnit `/24` (for `pick_free_vip` base).
+pub fn floatunit_subnet_base_vip(key: &Key) -> String {
+    let p = derive_floatunit_subnet24(key);
+    format!("{}.{}.{}.1", p[0], p[1], p[2])
+}
+
 /// BEP15 info_hash / decentralized room id (first 20 bytes of SHA-256 over key || protocol).
 pub fn room_id_20b(key: &Key, protocol: u8) -> [u8; 20] {
     let mut hasher = Sha256::new();
@@ -319,44 +335,38 @@ pub fn room_id_hex(key: &Key, protocol: u8) -> String {
 
 pub const PROTO_UDP: u8 = 1;
 
-#[derive(Clone, Debug)]
+/// FloatUnit invite wire version (`version | protocol | key`).
+pub const INVITE_VERSION: u8 = 1;
+
+const INVITE_WIRE_LEN: usize = 34;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvitePayload {
-    pub mode: u8,
-    pub owner_ip: [u8; 4],
-    pub owner_port: u16,
-    pub key: [u8; 32],
+    pub version: u8,
     pub protocol: u8,
+    pub key: [u8; 32],
 }
 
 pub fn encode_invite(payload: &InvitePayload) -> String {
-    let mut raw = Vec::with_capacity(40);
-    raw.push(payload.mode);
-    raw.extend_from_slice(&payload.owner_ip);
-    raw.extend_from_slice(&payload.owner_port.to_be_bytes());
+    let mut raw = Vec::with_capacity(INVITE_WIRE_LEN);
+    raw.push(payload.version);
     raw.push(payload.protocol);
     raw.extend_from_slice(&payload.key);
-    let out = URL_SAFE_NO_PAD.encode(raw);
-    out
+    URL_SAFE_NO_PAD.encode(raw)
 }
 
 pub fn decode_invite(invite: &str) -> Result<InvitePayload> {
     let raw = URL_SAFE_NO_PAD.decode(invite)?;
-    if raw.len() != 40 {
+    if raw.len() != INVITE_WIRE_LEN || raw[0] != INVITE_VERSION {
         bail!("unsupported invite format");
     }
-    let mode = raw[0];
-    let mut ip = [0u8; 4];
-    ip.copy_from_slice(&raw[1..5]);
-    let owner_port = u16::from_be_bytes([raw[5], raw[6]]);
-    let protocol = raw[7];
+    let protocol = raw[1];
     let mut key = [0u8; 32];
-    key.copy_from_slice(&raw[8..40]);
+    key.copy_from_slice(&raw[2..34]);
     Ok(InvitePayload {
-        mode,
-        owner_ip: ip,
-        owner_port,
-        key,
+        version: INVITE_VERSION,
         protocol,
+        key,
     })
 }
 
@@ -517,28 +527,67 @@ mod tests {
     }
 
     #[test]
-    fn room_id_same_for_two_endpoint_encodings() {
+    fn room_id_from_invite_key_matches_helper() {
         let key = [9u8; 32];
-        let a = InvitePayload {
-            mode: 1,
-            owner_ip: [192, 168, 1, 1],
-            owner_port: 7878,
-            key,
+        let invite = InvitePayload {
+            version: INVITE_VERSION,
             protocol: PROTO_UDP,
-        };
-        let b = InvitePayload {
-            mode: 1,
-            owner_ip: [1, 2, 3, 4],
-            owner_port: 9999,
             key,
-            protocol: PROTO_UDP,
         };
         let k = Key(key);
         assert_eq!(
-            room_id_20b_from_raw_key(&a.key, a.protocol),
-            room_id_20b_from_raw_key(&b.key, b.protocol)
+            room_id_20b_from_raw_key(&invite.key, invite.protocol),
+            room_id_20b(&k, PROTO_UDP)
         );
         assert_eq!(room_id_hex(&k, PROTO_UDP).len(), 40);
+    }
+
+    #[test]
+    fn invite_roundtrip_key_only() {
+        let payload = InvitePayload {
+            version: INVITE_VERSION,
+            protocol: PROTO_UDP,
+            key: [0xab; 32],
+        };
+        let encoded = encode_invite(&payload);
+        let decoded = decode_invite(&encoded).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn invite_rejects_wrong_length() {
+        let mut raw = vec![INVITE_VERSION, PROTO_UDP];
+        raw.extend_from_slice(&[1u8; 32]);
+        assert_eq!(raw.len(), INVITE_WIRE_LEN);
+        let good = URL_SAFE_NO_PAD.encode(&raw);
+        assert!(decode_invite(&good).is_ok());
+
+        raw.push(0);
+        let too_long = URL_SAFE_NO_PAD.encode(&raw);
+        assert!(decode_invite(&too_long).is_err());
+
+        let too_short = URL_SAFE_NO_PAD.encode(&raw[..10]);
+        assert!(decode_invite(&too_short).is_err());
+
+        let mut bad_ver = vec![0u8, PROTO_UDP];
+        bad_ver.extend_from_slice(&[2u8; 32]);
+        let bad = URL_SAFE_NO_PAD.encode(&bad_ver);
+        assert!(decode_invite(&bad).is_err());
+    }
+
+    #[test]
+    fn derive_floatunit_subnet_is_stable() {
+        let key = Key([0xAB; KEY_LEN]);
+        let a = derive_floatunit_subnet24(&key);
+        let b = derive_floatunit_subnet24(&key);
+        assert_eq!(a, b);
+        assert_eq!(a[0], 10);
+        let other = Key([0xAC; KEY_LEN]);
+        // Distinct keys may collide rarely; base VIP string must remain valid form.
+        let base = floatunit_subnet_base_vip(&key);
+        assert!(base.starts_with("10."));
+        assert!(base.ends_with(".1"));
+        let _ = other;
     }
 
     #[test]

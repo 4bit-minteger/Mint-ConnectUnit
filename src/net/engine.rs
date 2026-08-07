@@ -24,12 +24,19 @@ use tokio::time::{interval, interval_at, Interval, MissedTickBehavior};
 use crate::bcast::BroadcastDeduplicator;
 use crate::config::PeerInfo;
 use crate::crypto::{
-    decode_wire_counter, derive_control_plane_material, derive_data_plane_material, now_epoch_ms,
-    AeadKey, ControlPlaneAead, ControlRateLimiter, CtrlReplayTable, DataPlaneAead,
-    DataReplayWindow, Key, DATA_TAG_LEN, WIRE_COUNTER_LEN,
+    decode_wire_counter, derive_control_plane_material, derive_data_plane_material,
+    floatunit_subnet_base_vip, now_epoch_ms, AeadKey, ControlPlaneAead, ControlRateLimiter,
+    CtrlReplayTable, DataPlaneAead, DataReplayWindow, Key, DATA_TAG_LEN, WIRE_COUNTER_LEN,
 };
 use crate::metrics::EngineMetrics;
 use crate::nat::{ice::IceCandidate, stun};
+use crate::net::claim_gossip::{
+    build_gossip_digest_rotated, claim_still_live, install_fight_suppress, install_leave_tombstone,
+    merge_claim, prune_fight_suppress, prune_leave_tombstones, remove_claim, remove_claims_for_vip,
+    rotate_endpoints, select_leave_tombs_for_gossip, settle_duplicate_vips,
+    should_reroll_for_vip_fight, ClaimRecord, FightSuppress, LeaveTombstone,
+    CLAIM_GOSSIP_DIGEST_MAX, CLAIM_GOSSIP_LEAVE_TOMBS_MAX, FIGHT_SUPPRESS_TTL, LEAVE_TOMBSTONE_TTL,
+};
 use crate::net::decentralized::{
     DecentralizedState, HttpAnnounceResult, TrackerDatagramEvent, DECENTRALIZED_RESOLVE_TIMEOUT,
 };
@@ -39,12 +46,6 @@ use crate::net::fec::{
 };
 use crate::net::fec_tx_worker::{
     start_fec_tx_worker, FecTxEvent, FecTxHandle, FecTxTuning, NormalOfferKind,
-};
-use crate::net::msyn_sync::{
-    build_msyn_delta_shards, build_msyn_full_shards, clear_pending_delivered, collect_removed_vips,
-    effective_msyn_json_budget, ingest_msyn_part, peer_owes_removals,
-    routes_from_snapshot_non_stale, should_advance_peer_sync_after_send, sweep_msyn_assemble,
-    MsynAssembleMap, MsynIngestOutcome, ShardError, MSYN_APPLY_MAX_REMOVED, MSYN_APPLY_MAX_ROUTES,
 };
 use crate::net::outbound_udp::OutboundUdpClock;
 use crate::net::pacing::PacingQueueSnapshot;
@@ -56,12 +57,11 @@ use crate::net::reliable::{ReliableChannel, SendResult};
 use crate::net::retransmit::RetransmitDirectSender;
 use crate::net::size_loss::{replay_gap, SizeLossTable};
 use crate::pmtud::{
-    is_rfc1918_private_ip, PathMtuDiscovery, PeerMtuSnapshot, PeerTickInput, SizeHealth,
-    MIN_ADAPTER_PAYLOAD_MTU,
+    PathMtuDiscovery, PeerMtuSnapshot, PeerTickInput, SizeHealth, MIN_ADAPTER_PAYLOAD_MTU,
 };
 use crate::routing::{
-    owner_vip_with_prefix, same_subnet, should_relay, should_relay_snap, PathKind, RelaySelection,
-    RouteState, RoutingTable,
+    same_subnet, should_relay, should_relay_snap, PathKind, RelaySelection, RouteState,
+    RoutingTable,
 };
 use crate::runtime_trace::RuntimeTrace;
 use crate::term_style;
@@ -74,16 +74,19 @@ const PEER_RECONNECT_UNBOUND_KEY: &str = "peer-reconnect:unbound";
 const PEER_RECONNECT_ANNOUNCE_BUDGET: usize = 8;
 const PEER_RECONNECT_MAX_DISTINCT_KEYS: usize = 4;
 const PEER_RECONNECT_COOLDOWN: Duration = Duration::from_secs(30);
-const RECONNECT_FASTPATH_COOLDOWN: Duration = Duration::from_secs(30);
 
 use crate::net::pace_clock::{self, PaceClockApply, PaceClockShared};
 
 #[derive(Debug, Clone)]
 pub struct JoinAck {
-    pub vip: String,
+    /// Acker peer VIP (route target), not an assigned VIP for the joiner.
+    pub peer_vip: String,
+    pub peer_node_id: String,
     pub subnet_prefix: u8,
-
-    pub owner_endpoint: SocketAddr,
+    pub peer_endpoint: SocketAddr,
+    /// Local VIP after any conflict resolution during handshake.
+    pub local_vip: String,
+    pub vip_epoch: u64,
 }
 
 fn try_deliver_join_ack(
@@ -106,11 +109,9 @@ enum ReliableDedupKey {
 pub enum EngineCmd {
     Shutdown,
     PingAll,
-    Kick(SocketAddr),
     PeerRouteRemoved {
         vip: String,
     },
-    SetOwnerEndpoint(SocketAddr, Option<oneshot::Sender<()>>),
     SetCryptoKey(Key, Option<oneshot::Sender<()>>),
     AddCryptoKey(Key),
     BindPeerKey {
@@ -121,11 +122,12 @@ pub enum EngineCmd {
     PrepareJoin {
         join_tx: oneshot::Sender<Option<JoinAck>>,
         key: Key,
-        owner: SocketAddr,
+        /// Direct join target when known (manual join). Decentralized join may omit and rely on tracker fan-out.
+        target: Option<SocketAddr>,
         body: Vec<u8>,
     },
     SendJoin {
-        owner: SocketAddr,
+        target: SocketAddr,
         body: Vec<u8>,
     },
     ManualPunch {
@@ -149,10 +151,10 @@ pub enum EngineCmd {
         key: String,
     },
     SetIdentity {
-        is_owner: bool,
         my_vip: String,
         my_node_id: String,
         subnet_prefix: u8,
+        vip_epoch: u64,
         reply: Option<oneshot::Sender<()>>,
     },
     SetSocketBuffers {
@@ -193,8 +195,13 @@ pub enum EngineCmd {
         payload: serde_json::Value,
     },
     SetMembershipVersion(u64),
-    BroadcastMsmd(serde_json::Value),
-    TriggerMembershipBroadcast,
+    BroadcastLeave {
+        node_id: String,
+        vip: String,
+        vip_epoch: u64,
+        event_id: String,
+    },
+    TriggerClaimGossip,
     QueryPublicEndpoint {
         timeout: Duration,
         force_refresh: bool,
@@ -210,9 +217,6 @@ pub enum EngineCmd {
         dest: SocketAddr,
         timeout_ms: u64,
         reply: oneshot::Sender<i64>,
-    },
-    QueryOwnerSendEndpoint {
-        reply: oneshot::Sender<Option<SocketAddr>>,
     },
     ParaSendHello {
         target_vip: SocketAddr,
@@ -255,13 +259,15 @@ pub enum EngineCmd {
         announce_secs: u64,
         is_joiner: bool,
         join_body: Option<Vec<u8>>,
-        join_owner_hint: Option<SocketAddr>,
         node_id: String,
     },
     StopDecentralized,
     CancelJoinWait,
     TakePendingJoinAck {
         reply: oneshot::Sender<Option<JoinAck>>,
+    },
+    QueryDiscoveredCount {
+        reply: oneshot::Sender<usize>,
     },
     /// Full in-process session wipe (routing, crypto, punch, decentralized).
     /// Used by CLI `remove` so a later create/join on the same daemon is clean.
@@ -296,28 +302,22 @@ pub enum ParaSignal {
         from: SocketAddr,
         public_ip: String,
         public_port: u16,
-        proposed_key: String,
-        proposed_vip_subnet: String,
+        network_id: String,
         node_id: String,
         candidates: Vec<ParaCandidate>,
         start_at_ms: u64,
         session_id: String,
-        discover_only: bool,
     },
     ReplyReceived {
         from: SocketAddr,
         public_ip: String,
         public_port: u16,
-        assigned_vip: String,
         network_id: String,
         node_id: String,
         candidates: Vec<ParaCandidate>,
         agreed_start_at_ms: u64,
         session_id: String,
         responder_vip: String,
-        responder_is_owner: bool,
-        network_name: String,
-        network_key_hex: String,
     },
     OkReceived {
         from: SocketAddr,
@@ -331,7 +331,6 @@ pub enum ParaSignal {
     },
 }
 
-type JoinHandler = Arc<dyn Fn(String, SocketAddr) -> Option<String> + Send + Sync>;
 type LeaveHandler = Arc<dyn Fn(String) + Send + Sync>;
 type EndpointLearnedHandler = Arc<dyn Fn(String, SocketAddr) + Send + Sync>;
 
@@ -343,31 +342,30 @@ pub enum RosterChange {
 
 type RosterChangedHandler = Arc<dyn Fn(RosterChange) + Send + Sync>;
 
+/// old_vip, new_vip, vip_epoch
+pub type IdentityChangedHandler = Arc<dyn Fn(String, String, u64) + Send + Sync>;
+
+const VIP_REROLL_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
 pub struct EngineState {
     pub crypto_keys: CryptoPool,
     pub data_ciphers: HashMap<(u32, u32), Arc<DataPlaneAead>>,
     pub control_ciphers: HashMap<[u8; 32], Arc<ControlPlaneAead>>,
     pub data_send_ctr: HashMap<u32, u64>,
     pub data_replay: HashMap<u32, DataReplayWindow>,
-    pub owner_ep: Option<SocketAddr>,
-
-    pub owner_ep_trusted: bool,
-    pub is_owner: bool,
     pub my_vip: String,
     pub my_vip_u32: u32,
     pub my_node_id: String,
+    pub vip_epoch: u64,
     pub candidates: Vec<IceCandidate>,
     pub tun_inject_tx: broadcast::Sender<Bytes>,
     pub join_tx: Option<oneshot::Sender<Option<JoinAck>>>,
-    pub kicked: bool,
-    pub owner_node_id: String,
     pub membership_version: u64,
     pub adapter_name: Option<String>,
     pub last_applied_adapter_mtu: u16,
 
     pub subnet_prefix: u8,
 
-    pub owner_vip_cached: String,
     feature_flags: RuntimeFeatureFlags,
     pub prev_path_kind: HashMap<u32, PathKind>,
     pub pending_heal_vips: HashSet<String>,
@@ -448,9 +446,8 @@ impl CryptoPool {
         self.per_peer.remove(&peer);
     }
 
-    fn prune_per_peer_orphans(&mut self, rt: &RoutingTable, owner_ep: Option<SocketAddr>) {
-        self.per_peer
-            .retain(|addr, _| rt.tracks_endpoint(*addr) || owner_ep == Some(*addr));
+    fn prune_per_peer_orphans(&mut self, rt: &RoutingTable) {
+        self.per_peer.retain(|addr, _| rt.tracks_endpoint(*addr));
     }
 
     fn key_for_peer(&self, peer: SocketAddr) -> Option<Arc<AeadKey>> {
@@ -535,8 +532,6 @@ struct PacingThreadControl {
 
 pub struct P2PEngine {
     pub socket: Arc<UdpSocket>,
-
-    pub pmtud_probe_socket: Arc<UdpSocket>,
     pub routing: Arc<RwLock<RoutingTable>>,
     pacing: PacingWorkerHandle,
     pacing_tick_tx: mpsc::Sender<()>,
@@ -572,14 +567,22 @@ pub struct P2PEngine {
     pub cmd_rx: mpsc::Receiver<EngineCmd>,
     pub state: EngineState,
     state_view: Arc<RwLock<PunchState>>,
-    pub join_handler: Option<JoinHandler>,
     pub leave_handler: Option<LeaveHandler>,
     pub endpoint_learned_handler: Option<EndpointLearnedHandler>,
     roster_changed_handler: Option<RosterChangedHandler>,
+    identity_changed_handler: Option<IdentityChangedHandler>,
     reliable_seen: HashSet<(ReliableDedupKey, u32)>,
     reliable_seen_timeline: VecDeque<(tokio::time::Instant, ReliableDedupKey, u32)>,
+    /// Leave event dedupe (reused for MLEA deduplication).
     msmd_seen: HashSet<Arc<str>>,
     msmd_timeline: VecDeque<(tokio::time::Instant, Arc<str>)>,
+    claim_map: HashMap<String, ClaimRecord>,
+    leave_tombs: HashMap<String, LeaveTombstone>,
+    fight_suppress: HashMap<String, FightSuppress>,
+    pending_claim_gossip: bool,
+    vip_reroll_retry_after: Option<Instant>,
+    claim_gossip_digest_cursor: usize,
+    claim_gossip_fanout_cursor: usize,
     manual_punch_stops: HashMap<String, Arc<AtomicBool>>,
     ice_check_stops: HashMap<String, Arc<AtomicBool>>,
     peer_keepalive_stops: HashMap<String, Arc<AtomicBool>>,
@@ -618,24 +621,14 @@ pub struct P2PEngine {
     para_notify_txs: HashMap<u64, mpsc::Sender<ParaSignal>>,
     next_para_listener_id: u64,
     metrics: Arc<EngineMetrics>,
-    last_msyn_after_join: Option<Instant>,
-
-    pending_msyn_after_join: bool,
-    msyn_coalesce_interval: Option<Interval>,
     last_prepare_join_at: Option<Instant>,
     last_tun_inject_drop_warn: Option<Instant>,
 
     last_pmtud_netsh_at: Option<Instant>,
     last_relay_stale_drop_warn: Option<Instant>,
-    last_relay_degraded_no_owner_warn: Option<Instant>,
+    last_relay_degraded_no_hop_warn: Option<Instant>,
     last_reliable_seen_warn: Option<Instant>,
 
-    peer_sync_state: HashMap<String, u64>,
-    peer_pending_removals: HashMap<String, HashSet<String>>,
-
-    msyn_applied_to_rev: u64,
-    next_msyn_sync_id: u64,
-    msyn_assemble: MsynAssembleMap,
     rx_bytes_pending: HashMap<SocketAddr, u64>,
     last_seen_pending: HashMap<SocketAddr, Instant>,
     rx_bytes_pending_vip: HashMap<u32, u64>,
@@ -765,8 +758,8 @@ struct ParaHelloMsg {
     node_id: String,
     public_ip: String,
     public_port: u16,
-    proposed_key_hex: String,
-    proposed_vip_subnet: String,
+    #[serde(default)]
+    network_id: String,
     ts_ms: u64,
     #[serde(default)]
     candidates: Vec<ParaCandidate>,
@@ -774,8 +767,6 @@ struct ParaHelloMsg {
     start_at_ms: u64,
     #[serde(default)]
     session_id: String,
-    #[serde(default)]
-    discover_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -783,7 +774,7 @@ struct ParaReplyMsg {
     node_id: String,
     public_ip: String,
     public_port: u16,
-    assigned_vip: String,
+    #[serde(default)]
     network_id: String,
     ts_ms: u64,
     #[serde(default)]
@@ -792,18 +783,8 @@ struct ParaReplyMsg {
     agreed_start_at_ms: u64,
     #[serde(default)]
     session_id: String,
-
     #[serde(default)]
     responder_vip: String,
-
-    #[serde(default)]
-    responder_is_owner: bool,
-
-    #[serde(default)]
-    network_name: String,
-
-    #[serde(default)]
-    network_key_hex: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,20 +824,13 @@ impl Default for RuntimeFeatureFlags {
     }
 }
 
-#[inline]
-fn refresh_owner_vip_cache(state: &mut EngineState) {
-    state.owner_vip_cached = owner_vip_with_prefix(&state.my_vip, state.subnet_prefix);
-}
-
 impl P2PEngine {
     pub fn new(
         socket: Arc<UdpSocket>,
-        pmtud_probe_socket: Arc<UdpSocket>,
         routing: Arc<RwLock<RoutingTable>>,
         tun_rx: mpsc::Receiver<Bytes>,
         tun_inject_tx: broadcast::Sender<Bytes>,
         cmd_rx: mpsc::Receiver<EngineCmd>,
-        is_owner: bool,
         my_vip: Ipv4Addr,
         my_node_id: String,
         subnet_prefix: u8,
@@ -874,7 +848,6 @@ impl P2PEngine {
         let tun_inject_capacity = tun_inject_capacity.max(1);
         let my_vip_s = my_vip.to_string();
         let subnet_prefix = subnet_prefix.clamp(8, 30);
-        let owner_vip_cached = owner_vip_with_prefix(&my_vip_s, subnet_prefix);
         let mut keepalive_interval = interval(Duration::from_secs(5));
         keepalive_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sync_interval = interval(Duration::from_secs(15));
@@ -916,13 +889,6 @@ impl P2PEngine {
             new_cc_probe_interval(&crate::advanced_tuning::CongestionTuning::default());
         let mut decentralized_interval = interval(Duration::from_secs(5));
         decentralized_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let msyn_coalesce_interval = if is_owner {
-            let mut i = interval(Duration::from_millis(50));
-            i.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            Some(i)
-        } else {
-            None
-        };
         let (stun_resolve_tx, stun_resolve_rx) = mpsc::unbounded_channel();
         let (decentralized_resolve_tx, decentralized_resolve_rx) = mpsc::unbounded_channel();
         let (decentralized_http_tx, decentralized_http_rx) = mpsc::unbounded_channel();
@@ -934,7 +900,6 @@ impl P2PEngine {
         }));
         Self {
             socket,
-            pmtud_probe_socket,
             routing,
             pacing,
             pacing_tick_tx,
@@ -973,34 +938,36 @@ impl P2PEngine {
                 control_ciphers: HashMap::new(),
                 data_send_ctr: HashMap::new(),
                 data_replay: HashMap::new(),
-                owner_ep: None,
-                owner_ep_trusted: false,
-                is_owner,
                 my_vip: my_vip_s,
                 my_vip_u32: u32::from(my_vip),
                 my_node_id,
+                vip_epoch: 0,
                 candidates: Vec::new(),
                 tun_inject_tx,
                 join_tx: None,
-                kicked: false,
-                owner_node_id: String::new(),
                 membership_version: 0,
                 adapter_name: None,
                 last_applied_adapter_mtu: 0,
                 subnet_prefix,
-                owner_vip_cached,
                 feature_flags: RuntimeFeatureFlags::default(),
                 prev_path_kind: HashMap::new(),
                 pending_heal_vips: HashSet::new(),
             },
-            join_handler: None,
             leave_handler: None,
             endpoint_learned_handler: None,
             roster_changed_handler: None,
+            identity_changed_handler: None,
             reliable_seen: HashSet::new(),
             reliable_seen_timeline: VecDeque::new(),
             msmd_seen: HashSet::new(),
             msmd_timeline: VecDeque::new(),
+            claim_map: HashMap::new(),
+            leave_tombs: HashMap::new(),
+            fight_suppress: HashMap::new(),
+            pending_claim_gossip: false,
+            vip_reroll_retry_after: None,
+            claim_gossip_digest_cursor: 0,
+            claim_gossip_fanout_cursor: 0,
             manual_punch_stops: HashMap::new(),
             ice_check_stops: HashMap::new(),
             peer_keepalive_stops: HashMap::new(),
@@ -1037,20 +1004,12 @@ impl P2PEngine {
             para_notify_txs: HashMap::new(),
             next_para_listener_id: 1,
             metrics,
-            last_msyn_after_join: None,
-            pending_msyn_after_join: false,
-            msyn_coalesce_interval,
             last_prepare_join_at: None,
             last_tun_inject_drop_warn: None,
             last_pmtud_netsh_at: None,
             last_relay_stale_drop_warn: None,
-            last_relay_degraded_no_owner_warn: None,
+            last_relay_degraded_no_hop_warn: None,
             last_reliable_seen_warn: None,
-            peer_sync_state: HashMap::new(),
-            peer_pending_removals: HashMap::new(),
-            msyn_applied_to_rev: 0,
-            next_msyn_sync_id: 1,
-            msyn_assemble: HashMap::new(),
             rx_bytes_pending: HashMap::new(),
             last_seen_pending: HashMap::new(),
             rx_bytes_pending_vip: HashMap::new(),
@@ -1216,66 +1175,22 @@ impl P2PEngine {
                     self.spawn_decentralized_join_punch();
                 }
             } else {
-                self.try_reconnect_fastpath_from_announce(&info.peers);
                 self.try_peer_reconnect_from_announce(&info.peers);
             }
         }
     }
 
-    fn try_reconnect_fastpath_from_announce(&mut self, peers: &[SocketAddr]) {
-        if self.state.join_tx.is_some() || !self.decentralized.is_active() || self.state.is_owner {
-            return;
-        }
-        let current_owner = match self.owner_send_endpoint() {
-            Some(ep) => ep,
-            None => return,
-        };
-        // Healthy direct path: keep discovery quiet — no punch / UI spam.
-        if self.owner_route_healthy(current_owner) {
-            return;
-        }
-        let hint = self.decentralized.join_owner_hint();
-        let Some(candidate) = reconnect_fastpath_owner_candidate(current_owner, hint, peers) else {
-            return;
-        };
-        let now = Instant::now();
-        if self.reconnect_fastpath_last_ep == Some(candidate) {
-            if let Some(at) = self.reconnect_fastpath_last_at {
-                if now.duration_since(at) < RECONNECT_FASTPATH_COOLDOWN {
-                    return;
-                }
-            }
-        }
-        self.reconnect_fastpath_last_ep = Some(candidate);
-        self.reconnect_fastpath_last_at = Some(now);
-        let bases = self.filter_decentralized_punch_targets(vec![candidate]);
-        if bases.is_empty() {
-            return;
-        }
-        self.stop_decentralized_reconnect_fastpath();
-        self.spawn_punch_workflow(DECENTRALIZED_RECONNECT_FASTPATH_KEY, bases, false);
-    }
-
     fn try_peer_reconnect_from_announce(&mut self, peers: &[SocketAddr]) {
-        if self.state.join_tx.is_some() || !self.decentralized.is_active() || self.state.is_owner {
+        if self.state.join_tx.is_some() || !self.decentralized.is_active() {
             return;
         }
-        if !self.has_non_owner_peer_vip_in_rt() {
+        if !self.has_peer_vip_in_rt() {
             return;
         }
         if !self.has_crypto() {
             return;
         }
-        let owner_send = self.owner_send_endpoint();
-        if let Some(ep) = owner_send {
-            if self.owner_route_healthy(ep) {
-                self.stop_all_peer_reconnect_workflows();
-                return;
-            }
-        }
-        let owner_send = owner_send;
         let my_vip = self.state.my_vip.clone();
-        let owner_vip = self.state.owner_vip_cached.clone();
         let mut vip_bases: HashMap<String, Vec<SocketAddr>> = HashMap::new();
         let mut unbound_bases: Vec<SocketAddr> = Vec::new();
         let mut budget = 0usize;
@@ -1283,12 +1198,9 @@ impl P2PEngine {
             if budget >= PEER_RECONNECT_ANNOUNCE_BUDGET {
                 break;
             }
-            if owner_send == Some(*addr) {
-                continue;
-            }
             budget += 1;
             let rt = self.routing.read();
-            match unique_ip_peer_vip(&rt, &my_vip, &owner_vip, addr.ip()) {
+            match unique_ip_peer_vip(&rt, &my_vip, addr.ip()) {
                 UniqueIpMatch::Bound(vip) => {
                     if peer_route_needs_work(&rt, &vip, *addr) {
                         vip_bases.entry(vip).or_default().push(*addr);
@@ -1424,8 +1336,7 @@ impl P2PEngine {
         for (ep, body) in out.join_fanout {
             self.send_ctrl_signed_to(ep, PKT_HPCH, self.state.my_vip.as_bytes())
                 .await;
-            let pkt = self.frame_with_tag_reuse(PKT_JOIN, &body);
-            let _ = self.socket.send_to(&pkt, ep).await;
+            self.send_ctrl_signed_to(ep, PKT_JOIN, &body).await;
         }
     }
 
@@ -1439,10 +1350,6 @@ impl P2PEngine {
         self.ui.emit_stderr(msg);
     }
 
-    pub fn set_join_handler(&mut self, handler: JoinHandler) {
-        self.join_handler = Some(handler);
-    }
-
     pub fn set_leave_handler(&mut self, handler: LeaveHandler) {
         self.leave_handler = Some(handler);
     }
@@ -1453,6 +1360,10 @@ impl P2PEngine {
 
     pub fn set_roster_changed_handler(&mut self, handler: RosterChangedHandler) {
         self.roster_changed_handler = Some(handler);
+    }
+
+    pub fn set_identity_changed_handler(&mut self, handler: IdentityChangedHandler) {
+        self.identity_changed_handler = Some(handler);
     }
 
     fn remember_endpoint(&self, vip: &str, ep: SocketAddr) {
@@ -1469,10 +1380,10 @@ impl P2PEngine {
     }
 
     fn notify_roster_upsert(&self, vip: &str, ep: SocketAddr, node_id: Option<&str>) {
-        if self.state.is_owner || self.roster_changed_handler.is_none() {
+        if self.roster_changed_handler.is_none() {
             return;
         }
-        if vip == self.state.my_vip || vip == self.state.owner_vip_cached {
+        if vip == self.state.my_vip {
             return;
         }
         let node_id = node_id
@@ -1487,17 +1398,23 @@ impl P2PEngine {
                     .unwrap_or_default()
             });
         if let Some(handler) = &self.roster_changed_handler {
+            let vip_epoch = self
+                .claim_map
+                .get(node_id.as_str())
+                .map(|c| c.vip_epoch)
+                .unwrap_or(0);
             handler(RosterChange::Upsert(PeerInfo {
                 node_id: node_id.clone(),
                 name: node_id,
                 virtual_ip: vip.to_string(),
                 real_ip: ep.to_string(),
+                vip_epoch,
             }));
         }
     }
 
     fn notify_roster_remove(&self, vip: &str) {
-        if self.state.is_owner || self.roster_changed_handler.is_none() {
+        if self.roster_changed_handler.is_none() {
             return;
         }
         if let Some(handler) = &self.roster_changed_handler {
@@ -1561,41 +1478,14 @@ impl P2PEngine {
         }
     }
 
-    fn has_non_owner_peer_vip_in_rt(&self) -> bool {
+    fn has_peer_vip_in_rt(&self) -> bool {
         let rt = self.routing.read();
         let my = self.state.my_vip.as_str();
-        let owner = self.state.owner_vip_cached.as_str();
-        rt.table
-            .keys()
-            .any(|vip| vip.as_str() != my && vip.as_str() != owner)
+        rt.table.keys().any(|vip| vip.as_str() != my)
     }
 
     fn has_crypto(&self) -> bool {
         self.state.crypto_keys.has_any()
-    }
-
-    fn owner_send_endpoint_for_rt(&self, rt: &RoutingTable) -> Option<SocketAddr> {
-        if self.state.is_owner {
-            return None;
-        }
-        let route_ep = {
-            let ov = &self.state.owner_vip_cached;
-            if ov.is_empty() {
-                None
-            } else {
-                rt.lookup(ov)
-            }
-        };
-        if self.state.owner_ep_trusted {
-            self.state.owner_ep.or(route_ep)
-        } else {
-            route_ep.or(self.state.owner_ep)
-        }
-    }
-
-    fn owner_send_endpoint(&self) -> Option<SocketAddr> {
-        let rt = self.routing.read();
-        self.owner_send_endpoint_for_rt(&rt)
     }
 
     fn routing_rtt_hint_ms(&self, from: SocketAddr) -> Option<i32> {
@@ -1631,7 +1521,10 @@ impl P2PEngine {
         } else {
             None
         };
-        let qd_raw = crate::routing::effective_queuing_delay_ms(entry);
+        let qd_raw = crate::routing::effective_queuing_delay_ms(
+            entry,
+            rt.congestion.owd_prefer_after_samples,
+        );
         let qd = if qd_raw >= 0.0 {
             Some(qd_raw as f32)
         } else {
@@ -1718,11 +1611,8 @@ impl P2PEngine {
         self.last_seen_pending.insert(from, Instant::now());
         let needs_promote = self.routing.read().is_endpoint_stale(from);
         if needs_promote {
-            if let Some(vip) = self.routing.write().promote_stale_if_needed(from) {
+            if let Some(_) = self.routing.write().promote_stale_if_needed(from) {
                 self.metrics.inc_stale_to_candidate_promotions();
-                if self.state.is_owner {
-                    self.peer_sync_state.remove(&vip);
-                }
             }
         }
     }
@@ -1844,24 +1734,16 @@ impl P2PEngine {
         }
         self.pending_join_ack = None;
         self.stop_background_loops().await;
-        self.pending_msyn_after_join = false;
-        self.state.kicked = false;
         self.state.crypto_keys.clear();
         self.clear_data_crypto_state();
-        self.state.owner_ep = None;
-        self.state.owner_ep_trusted = false;
         self.state.my_vip.clear();
         self.state.my_vip_u32 = 0;
         self.state.subnet_prefix = 24;
-        self.state.owner_vip_cached.clear();
-        self.state.is_owner = false;
         self.state.candidates.clear();
         self.state.my_node_id.clear();
-        self.peer_sync_state.clear();
-        self.peer_pending_removals.clear();
-        self.msyn_applied_to_rev = 0;
-        self.next_msyn_sync_id = 1;
-        self.msyn_assemble.clear();
+        self.claim_map.clear();
+        self.leave_tombs.clear();
+        self.fight_suppress.clear();
         {
             let mut rt = self.routing.write();
             *rt = RoutingTable::new();
@@ -2012,12 +1894,7 @@ impl P2PEngine {
 
     pub async fn run(mut self) {
         let mut recv_buf = vec![0u8; 65535];
-        let mut pmtud_recv_buf = vec![0u8; 65535];
         loop {
-            if self.state.kicked {
-                self.reset_session_state().await;
-                self.ui_out("  [KICK] Local session cleared by owner.".to_string());
-            }
             select! {
                 recv = self.socket.recv_from(&mut recv_buf) => {
                     if let Ok((n, from)) = recv {
@@ -2036,16 +1913,6 @@ impl P2PEngine {
                             continue;
                         }
                         self.handle_packet(data, from).await;
-                    }
-                }
-                recv = self.pmtud_probe_socket.recv_from(&mut pmtud_recv_buf) => {
-                    if let Ok((n, from)) = recv {
-                        let data = &pmtud_recv_buf[..n];
-                        if let Some((tag, body)) = parse_tag(data) {
-                            if tag == *PKT_PMAR {
-                                self.apply_pmar_body(from, body).await;
-                            }
-                        }
                     }
                 }
                 Some(pkt) = self.tun_rx.recv() => {
@@ -2072,9 +1939,11 @@ impl P2PEngine {
                     self.send_keepalives().await;
                 }
                 _ = self.sync_interval.tick() => {
-                    if self.state.is_owner {
-                        let _ = self.broadcast_msyn().await;
-                    }
+                    let now = Instant::now();
+                    prune_leave_tombstones(&mut self.leave_tombs, now);
+                    prune_fight_suppress(&mut self.fight_suppress, now);
+                    self.flush_pending_claim_gossip().await;
+                    self.broadcast_claim_gossip().await;
                 }
                 _ = self.direct_retry_interval.tick() => {
                     self.direct_retry_tick();
@@ -2101,21 +1970,20 @@ impl P2PEngine {
                             })
                             .collect()
                     };
-                    if self.state.is_owner {
-                        for (vip, _, _) in &victims {
-                            self.note_route_removed_for_sync(vip);
-                        }
-                    }
                     {
                         let mut rt = self.routing.write();
                         for (vip, _, _) in &victims {
                             rt.remove(vip);
                         }
-                        self.peer_sync_state
-                            .retain(|vip, _| rt.table.contains_key(vip));
                     }
                     for (vip, _, node_id) in &victims {
                         self.on_peer_route_removed(vip, node_id.as_deref());
+                        if let Some(nid) = node_id {
+                            remove_claim(&mut self.claim_map, nid);
+                        } else {
+                            // Route lacked node_id — still drop claim ghosts by VIP.
+                            let _ = remove_claims_for_vip(&mut self.claim_map, vip);
+                        }
                     }
                     for (_, ep, _) in victims {
                         self.invalidate_fec_qd_cache(ep);
@@ -2142,11 +2010,7 @@ impl P2PEngine {
                         self.ui_err(format!("  [PACE] socket send loop unhealthy: {err}"));
                         if let Some(dest) = last_failed_dest {
                             if !dest.ip().is_unspecified() {
-                                let owner_ep_hint = self.owner_send_endpoint();
-                                let fail = self
-                                    .routing
-                                    .write()
-                                    .note_fail(dest, owner_ep_hint);
+                                let fail = self.routing.write().note_fail(dest, None);
                                 self.refresh_fec_qd_cache(dest);
                                 if self.state.feature_flags.predictive_heal {
                                     if let (Some(vip), true) = (fail.vip, fail.needs_heal) {
@@ -2183,8 +2047,7 @@ impl P2PEngine {
                     let reliable_failures: Vec<_> =
                         self.reliable_failure_buf.drain(..).collect();
                     for (_seq, dest) in reliable_failures {
-                        let owner_ep_hint = self.owner_send_endpoint();
-                        let fail = self.routing.write().note_fail(dest, owner_ep_hint);
+                        let fail = self.routing.write().note_fail(dest, None);
                         self.refresh_fec_qd_cache(dest);
                         if self.state.feature_flags.predictive_heal {
                             if let (Some(vip), true) = (fail.vip, fail.needs_heal) {
@@ -2227,6 +2090,7 @@ impl P2PEngine {
                 }
                 _ = self.decentralized_interval.tick() => {
                     self.run_decentralized_tick().await;
+                    self.send_claim_presence_tick().await;
                 }
                 _ = self.ping_watchdog_interval.tick() => {
                     let heal_vips = self.expire_pending_pings();
@@ -2236,28 +2100,6 @@ impl P2PEngine {
                 }
                 _ = self.cc_probe_interval.tick() => {
                     self.send_cc_probes().await;
-                }
-                _ = async {
-                    if let Some(interval) = self.msyn_coalesce_interval.as_mut() {
-                        interval.tick().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    if self.state.is_owner && self.pending_msyn_after_join {
-                        let now = Instant::now();
-                        let due = self
-                            .last_msyn_after_join
-                            .map(|prev| {
-                                now.duration_since(prev) >= Duration::from_millis(200)
-                            })
-                            .unwrap_or(true);
-                        if due {
-                            self.pending_msyn_after_join = false;
-                            let _ = self.broadcast_msyn().await;
-                            self.last_msyn_after_join = Some(now);
-                        }
-                    }
                 }
             }
         }
@@ -2278,6 +2120,8 @@ impl P2PEngine {
                 .on_ack(from, sz, probe_id, session_id, Instant::now());
         if ok {
             self.metrics.inc_pmtud_probe_acks();
+        } else {
+            self.metrics.inc_pmtud_pmar_ignored();
         }
         self.metrics.add_pmtud_events(ev);
         if min_changed {
@@ -2490,7 +2334,6 @@ impl P2PEngine {
             return Ok(());
         }
 
-        let is_owner = self.state.is_owner;
         let multipath_core = self.state.feature_flags.multipath_core;
         let dual_write = self.state.feature_flags.dual_write_transition;
 
@@ -2518,16 +2361,13 @@ impl P2PEngine {
                     self.broadcast_scratch.clear();
                     return Ok(());
                 }
-                let owner_for_fallback = if !is_owner {
-                    self.owner_send_endpoint_for_rt(&rt)
-                } else {
-                    None
+                let hub = match rt.select_broadcast_relay_hop(&self.state.my_vip, None) {
+                    RelaySelection::Hop(ep) => Some(ep),
+                    RelaySelection::None => None,
                 };
                 drop(rt);
-                if !is_owner {
-                    if let Some(owner_ep) = owner_for_fallback {
-                        self.send_data_with_fallback(owner_ep, &pkt).await;
-                    }
+                if let Some(hub_ep) = hub {
+                    self.send_data_with_fallback(hub_ep, &pkt).await;
                 }
                 return Ok(());
             };
@@ -2564,7 +2404,7 @@ impl P2PEngine {
         let mut target = snap.ep;
         let mut target_kind = PathKind::Direct;
         if let Some((ep, kind)) = snap.multipath_active {
-            if kind != PathKind::OwnerRelay {
+            if kind != PathKind::HubRelay {
                 target = ep;
                 target_kind = kind;
             }
@@ -2573,21 +2413,16 @@ impl P2PEngine {
         let mut relay_selection: Option<RelaySelection> = None;
         if let Some(ref rs) = snap.relay_snap {
             let want_relay = should_relay_snap(rs, &snap.failover);
-            if want_relay && !is_owner {
+            if want_relay {
                 if let Some(ref dest_vip) = snap.vip {
                     let selection = {
                         let rt = self.routing.read();
-                        rt.select_relay_endpoint(
-                            dest_vip,
-                            &self.state.owner_vip_cached,
-                            &self.state.my_vip,
-                            None,
-                        )
+                        rt.select_relay_endpoint(dest_vip, &self.state.my_vip, None)
                     };
                     match selection {
                         RelaySelection::Hop(hop) => {
                             target = hop;
-                            target_kind = PathKind::OwnerRelay;
+                            target_kind = PathKind::HubRelay;
                             relay_selection = Some(selection);
                         }
                         RelaySelection::None if rs.state == RouteState::Stale => {
@@ -2610,7 +2445,7 @@ impl P2PEngine {
                             self.metrics.inc_relay_fallback_direct_no_hop();
                             let warn_at = Instant::now();
                             let warn = self
-                                .last_relay_degraded_no_owner_warn
+                                .last_relay_degraded_no_hop_warn
                                 .map(|t| warn_at.duration_since(t) >= Duration::from_secs(5))
                                 .unwrap_or(true);
                             if warn {
@@ -2618,7 +2453,7 @@ impl P2PEngine {
                                     "  [DATA] relay: no relay hop; send direct to peer (best effort)"
                                         .to_string(),
                                 );
-                                self.last_relay_degraded_no_owner_warn = Some(warn_at);
+                                self.last_relay_degraded_no_hop_warn = Some(warn_at);
                             }
                             target = snap.ep;
                             target_kind = PathKind::Direct;
@@ -2670,8 +2505,8 @@ impl P2PEngine {
         }
 
         if let Some(vip) = snap.vip.as_ref() {
-            if target_kind == PathKind::OwnerRelay
-                && prev_path_kind_for_dst != Some(PathKind::OwnerRelay)
+            if target_kind == PathKind::HubRelay
+                && prev_path_kind_for_dst != Some(PathKind::HubRelay)
             {
                 self.routing.write().note_relay_fallback(vip);
                 self.metrics.inc_relay_fallback(1);
@@ -2770,10 +2605,9 @@ impl P2PEngine {
             self.state.pending_heal_vips.remove(&vip);
         }
         self.heal_cooldown_until.remove(&vip);
-        let owner_hint = self.owner_send_endpoint();
         let mut rt = self.routing.write();
         let tracked_ok = rt
-            .vip_for_data_endpoint(endpoint, owner_hint)
+            .vip_for_data_endpoint(endpoint, None)
             .map(|v| v == vip)
             .unwrap_or(false);
         if !tracked_ok {
@@ -2848,13 +2682,12 @@ impl P2PEngine {
         if !has_src && !has_dst {
             return;
         }
-        let ignore_relay = self.owner_send_endpoint();
         let advanced = self.state.feature_flags.multipath_bandwidth_prober;
         let batch = std::mem::take(&mut self.rx_bytes_pending);
         let by_dst = std::mem::take(&mut self.rx_bytes_pending_vip);
         let mut rt = self.routing.write();
         if has_src {
-            rt.note_bytes_received_batch(batch, advanced, ignore_relay);
+            rt.note_bytes_received_batch(batch, advanced, None);
         }
         if has_dst {
             for (dst_u32, bytes) in by_dst {
@@ -2898,39 +2731,18 @@ impl P2PEngine {
     }
 
     async fn send_relay_hop(&mut self, hop: SocketAddr, dest_vip: &str, payload: &[u8]) {
-        if self.state.is_owner {
-            return;
-        }
         if self.send_menc(hop, payload).await.is_ok() {
             self.metrics.inc_relay_send_hop();
-            if self
-                .owner_send_endpoint()
-                .is_some_and(|owner_ep| owner_ep == hop)
-            {
-                self.metrics.inc_relay_send_owner();
-            }
             return;
         }
-        let ignore = self.owner_send_endpoint();
-        let _ = self.routing.write().note_fail(hop, ignore);
+        let _ = self.routing.write().note_fail(hop, None);
         let selection = {
             let rt = self.routing.read();
-            rt.select_relay_endpoint(
-                dest_vip,
-                &self.state.owner_vip_cached,
-                &self.state.my_vip,
-                Some(hop),
-            )
+            rt.select_relay_endpoint(dest_vip, &self.state.my_vip, Some(hop))
         };
         if let RelaySelection::Hop(alt) = selection {
             if self.send_menc(alt, payload).await.is_ok() {
                 self.metrics.inc_relay_send_hop();
-                if self
-                    .owner_send_endpoint()
-                    .is_some_and(|owner_ep| owner_ep == alt)
-                {
-                    self.metrics.inc_relay_send_owner();
-                }
                 self.apply_relay_path_stamp(dest_vip, RelaySelection::Hop(alt));
             }
         }
@@ -2938,7 +2750,7 @@ impl P2PEngine {
 
     async fn send_data_with_fallback(&mut self, dest: SocketAddr, payload: &[u8]) {
         if self.send_menc(dest, payload).await.is_err() {
-            self.send_data_fallback_usable_owner(dest, payload, false)
+            self.send_data_fallback_usable_hub(dest, payload, false)
                 .await;
         }
     }
@@ -2954,7 +2766,7 @@ impl P2PEngine {
             PathKind::Direct | PathKind::IceSrflx => {
                 self.send_data_with_fallback(dest_ep, payload).await;
             }
-            PathKind::OwnerRelay => {
+            PathKind::HubRelay => {
                 if let Some(vip) = dest_vip {
                     self.send_relay_hop(dest_ep, vip, payload).await;
                 }
@@ -2964,30 +2776,31 @@ impl P2PEngine {
 
     async fn send_data_with_fallback_direct(&mut self, dest: SocketAddr, payload: &[u8]) {
         if self.send_menc_direct(dest, payload).await.is_err() {
-            self.send_data_fallback_usable_owner(dest, payload, true)
+            self.send_data_fallback_usable_hub(dest, payload, true)
                 .await;
         }
     }
 
-    async fn send_data_fallback_usable_owner(
+    async fn send_data_fallback_usable_hub(
         &mut self,
         dest: SocketAddr,
         payload: &[u8],
         direct: bool,
     ) {
-        if self.state.is_owner {
-            return;
-        }
-        let Some(owner_ep) = self.owner_send_endpoint() else {
+        let hub = {
+            let rt = self.routing.read();
+            match rt.select_broadcast_relay_hop(&self.state.my_vip, Some(dest)) {
+                RelaySelection::Hop(ep) => Some(ep),
+                RelaySelection::None => None,
+            }
+        };
+        let Some(hub_ep) = hub else {
             return;
         };
-        if owner_ep == dest || !self.owner_route_healthy(owner_ep) {
-            return;
-        }
         if direct {
-            let _ = self.send_menc_direct(owner_ep, payload).await;
+            let _ = self.send_menc_direct(hub_ep, payload).await;
         } else {
-            let _ = self.send_menc(owner_ep, payload).await;
+            let _ = self.send_menc(hub_ep, payload).await;
         }
     }
 
@@ -3002,12 +2815,7 @@ impl P2PEngine {
     fn sync_dest_relay_path_stamp(&mut self, dest_vip: &str) {
         let selection = {
             let rt = self.routing.read();
-            rt.select_relay_endpoint(
-                dest_vip,
-                &self.state.owner_vip_cached,
-                &self.state.my_vip,
-                None,
-            )
+            rt.select_relay_endpoint(dest_vip, &self.state.my_vip, None)
         };
         self.apply_relay_path_stamp(dest_vip, selection);
     }
@@ -3024,52 +2832,6 @@ impl P2PEngine {
             }
             EngineCmd::PeerRouteRemoved { vip } => {
                 self.on_peer_route_removed(&vip, None);
-                false
-            }
-            EngineCmd::Kick(ep) => {
-                let _ = self
-                    .send_control_packet(ep, PKT_KICK, b"kicked_by_owner")
-                    .await;
-                if self.state.is_owner {
-                    let (vip, node_id) = {
-                        let rt = self.routing.read();
-                        let vip = rt.ep_to_vip.get(&ep).cloned();
-                        let node_id = vip.as_ref().and_then(|v| {
-                            rt.table.get(v).and_then(|e| {
-                                (!e.node_id.is_empty()).then(|| e.node_id.to_string())
-                            })
-                        });
-                        drop(rt);
-                        if let Some(ref vip) = vip {
-                            self.note_route_removed_for_sync(vip);
-                            self.routing.write().remove(vip);
-                        }
-                        (vip, node_id)
-                    };
-                    if let Some(vip) = vip {
-                        self.on_peer_route_removed(&vip, node_id.as_deref());
-                        self.peer_sync_state.remove(&vip);
-                        if let Some(handler) = &self.leave_handler {
-                            handler(vip);
-                        }
-                    }
-                    self.invalidate_fec_qd_cache(ep);
-                    self.state.crypto_keys.unbind_peer(ep);
-                    self.reliable.flush_dest(ep);
-                    self.teardown_fec_peer(ep);
-                }
-                false
-            }
-            EngineCmd::SetOwnerEndpoint(ep, reply) => {
-                self.state.owner_ep = Some(ep);
-                self.state.owner_ep_trusted = false;
-                let owner_vip_str = self.state.owner_vip_cached.clone();
-                if !owner_vip_str.is_empty() {
-                    self.remember_endpoint(&owner_vip_str, ep);
-                }
-                if let Some(tx) = reply {
-                    let _ = tx.send(());
-                }
                 false
             }
             EngineCmd::SetCryptoKey(key, reply) => {
@@ -3109,7 +2871,7 @@ impl P2PEngine {
             EngineCmd::PrepareJoin {
                 join_tx,
                 key,
-                owner,
+                target,
                 body,
             } => {
                 let now = Instant::now();
@@ -3133,49 +2895,35 @@ impl P2PEngine {
                 if self.mtu_pin {
                     self.apply_mtu_pin_policy();
                 }
-                self.state.owner_ep = Some(owner);
-                self.state.owner_ep_trusted = false;
-                let owner_vip_str = self.state.owner_vip_cached.clone();
-                if !owner_vip_str.is_empty() {
-                    self.update_route(&owner_vip_str, owner, None);
+                if let Some(target) = target {
+                    self.send_ctrl_signed_to(target, PKT_HPCH, self.state.my_vip.as_bytes())
+                        .await;
+
+                    self.send_ctrl_signed_to(target, PKT_JOIN, &body).await;
+
+                    let sock = self.socket.clone();
+                    let sv = self.state_view.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        let snap = sv.read().clone();
+                        let pkt = build_signed_or_plain_static(
+                            snap.crypto_key.clone(),
+                            &snap.ctrl_send_ctr,
+                            PKT_HPCH,
+                            snap.my_vip.as_bytes(),
+                        );
+                        let _ = sock.send_to(&pkt, target).await;
+                    });
                 }
-
-                self.send_ctrl_signed_to(owner, PKT_HPCH, self.state.my_vip.as_bytes())
-                    .await;
-
-                let pkt = self.frame_with_tag_reuse(PKT_JOIN, &body);
-                let _ = self.socket.send_to(&pkt, owner).await;
-
-                let sock = self.socket.clone();
-                let sv = self.state_view.clone();
-                let owner_addr = owner;
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    let snap = sv.read().clone();
-                    let pkt = build_signed_or_plain_static(
-                        snap.crypto_key.clone(),
-                        &snap.ctrl_send_ctr,
-                        PKT_HPCH,
-                        snap.my_vip.as_bytes(),
-                    );
-                    let _ = sock.send_to(&pkt, owner_addr).await;
-                });
                 if self.decentralized.is_active() && self.decentralized.is_joiner() {
                     self.spawn_decentralized_join_punch();
                 }
                 false
             }
-            EngineCmd::SendJoin { owner, body } => {
-                self.state.owner_ep = Some(owner);
-                self.state.owner_ep_trusted = false;
-                let owner_vip_str = self.state.owner_vip_cached.clone();
-                if !owner_vip_str.is_empty() {
-                    self.update_route(&owner_vip_str, owner, None);
-                }
-                self.send_ctrl_signed_to(owner, PKT_HPCH, self.state.my_vip.as_bytes())
+            EngineCmd::SendJoin { target, body } => {
+                self.send_ctrl_signed_to(target, PKT_HPCH, self.state.my_vip.as_bytes())
                     .await;
-                let pkt = self.frame_with_tag_reuse(PKT_JOIN, &body);
-                let _ = self.socket.send_to(&pkt, owner).await;
+                self.send_ctrl_signed_to(target, PKT_JOIN, &body).await;
                 false
             }
             EngineCmd::ManualPunch { target, count } => {
@@ -3267,20 +3015,17 @@ impl P2PEngine {
                 false
             }
             EngineCmd::SetIdentity {
-                is_owner,
                 my_vip,
                 my_node_id,
                 subnet_prefix,
+                vip_epoch,
                 reply,
             } => {
-                self.msyn_applied_to_rev = 0;
-                self.state.owner_ep_trusted = false;
-                self.state.is_owner = is_owner;
                 self.state.my_vip = my_vip.clone();
                 self.state.my_node_id = my_node_id;
+                self.state.vip_epoch = vip_epoch;
                 self.state.my_vip_u32 = my_vip.parse::<Ipv4Addr>().map(u32::from).unwrap_or(0);
                 self.state.subnet_prefix = subnet_prefix.clamp(8, 30);
-                refresh_owner_vip_cache(&mut self.state);
                 self.state_view.write().my_vip = my_vip.clone();
                 if !my_vip.is_empty() {
                     let prefix = self.state.subnet_prefix;
@@ -3443,7 +3188,7 @@ impl P2PEngine {
                 payload,
             } => {
                 let v = json!({
-                    "ttl": 2,
+                    "ttl": 1,
                     "dst_node": dst_node,
                     "src_node": self.state.my_node_id,
                     "kind": kind,
@@ -3459,20 +3204,44 @@ impl P2PEngine {
                 self.state.membership_version = v;
                 false
             }
-            EngineCmd::BroadcastMsmd(v) => {
-                let body = v.to_string();
+            EngineCmd::BroadcastLeave {
+                node_id,
+                vip,
+                vip_epoch,
+                event_id,
+            } => {
+                if !self.accept_wire_claim_vip(&vip) {
+                    return false;
+                }
+                let now = Instant::now();
+                install_leave_tombstone(
+                    &mut self.leave_tombs,
+                    &node_id,
+                    &vip,
+                    vip_epoch,
+                    now,
+                    LEAVE_TOMBSTONE_TTL,
+                );
+                remove_claim(&mut self.claim_map, &node_id);
+                let body = serde_json::json!({
+                    "proto_ver": WIRE_PROTOCOL_VERSION,
+                    "event_id": event_id,
+                    "node_id": node_id,
+                    "vip": vip,
+                    "vip_epoch": vip_epoch,
+                    "ts_ms": now_epoch_ms(),
+                })
+                .to_string();
                 let members: Vec<SocketAddr> = self.routing.read().endpoints_excluding_stale();
                 for ep in members {
                     let _ = self
-                        .send_control_packet(ep, PKT_MSMD, body.as_bytes())
+                        .send_control_packet(ep, PKT_LEAVE, body.as_bytes())
                         .await;
                 }
                 false
             }
-            EngineCmd::TriggerMembershipBroadcast => {
-                if self.state.is_owner {
-                    let _ = self.broadcast_msyn().await;
-                }
+            EngineCmd::TriggerClaimGossip => {
+                self.broadcast_claim_gossip().await;
                 false
             }
             EngineCmd::QueryPublicEndpoint {
@@ -3629,11 +3398,6 @@ impl P2PEngine {
                 );
                 false
             }
-            EngineCmd::QueryOwnerSendEndpoint { reply } => {
-                let ep = self.owner_send_endpoint();
-                let _ = reply.send(ep);
-                false
-            }
             EngineCmd::ParaSendHello {
                 target_vip,
                 payload,
@@ -3695,7 +3459,6 @@ impl P2PEngine {
                 announce_secs,
                 is_joiner,
                 join_body,
-                join_owner_hint,
                 node_id,
             } => {
                 if let Some(stop) = self.manual_punch_stops.remove("decentralized") {
@@ -3719,7 +3482,6 @@ impl P2PEngine {
                     announce_secs,
                     is_joiner,
                     join_body,
-                    join_owner_hint,
                     listen_port,
                 );
                 self.reset_reconnect_fastpath_state();
@@ -3748,6 +3510,10 @@ impl P2PEngine {
                 let _ = reply.send(self.pending_join_ack.take());
                 false
             }
+            EngineCmd::QueryDiscoveredCount { reply } => {
+                let _ = reply.send(self.decentralized.discovered_endpoints().len());
+                false
+            }
             EngineCmd::ResetSession { reply } => {
                 self.reset_session_state().await;
                 let _ = reply.send(());
@@ -3764,17 +3530,6 @@ impl P2PEngine {
         if let Ok(vip) = std::str::from_utf8(body).map(str::trim) {
             if vip.parse::<Ipv4Addr>().is_ok() {
                 self.learn_route_from_hole_punch_body(body, from, true, authenticated);
-
-                if !self.state.is_owner
-                    && !self.state.owner_vip_cached.is_empty()
-                    && vip == self.state.owner_vip_cached.as_str()
-                    && (authenticated || !self.has_crypto())
-                {
-                    self.state.owner_ep = Some(from);
-                    self.state.owner_ep_trusted = true;
-                    let owner_vip_str = self.state.owner_vip_cached.clone();
-                    self.remember_endpoint(&owner_vip_str, from);
-                }
             }
         }
     }
@@ -3787,13 +3542,9 @@ impl P2PEngine {
     }
 
     async fn handle_mctl(&mut self, body: &[u8], from: SocketAddr, authenticated: bool) {
-        let msyn_max = self.advanced_tuning.engine_limits.msyn_body_max;
-        let Some(parsed) = parse_mctl(body, msyn_max) else {
+        let Some(parsed) = parse_mctl(body) else {
             return;
         };
-        if (parsed.flags & MCTL_FLAG_MSYN) != 0 && !authenticated {
-            return;
-        }
         if parsed.signaling_ok {
             if let Some(vip) = parsed.vip.as_deref() {
                 if (parsed.flags & MCTL_FLAG_HB) != 0 {
@@ -3804,26 +3555,12 @@ impl P2PEngine {
                 }
             }
         }
-        if parsed.msyn_ok {
-            if let Some(msyn) = parsed.msyn.as_deref() {
-                self.handle_msyn_body(msyn, from).await;
-            }
-        }
     }
 
-    async fn send_mctl(
-        &mut self,
-        dest: SocketAddr,
-        flags: u16,
-        vip: Option<&[u8]>,
-        msyn: Option<&[u8]>,
-    ) -> bool {
-        let Some(body) = encode_mctl(flags, vip, msyn) else {
+    async fn send_mctl(&mut self, dest: SocketAddr, flags: u16, vip: Option<&[u8]>) -> bool {
+        let Some(body) = encode_mctl(flags, vip) else {
             return false;
         };
-        if body.len() > self.advanced_tuning.engine_limits.msyn_body_max {
-            return false;
-        }
         self.send_control_packet(dest, PKT_MCTL, &body).await
     }
 
@@ -3851,21 +3588,13 @@ impl P2PEngine {
         let now = Instant::now();
         let keepalive = Duration::from_secs(self.advanced_tuning.timers.keepalive_secs);
 
-        let (routes, owner_extra) = {
+        let routes = {
             let rt = self.routing.read();
-            let routes = rt.endpoints_excluding_stale();
-            let owner_extra = self
-                .owner_send_endpoint_for_rt(&rt)
-                .filter(|&ep| !rt.tracks_endpoint(ep));
-            (routes, owner_extra)
+            rt.endpoints_excluding_stale()
         };
 
-        let mut retain_keys: HashSet<SocketAddr> = routes.iter().copied().collect();
-        if let Some(ep) = owner_extra {
-            retain_keys.insert(ep);
-        }
+        let retain_keys: HashSet<SocketAddr> = routes.iter().copied().collect();
         self.outbound_udp.retain_only(&retain_keys);
-        sweep_msyn_assemble(&mut self.msyn_assemble, now);
 
         for &ep in &routes {
             if !self.outbound_udp.needs_refresh(ep, now, keepalive) {
@@ -3873,24 +3602,7 @@ impl P2PEngine {
                 continue;
             }
             if self
-                .send_mctl(ep, MCTL_FLAG_HB, Some(body.as_slice()), None)
-                .await
-            {
-                self.metrics.inc_keepalive_sent();
-            }
-        }
-        if let Some(owner_ep) = owner_extra {
-            if !self.outbound_udp.needs_refresh(owner_ep, now, keepalive) {
-                self.metrics.inc_keepalive_suppressed();
-                return;
-            }
-            if self
-                .send_mctl(
-                    owner_ep,
-                    MCTL_FLAG_HB | MCTL_FLAG_HOL,
-                    Some(body.as_slice()),
-                    None,
-                )
+                .send_mctl(ep, MCTL_FLAG_HB, Some(body.as_slice()))
                 .await
             {
                 self.metrics.inc_keepalive_sent();
@@ -3917,11 +3629,10 @@ impl P2PEngine {
         {
             return vec![primary];
         }
-        let ignore = self.owner_send_endpoint();
         let dests = self
             .routing
             .read()
-            .control_race_endpoints_for_endpoint(primary, ignore);
+            .control_race_endpoints_for_endpoint(primary, None);
         if dests.is_empty() {
             vec![primary]
         } else {
@@ -3972,6 +3683,10 @@ impl P2PEngine {
         self.reliable_seen_timeline
             .push_back((tokio::time::Instant::now(), dk, seq));
         self.touch_routing_endpoint(from);
+        // Compact JoinAck is rejected when crypto is enabled; expect sealed MPJA.
+        if self.has_crypto() {
+            return;
+        }
         self.dispatch_control(*PKT_JACK, &body[5..], from, false)
             .await;
     }
@@ -4066,13 +3781,11 @@ impl P2PEngine {
                 from,
                 public_ip: v.public_ip,
                 public_port: v.public_port,
-                proposed_key: v.proposed_key_hex,
-                proposed_vip_subnet: v.proposed_vip_subnet,
+                network_id: v.network_id,
                 node_id: v.node_id,
                 candidates: v.candidates,
                 start_at_ms: v.start_at_ms,
                 session_id: v.session_id,
-                discover_only: v.discover_only,
             });
             return;
         }
@@ -4088,16 +3801,12 @@ impl P2PEngine {
                 from,
                 public_ip: v.public_ip,
                 public_port: v.public_port,
-                assigned_vip: v.assigned_vip,
                 network_id: v.network_id,
                 node_id: v.node_id,
                 candidates: v.candidates,
                 agreed_start_at_ms: v.agreed_start_at_ms,
                 session_id: v.session_id,
                 responder_vip: v.responder_vip,
-                responder_is_owner: v.responder_is_owner,
-                network_name: v.network_name,
-                network_key_hex: v.network_key_hex,
             });
             return;
         }
@@ -4145,7 +3854,8 @@ impl P2PEngine {
         }
 
         if tag == *PKT_JOIN {
-            if !self.state.is_owner {
+            // Any member with identity may ack a claim hello (equal-peer join).
+            if self.state.my_vip.is_empty() || self.state.my_node_id.is_empty() {
                 return;
             }
             if !self.join_rate_limiter.allow(join_rate_key(from)) {
@@ -4180,26 +3890,46 @@ impl P2PEngine {
             if node.is_empty() || node.len() > 64 {
                 return;
             }
+            let claim_vip = v
+                .get("vip")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let claim_epoch = v.get("vip_epoch").and_then(|x| x.as_u64()).unwrap_or(0);
+            if !self.accept_wire_claim_vip(&claim_vip) {
+                return;
+            }
             let peer_cands_json = v.get("candidates").cloned();
-            // Announce only on first membership sighting; re-JOIN / JACK refresh stays silent.
             let already_known = self.routing.read().lookup_ep_by_node(&node).is_some();
-            let assigned_vip = if let Some(handler) = &self.join_handler {
-                handler(node.clone(), from)
+            self.apply_remote_claim(&node, &claim_vip, claim_epoch, from);
+            let reply = json!({
+                "proto_ver": WIRE_PROTOCOL_VERSION,
+                "node_id": self.state.my_node_id,
+                "vip": self.state.my_vip,
+                "vip_epoch": self.state.vip_epoch,
+                "prefix": self.state.subnet_prefix,
+                "candidates": self.state.candidates,
+                "crypto_required": self.has_crypto(),
+            });
+            let reply_body = reply.to_string();
+            if self.has_crypto() {
+                let sent = self
+                    .send_control_packet(from, PKT_JACK, reply_body.as_bytes())
+                    .await;
+                if !sent {
+                    let key = self
+                        .outbound_crypto_key_for(from)
+                        .or_else(|| self.state.crypto_keys.shared_signing_key());
+                    if let Some(key) = key {
+                        if let Some(sealed) =
+                            self.seal_control_body(key.as_ref(), PKT_JACK, reply_body.as_bytes())
+                        {
+                            let pkt = self.frame_with_tag_reuse(PKT_CTSIG, &sealed);
+                            let _ = self.pacing.enqueue_retransmit(pkt, from);
+                        }
+                    }
+                }
             } else {
-                self.allocate_owner_vip_fallback(&node)
-            };
-            if let Some(vip) = assigned_vip {
-                self.update_route(&vip, from, Some(&node));
-                let reply = json!({
-                    "proto_ver": WIRE_PROTOCOL_VERSION,
-                    "prefix": self.state.subnet_prefix,
-                    "vip": vip,
-                    "owner_vip": self.state.my_vip,
-                    "owner_node_id": self.state.my_node_id,
-                    "candidates": self.state.candidates,
-                    "crypto_required": self.has_crypto(),
-                });
-                let reply_body = reply.to_string();
                 let rtt_hint = self.routing_rtt_hint_ms(from);
                 match self.reliable.send(
                     CompactPacketType::JoinAck,
@@ -4217,36 +3947,29 @@ impl P2PEngine {
                         let _ = self.pacing.enqueue_retransmit(Bytes::from(raw), from);
                     }
                 }
+            }
 
-                self.send_ctrl_signed_to(from, PKT_HPCH, self.state.my_vip.as_bytes())
-                    .await;
-                let _ = self.broadcast_msyn_after_join().await;
-                if let Some(cands_val) = peer_cands_json {
-                    if let Ok(cands) = serde_json::from_value::<Vec<IceCandidate>>(cands_val) {
-                        if !cands.is_empty() {
-                            self.start_ice_checks(cands, node.clone()).await;
-                        }
+            self.send_ctrl_signed_to(from, PKT_HPCH, self.state.my_vip.as_bytes())
+                .await;
+            self.broadcast_claim_gossip().await;
+            if let Some(cands_val) = peer_cands_json {
+                if let Ok(cands) = serde_json::from_value::<Vec<IceCandidate>>(cands_val) {
+                    if !cands.is_empty() {
+                        self.start_ice_checks(cands, node.clone()).await;
                     }
                 }
-                // Live-only: must not enter the daemon UI replay ring (CLI re-attach).
-                if !already_known {
-                    self.ui
-                        .emit_plain_live(term_style::fmt_join_line(format_args!(
-                            " Owner confirmed peer join: node={} vip={} from={}",
-                            node, vip, from
-                        )));
-                }
-            } else {
-                let _ = self.send_control_packet(from, PKT_MERR, b"pool_full").await;
+            }
+            if !already_known {
+                self.ui
+                    .emit_plain_live(term_style::fmt_join_line(format_args!(
+                        " Member ack join hello: node={} vip={} from={}",
+                        node, claim_vip, from
+                    )));
             }
             return;
         }
 
         if tag == *PKT_JACK {
-            if self.state.is_owner {
-                return;
-            }
-
             if body.len() > 8192 {
                 return;
             }
@@ -4261,62 +3984,45 @@ impl P2PEngine {
                 )));
                 return;
             }
-            let vip = v
+            if !jack_mpja_body_valid(&v, from, self.unit_network_key().as_ref()) {
+                return;
+            }
+            let peer_vip = v
                 .get("vip")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            let owner_node_id = v
-                .get("owner_node_id")
+            let peer_node_id = v
+                .get("node_id")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
+            let peer_epoch = v.get("vip_epoch").and_then(|x| x.as_u64()).unwrap_or(0);
             let prefix = v
                 .get("prefix")
                 .and_then(|x| x.as_u64())
                 .map(|n| n as u8)
                 .unwrap_or(24)
                 .clamp(8, 30);
-            let owner_vip_str = v
-                .get("owner_vip")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| owner_vip_with_prefix(&vip, prefix));
-            if !jack_mpja_body_valid(&v, from) {
-                return;
-            }
             if self.state.join_tx.is_none() && !self.decentralized.is_joiner() {
+                // Idle member: still learn acker claim for presence, but do not complete join.
+                self.apply_remote_claim(&peer_node_id, &peer_vip, peer_epoch, from);
                 return;
             }
-            if let Some(invite) = self.state.owner_ep {
-                if invite != from {
-                    self.ui_err(term_style::fmt_join_line_stderr(format_args!(
-                        " MPJA from {from} (invite target was {invite}); using reply as owner endpoint."
-                    )));
-                }
-            }
+            self.apply_remote_claim(&peer_node_id, &peer_vip, peer_epoch, from);
             let ack = JoinAck {
-                vip: vip.clone(),
+                peer_vip: peer_vip.clone(),
+                peer_node_id: peer_node_id.clone(),
                 subnet_prefix: prefix,
-                owner_endpoint: from,
+                peer_endpoint: from,
+                local_vip: self.state.my_vip.clone(),
+                vip_epoch: self.state.vip_epoch,
             };
             let delivered = try_deliver_join_ack(&mut self.state.join_tx, ack.clone());
             if !delivered && !self.decentralized.is_joiner() {
                 return;
             }
-            self.msyn_applied_to_rev = 0;
             self.state.subnet_prefix = prefix;
-            self.state.owner_ep = Some(from);
-            self.state.owner_ep_trusted = true;
-            self.update_route(&owner_vip_str, from, Some(&owner_node_id));
-            self.state.my_vip = vip.clone();
-            self.state_view.write().my_vip = vip.clone();
-            if let Ok(parsed) = vip.parse::<Ipv4Addr>() {
-                self.state.my_vip_u32 = u32::from(parsed);
-            }
-            refresh_owner_vip_cache(&mut self.state);
-            self.state.owner_node_id = owner_node_id.clone();
-            // Handshake done: silence tracker/punch join UI regardless of oneshot delivery race.
             self.on_join_wait_finished();
             if delivered {
                 self.ui_out(term_style::fmt_join_line(format_args!(
@@ -4335,22 +4041,24 @@ impl P2PEngine {
             if let Some(cands_val) = v.get("candidates") {
                 if let Ok(cands) = serde_json::from_value::<Vec<IceCandidate>>(cands_val.clone()) {
                     if !cands.is_empty() {
-                        self.start_ice_checks(cands, owner_node_id).await;
+                        self.start_ice_checks(cands, peer_node_id).await;
                     }
                 }
             }
             return;
         }
 
-        if tag == *PKT_SYNC {
-            if self.state.is_owner {
-                return;
+        if tag == *PKT_CLG {
+            if authenticated {
+                self.handle_claim_gossip_body(body, from).await;
             }
-            self.handle_msyn_body(body, from).await;
             return;
         }
 
-        if tag == *PKT_MSMD {
+        if tag == *PKT_LEAVE {
+            if !authenticated {
+                return;
+            }
             if body.len() > 4096 {
                 return;
             }
@@ -4361,59 +4069,57 @@ impl P2PEngine {
             if event_id.is_empty() || !self.mark_msmd_seen(event_id) {
                 return;
             }
-            let event_type = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            let vip = v.get("vip").and_then(|x| x.as_str()).unwrap_or("");
             let node_id = v.get("node_id").and_then(|x| x.as_str()).unwrap_or("");
-            let ep_str = v.get("endpoint").and_then(|x| x.as_str()).unwrap_or("");
-            if event_type == "join" && !vip.is_empty() {
-                if let Ok(ep) = ep_str.parse::<SocketAddr>() {
-                    self.update_route(vip, ep, Some(node_id));
-                }
-            } else if event_type == "leave" && !vip.is_empty() {
-                if self.state.is_owner {
-                    self.note_route_removed_for_sync(vip);
-                }
-                let leave_evicted: Option<(SocketAddr, Option<String>)> = {
-                    let mut rt = self.routing.write();
-                    match rt.table.get(vip) {
-                        None => None,
-                        Some(entry) => {
-                            let node_ok = node_id.is_empty()
-                                || entry.node_id.is_empty()
-                                || entry.node_id.as_ref() == node_id;
-                            if !node_ok {
-                                return;
-                            }
-                            let ep = entry.endpoint;
-                            let removed_node =
-                                (!entry.node_id.is_empty()).then(|| entry.node_id.to_string());
-                            rt.remove(vip);
-                            Some((ep, removed_node))
+            let vip = v.get("vip").and_then(|x| x.as_str()).unwrap_or("");
+            let vip_epoch = v.get("vip_epoch").and_then(|x| x.as_u64()).unwrap_or(0);
+            if node_id.is_empty() || !self.accept_wire_claim_vip(vip) {
+                return;
+            }
+            let now = Instant::now();
+            install_leave_tombstone(
+                &mut self.leave_tombs,
+                node_id,
+                vip,
+                vip_epoch,
+                now,
+                LEAVE_TOMBSTONE_TTL,
+            );
+            remove_claim(&mut self.claim_map, node_id);
+            let leave_evicted: Option<(SocketAddr, Option<String>)> = {
+                let mut rt = self.routing.write();
+                match rt.table.get(vip) {
+                    None => None,
+                    Some(entry) => {
+                        let node_ok = node_id.is_empty()
+                            || entry.node_id.is_empty()
+                            || entry.node_id.as_ref() == node_id;
+                        if !node_ok {
+                            return;
                         }
-                    }
-                };
-                let leave_applied = leave_evicted.is_some();
-                if leave_applied {
-                    let removed_node = leave_evicted.as_ref().and_then(|(_, n)| n.as_deref());
-                    self.on_peer_route_removed(vip, removed_node);
-                    if !self.state.is_owner {
-                        self.notify_roster_remove(vip);
-                        self.stop_peer_reconnect_for_vip(vip);
+                        let ep = entry.endpoint;
+                        let removed_node =
+                            (!entry.node_id.is_empty()).then(|| entry.node_id.to_string());
+                        rt.remove(vip);
+                        Some((ep, removed_node))
                     }
                 }
-                if let Some((ep, _)) = leave_evicted {
-                    self.invalidate_fec_qd_cache(ep);
-                    self.state.crypto_keys.unbind_peer(ep);
-                    self.reliable.flush_dest(ep);
-                    self.teardown_fec_peer(ep);
-                }
-                if self.state.is_owner {
-                    self.peer_sync_state.remove(vip);
-                    if leave_applied {
-                        if let Some(handler) = &self.leave_handler {
-                            handler(vip.to_string());
-                        }
-                    }
+            };
+            let leave_applied = leave_evicted.is_some();
+            if leave_applied {
+                let removed_node = leave_evicted.as_ref().and_then(|(_, n)| n.as_deref());
+                self.on_peer_route_removed(vip, removed_node);
+                self.notify_roster_remove(vip);
+                self.stop_peer_reconnect_for_vip(vip);
+            }
+            if let Some((ep, _)) = leave_evicted {
+                self.invalidate_fec_qd_cache(ep);
+                self.state.crypto_keys.unbind_peer(ep);
+                self.reliable.flush_dest(ep);
+                self.teardown_fec_peer(ep);
+            }
+            if leave_applied {
+                if let Some(handler) = &self.leave_handler {
+                    handler(vip.to_string());
                 }
             }
             return;
@@ -4426,7 +4132,7 @@ impl P2PEngine {
             if !authenticated {
                 let trusted_source = {
                     let rt = self.routing.read();
-                    rt.ep_to_vip.contains_key(&from) || self.state.owner_ep == Some(from)
+                    rt.ep_to_vip.contains_key(&from)
                 };
                 if !trusted_source {
                     self.metrics.inc_unauth_drop_crypto_gate();
@@ -4463,7 +4169,8 @@ impl P2PEngine {
                 return;
             }
 
-            if self.state.is_owner && ttl > 0 {
+            let hop_budget = crate::net::packet::prxy_forwarded_ttl(ttl);
+            if let Some(fwd_ttl) = hop_budget {
                 let src_matches_sender = {
                     let rt = self.routing.read();
                     rt.ep_to_vip.get(&from).is_some_and(|vip| {
@@ -4482,7 +4189,7 @@ impl P2PEngine {
                 let dst_ep = self.routing.read().lookup_ep_by_node(&dst_node);
                 if let Some(dst_ep) = dst_ep {
                     let mut fwd = v.clone();
-                    fwd["ttl"] = json!(ttl - 1);
+                    fwd["ttl"] = json!(fwd_ttl);
                     let fwd_body = fwd.to_string();
                     let _ = self
                         .send_control_packet(dst_ep, PKT_PRXY, fwd_body.as_bytes())
@@ -4517,32 +4224,6 @@ impl P2PEngine {
             self.try_stop_ice_checks_for_join_peer(from, body);
             return;
         }
-
-        if tag == *PKT_KICK {
-            if self.state.is_owner {
-                return;
-            }
-
-            let owner_route_ep = {
-                let rt = self.routing.read();
-                let ov = &self.state.owner_vip_cached;
-                if ov.is_empty() {
-                    None
-                } else {
-                    rt.lookup(ov)
-                }
-            };
-            let from_owner = self.state.owner_ep == Some(from) || owner_route_ep == Some(from);
-            let signed_or_open = authenticated || !self.has_crypto();
-            if !from_owner || !signed_or_open {
-                return;
-            }
-            self.state.kicked = true;
-            self.stop_background_loops().await;
-            if let Some(tx) = self.state.join_tx.take() {
-                let _ = tx.send(None);
-            }
-        }
     }
 
     async fn handle_mdat_like(&mut self, raw: Bytes, from: SocketAddr) {
@@ -4571,46 +4252,40 @@ impl P2PEngine {
             if self.bcast_dedup.is_fresh(slice) {
                 self.note_rx_bytes(from, packet_len);
                 self.inject_to_tun(raw.clone());
-                let is_owner = self.state.is_owner;
-                let (direct_eps, relay_vips): (SmallVec<[SocketAddr; 16]>, SmallVec<[String; 8]>) = {
+                let (mut direct_eps, need_relay): (SmallVec<[SocketAddr; 16]>, bool) = {
                     let rt = self.routing.read();
-                    let owner_ep_opt = self.owner_send_endpoint_for_rt(&rt);
                     let mut direct: SmallVec<[SocketAddr; 16]> = SmallVec::new();
-                    let mut relay: SmallVec<[String; 8]> = SmallVec::new();
-                    for (vip, entry) in rt.table.iter() {
+                    let mut need_relay = false;
+                    for (_vip, entry) in rt.table.iter() {
                         if entry.endpoint == from {
                             continue;
                         }
-                        let want_relay = should_relay(entry, &rt.failover);
-                        if want_relay && !is_owner {
-                            relay.push(vip.clone());
+                        if should_relay(entry, &rt.failover) {
+                            need_relay = true;
                         } else {
                             direct.push(entry.endpoint);
                         }
                     }
-                    if !relay.is_empty() {
-                        if let Some(owner_ep) = owner_ep_opt {
-                            direct.retain(|ep| *ep != owner_ep);
-                        }
-                    }
-                    (direct, relay)
+                    (direct, need_relay)
                 };
+                let hub_ep = if need_relay {
+                    let rt = self.routing.read();
+                    match rt.select_broadcast_relay_hop(&self.state.my_vip, Some(from)) {
+                        RelaySelection::Hop(ep) => Some(ep),
+                        RelaySelection::None => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(hub) = hub_ep {
+                    direct_eps.retain(|ep| *ep != hub);
+                }
                 for ep in &direct_eps {
                     let _ = self.send_menc_forward(*ep, slice).await;
                 }
-                if !relay_vips.is_empty() && !is_owner {
-                    let hub = {
-                        let rt = self.routing.read();
-                        rt.select_broadcast_relay_hop(
-                            &self.state.owner_vip_cached,
-                            &self.state.my_vip,
-                            Some(from),
-                        )
-                    };
-                    if let RelaySelection::Hop(hub_ep) = hub {
-                        if hub_ep != from {
-                            let _ = self.send_menc_forward(hub_ep, slice).await;
-                        }
+                if let Some(hub_ep) = hub_ep {
+                    if hub_ep != from {
+                        let _ = self.send_menc_forward(hub_ep, slice).await;
                     }
                 }
             }
@@ -4622,17 +4297,6 @@ impl P2PEngine {
             self.inject_to_tun(raw);
             return;
         }
-        if self.state.is_owner {
-            let target = self.routing.read().lookup_by_vip_u32(dst);
-            if let Some(ep) = target {
-                if ep != from {
-                    let _ = self.send_menc_forward(ep, slice).await;
-                }
-            } else {
-                self.metrics.inc_owner_forward_unknown_dst();
-            }
-            return;
-        }
         let trusted = self.routing.read().ep_to_vip.contains_key(&from);
         if trusted {
             let target = self.routing.read().lookup_by_vip_u32(dst);
@@ -4641,7 +4305,7 @@ impl P2PEngine {
                     let _ = self.send_menc_forward(ep, slice).await;
                 }
             } else {
-                self.metrics.inc_peer_forward_unknown_dst();
+                self.metrics.inc_hub_forward_unknown_dst();
             }
             return;
         }
@@ -4716,12 +4380,11 @@ impl P2PEngine {
         }
         self.probe_miss_by_ep.remove(&from);
         let rtt = (now_ms.saturating_sub(pending.sent_at_ms)) as i64;
-        let owner_ep_hint = self.owner_send_endpoint();
         let (vip_rtt_updated, owd_outcome) = {
             let mut rt = self.routing.write();
-            let vip_rtt_updated = rt.note_rtt(from, rtt.max(1), owner_ep_hint);
+            let vip_rtt_updated = rt.note_rtt(from, rtt.max(1), None);
             let owd_outcome = if vip_rtt_updated {
-                rt.note_fwd_owd(from, fwd_owd_sample_ms as f64, owner_ep_hint)
+                rt.note_fwd_owd(from, fwd_owd_sample_ms as f64, rtt.max(1) as f64, None)
             } else {
                 crate::routing::OwdSampleOutcome::Ignored
             };
@@ -4905,7 +4568,12 @@ impl P2PEngine {
             rt.ep_to_vip
                 .get(&ep)
                 .and_then(|vip| rt.table.get(vip))
-                .map(|e| crate::routing::effective_queuing_delay_ms(e))
+                .map(|e| {
+                    crate::routing::effective_queuing_delay_ms(
+                        e,
+                        rt.congestion.owd_prefer_after_samples,
+                    )
+                })
                 .unwrap_or(-1.0)
         };
         let st = self.fec_send_by_dest.entry(ep).or_default();
@@ -4924,7 +4592,15 @@ impl P2PEngine {
             rt.ep_to_vip
                 .get(&ep)
                 .and_then(|vip| rt.table.get(vip))
-                .map(|e| (crate::routing::effective_queuing_delay_ms(e), e.loss_ewma))
+                .map(|e| {
+                    (
+                        crate::routing::effective_queuing_delay_ms(
+                            e,
+                            rt.congestion.owd_prefer_after_samples,
+                        ),
+                        e.loss_ewma,
+                    )
+                })
                 .unwrap_or((-1.0, 0.0))
         };
         self.pacing.on_cc_sample(ep, qd, loss);
@@ -5014,7 +4690,12 @@ impl P2PEngine {
                     rt.ep_to_vip
                         .get(&dest)
                         .and_then(|vip| rt.table.get(vip))
-                        .map(|e| crate::routing::effective_queuing_delay_ms(e))
+                        .map(|e| {
+                            crate::routing::effective_queuing_delay_ms(
+                                e,
+                                rt.congestion.owd_prefer_after_samples,
+                            )
+                        })
                         .unwrap_or(-1.0)
                 };
                 st.queuing_delay_ms_cached = Some(val);
@@ -5294,16 +4975,13 @@ impl P2PEngine {
     }
 
     async fn send_control_packet(&mut self, dest: SocketAddr, tag: &[u8; 4], body: &[u8]) -> bool {
-        let mctl_needs_msyn_seal = *tag == *PKT_MCTL
-            && body.len() >= 2
-            && (u16::from_le_bytes([body[0], body[1]]) & MCTL_FLAG_MSYN) != 0;
         let needs_sign = matches!(
             *tag,
-            t if t == *PKT_SYNC
-                || t == *PKT_MSMD
-                || t == *PKT_KICK
+            t if t == *PKT_CLG
+                || t == *PKT_LEAVE
                 || t == *PKT_PRXY
-        ) || mctl_needs_msyn_seal;
+                || t == *PKT_JACK
+        );
         if needs_sign {
             let key = self
                 .outbound_crypto_key_for(dest)
@@ -5402,7 +5080,7 @@ impl P2PEngine {
 
     fn direct_retry_tick(&mut self) {
         let keepalive_body = self.state.my_vip.as_bytes().to_vec();
-        let (targets, owner_known) = {
+        let targets = {
             let rt = self.routing.read();
             let filtered: Vec<SocketAddr> = rt
                 .snapshot_for_retry()
@@ -5429,11 +5107,7 @@ impl P2PEngine {
             if n > 0 {
                 self.direct_retry_cursor = (start + take_n) % n;
             }
-            let owner_known = self
-                .owner_send_endpoint_for_rt(&rt)
-                .map(|owner_ep| rt.ep_to_vip.contains_key(&owner_ep))
-                .unwrap_or(false);
-            (targets, owner_known)
+            targets
         };
         for ep in targets {
             self.enqueue_ctrl_raced(ep, PKT_HPCH, &keepalive_body);
@@ -5472,20 +5146,6 @@ impl P2PEngine {
                 self.pacing.enqueue_control(pkt, ep);
             }
         }
-
-        if !self.state.is_owner {
-            if let Some(owner_ep) = self.owner_send_endpoint() {
-                if !owner_known {
-                    let pkt = build_signed_or_plain_static(
-                        self.outbound_crypto_key_for(owner_ep),
-                        &self.ctrl_send_ctr,
-                        PKT_HPCH,
-                        &keepalive_body,
-                    );
-                    self.pacing.enqueue_control(pkt, owner_ep);
-                }
-            }
-        }
     }
 
     fn reschedule_pmtud_interval(&mut self) {
@@ -5506,14 +5166,6 @@ impl P2PEngine {
             .set_missed_tick_behavior(MissedTickBehavior::Delay);
     }
 
-    /// RFC1918 peers: main listen socket (same 5-tuple as data/punch). Public: DF probe socket.
-    fn pmtud_probe_send_socket(&self, peer: SocketAddr) -> &UdpSocket {
-        match pmtud_probe_send_path(peer) {
-            PmtudProbeSendPath::Main => self.socket.as_ref(),
-            PmtudProbeSendPath::Probe => self.pmtud_probe_socket.as_ref(),
-        }
-    }
-
     async fn drive_pmtud_tick(&mut self) {
         let now = Instant::now();
         let cong = &self.advanced_tuning.congestion;
@@ -5530,7 +5182,10 @@ impl P2PEngine {
                     let vip_u32 = vip.parse::<Ipv4Addr>().ok().map(u32::from);
                     Some((
                         entry.smoothed_rtt_ms,
-                        crate::routing::effective_queuing_delay_ms(entry),
+                        crate::routing::effective_queuing_delay_ms(
+                            entry,
+                            rt.congestion.owd_prefer_after_samples,
+                        ),
                         vip_u32,
                     ))
                 }) {
@@ -5571,11 +5226,12 @@ impl P2PEngine {
             body.extend_from_slice(&intent.probe_id.to_be_bytes());
             body.resize(10 + payload_len, 0xAB);
             let frame = frame_with_tag(PKT_PMTU, &body);
-            self.metrics.inc_pmtud_probes_sent();
-            let sock = self.pmtud_probe_send_socket(intent.peer);
-            match sock.send_to(&frame, intent.peer).await {
-                Ok(_) => {}
+            match self.socket.send_to(&frame, intent.peer).await {
+                Ok(_) => {
+                    self.metrics.inc_pmtud_probes_sent();
+                }
                 Err(e) if is_udp_message_too_long(&e) => {
+                    self.metrics.inc_pmtud_probes_sent();
                     let ev =
                         self.pmtud
                             .on_send_hard_fail(intent.peer, intent.probe_id, Instant::now());
@@ -5601,28 +5257,139 @@ impl P2PEngine {
         self.reschedule_pmtud_interval();
     }
 
-    fn note_route_removed_for_sync(&mut self, removed_vip: &str) {
-        if !self.state.is_owner {
+    async fn broadcast_claim_gossip(&mut self) {
+        if self.state.my_vip.is_empty() || self.state.my_node_id.is_empty() {
             return;
         }
-        let peers: Vec<String> = {
+        let own = ClaimRecord {
+            node_id: self.state.my_node_id.clone(),
+            vip: self.state.my_vip.clone(),
+            vip_epoch: self.state.vip_epoch,
+            ep_hints: vec![],
+        };
+        let now = Instant::now();
+        // Enrich empty ep_hints from the live routing table so third-party claims
+        // remain punchable after gossip.
+        {
             let rt = self.routing.read();
-            rt.sync_snapshot()
-                .into_iter()
-                .filter(|r| !matches!(r.state, RouteState::Stale))
-                .filter(|r| r.vip.as_ref() != removed_vip)
-                .map(|r| r.vip.to_string())
+            for claim in self.claim_map.values_mut() {
+                if claim.ep_hints.is_empty() {
+                    if let Some(entry) = rt.table.get(&claim.vip) {
+                        if matches!(
+                            entry.state,
+                            RouteState::Active | RouteState::Candidate | RouteState::Degraded
+                        ) {
+                            claim.ep_hints.push(entry.endpoint.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let digest = build_gossip_digest_rotated(
+            &own,
+            &self.claim_map,
+            &self.leave_tombs,
+            now,
+            CLAIM_GOSSIP_DIGEST_MAX,
+            self.claim_gossip_digest_cursor,
+        );
+        self.claim_gossip_digest_cursor = self.claim_gossip_digest_cursor.saturating_add(1);
+
+        let mut leave_tombs =
+            select_leave_tombs_for_gossip(&self.leave_tombs, now, CLAIM_GOSSIP_LEAVE_TOMBS_MAX);
+        let mut claims_json: Vec<serde_json::Value> = digest
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "node_id": c.node_id,
+                    "vip": c.vip,
+                    "vip_epoch": c.vip_epoch,
+                    "ep_hints": c.ep_hints,
+                })
+            })
+            .collect();
+        let max = self.advanced_tuning.engine_limits.msyn_body_max;
+        let mut leaves_json: Vec<serde_json::Value> = leave_tombs
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "node_id": t.node_id,
+                    "vip": t.vip,
+                    "vip_epoch": t.vip_epoch,
+                })
+            })
+            .collect();
+        let mut body_bytes = serde_json::json!({
+            "proto_ver": WIRE_PROTOCOL_VERSION,
+            "from": self.state.my_node_id,
+            "ts_ms": now_epoch_ms(),
+            "claims": claims_json,
+            "leaves": leaves_json,
+        })
+        .to_string()
+        .into_bytes();
+        // Trim tombs first, then claims (keep own claim at index 0).
+        while body_bytes.len() > max && !leave_tombs.is_empty() {
+            leave_tombs.pop();
+            leaves_json = leave_tombs
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "node_id": t.node_id,
+                        "vip": t.vip,
+                        "vip_epoch": t.vip_epoch,
+                    })
+                })
+                .collect();
+            body_bytes = serde_json::json!({
+                "proto_ver": WIRE_PROTOCOL_VERSION,
+                "from": self.state.my_node_id,
+                "ts_ms": now_epoch_ms(),
+                "claims": claims_json,
+                "leaves": leaves_json,
+            })
+            .to_string()
+            .into_bytes();
+        }
+        while body_bytes.len() > max && claims_json.len() > 1 {
+            claims_json.pop();
+            body_bytes = serde_json::json!({
+                "proto_ver": WIRE_PROTOCOL_VERSION,
+                "from": self.state.my_node_id,
+                "ts_ms": now_epoch_ms(),
+                "claims": claims_json,
+                "leaves": leaves_json,
+            })
+            .to_string()
+            .into_bytes();
+        }
+        if body_bytes.len() > max {
+            return;
+        }
+        let active_eps: Vec<SocketAddr> = {
+            let rt = self.routing.read();
+            rt.table
+                .values()
+                .filter(|e| e.state == RouteState::Active)
+                .map(|e| e.endpoint)
                 .collect()
         };
-        for peer_vip in peers {
-            self.peer_pending_removals
-                .entry(peer_vip)
-                .or_default()
-                .insert(removed_vip.to_string());
+        let targets = rotate_endpoints(&active_eps, self.claim_gossip_fanout_cursor, 8);
+        self.claim_gossip_fanout_cursor = self.claim_gossip_fanout_cursor.saturating_add(1);
+        for ep in targets {
+            let _ = self.send_control_packet(ep, PKT_CLG, &body_bytes).await;
         }
     }
 
-    async fn handle_msyn_body(&mut self, body: &[u8], from: SocketAddr) {
+    async fn flush_pending_claim_gossip(&mut self) {
+        if !self.pending_claim_gossip {
+            return;
+        }
+        self.pending_claim_gossip = false;
+        self.broadcast_claim_gossip().await;
+    }
+
+    async fn handle_claim_gossip_body(&mut self, body: &[u8], from: SocketAddr) {
         if body.len() > self.advanced_tuning.engine_limits.msyn_body_max {
             return;
         }
@@ -5630,357 +5397,135 @@ impl P2PEngine {
             return;
         };
         let now = Instant::now();
-        let outcome = ingest_msyn_part(
-            &mut self.msyn_assemble,
-            from,
-            &v,
-            self.msyn_applied_to_rev,
-            now,
-        );
-        match outcome {
-            MsynIngestOutcome::Ignored => {}
-            MsynIngestOutcome::Buffered { first_part } => {
-                if first_part {
-                    self.stop_all_peer_reconnect_workflows();
-                }
-            }
-            MsynIngestOutcome::Complete(done) => {
-                self.stop_all_peer_reconnect_workflows();
-                let from_rev = done.from_rev;
-                let to_rev = done.to_rev;
-                let (removed, routes) = done.assemble_removed_then_routes();
-                self.apply_msyn_epoch(from, from_rev, to_rev, &removed, &routes)
-                    .await;
-            }
-        }
-    }
-
-    async fn apply_msyn_epoch(
-        &mut self,
-        from: SocketAddr,
-        from_rev: u64,
-        to_rev: u64,
-        removed: &[String],
-        routes: &[serde_json::Value],
-    ) {
-        if to_rev <= self.msyn_applied_to_rev {
-            return;
-        }
-        if removed.len() > MSYN_APPLY_MAX_REMOVED || routes.len() > MSYN_APPLY_MAX_ROUTES {
-            self.ui_err(format!(
-                "[MSYN] assembled epoch too large (routes={} removed={}, caps {}/{}); ignore to_rev={}",
-                routes.len(),
-                removed.len(),
-                MSYN_APPLY_MAX_ROUTES,
-                MSYN_APPLY_MAX_REMOVED,
-                to_rev
-            ));
-            return;
-        }
-        {
-            let (evicted_eps, removed_peers) = {
-                let mut rt = self.routing.write();
-                let mut evicted_eps = Vec::new();
-                let mut removed_peers = Vec::new();
-                for vip in removed.iter() {
-                    if is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix) {
-                        let node_id = rt
-                            .table
-                            .get(vip.as_str())
-                            .and_then(|e| (!e.node_id.is_empty()).then(|| e.node_id.to_string()));
-                        if let Some(ep) = rt.lookup(vip) {
-                            evicted_eps.push(ep);
-                        }
-                        rt.remove(vip);
-                        removed_peers.push((vip.clone(), node_id));
-                    }
-                }
-                (evicted_eps, removed_peers)
-            };
-            for (vip, node_id) in removed_peers {
-                self.on_peer_route_removed(&vip, node_id.as_deref());
-                if !self.state.is_owner {
-                    self.notify_roster_remove(&vip);
-                    self.stop_peer_reconnect_for_vip(&vip);
-                }
-            }
-            for ep in evicted_eps {
-                self.invalidate_fec_qd_cache(ep);
-                self.state.crypto_keys.unbind_peer(ep);
-                self.reliable.flush_dest(ep);
-                self.teardown_fec_peer(ep);
-            }
-        }
-
-        self.touch_routing_endpoint(from);
-        let mut updates: Vec<(String, SocketAddr, Option<String>)> = Vec::new();
-        for r in routes.iter() {
-            let Some(vip) = r.get("vip").and_then(|x| x.as_str()) else {
-                continue;
-            };
-            if !is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix) {
-                continue;
-            }
-            let Some(ep) = r.get("ep").and_then(|x| x.as_str()) else {
-                continue;
-            };
-            if let Ok(addr) = ep.parse::<SocketAddr>() {
-                if !is_valid_sync_endpoint(addr) {
+        if let Some(leaves_arr) = v.get("leaves").and_then(|x| x.as_array()) {
+            for item in leaves_arr {
+                let node_id = item.get("node_id").and_then(|x| x.as_str()).unwrap_or("");
+                let vip = item.get("vip").and_then(|x| x.as_str()).unwrap_or("");
+                let vip_epoch = item.get("vip_epoch").and_then(|x| x.as_u64()).unwrap_or(0);
+                if node_id.is_empty() || !self.accept_wire_claim_vip(vip) {
                     continue;
                 }
-                let node_id = r.get("node_id").and_then(|x| x.as_str());
-                updates.push((vip.to_string(), addr, node_id.map(|s| s.to_string())));
+                install_leave_tombstone(
+                    &mut self.leave_tombs,
+                    node_id,
+                    vip,
+                    vip_epoch,
+                    now,
+                    LEAVE_TOMBSTONE_TTL,
+                );
             }
         }
-        if !updates.is_empty() {
-            let mut sync_effects: Vec<(String, SocketAddr, Option<SocketAddr>, bool)> =
-                Vec::with_capacity(updates.len());
-            let mut relay_stamp_vips: Vec<String> = Vec::new();
-            {
-                let mut rt = self.routing.write();
-                for (vip, ep, node_id) in &updates {
-                    if vip == &self.state.my_vip {
-                        continue;
-                    }
-                    let was_present = rt.table.contains_key(vip.as_str());
-                    let prev = rt.table.get(vip.as_str()).map(|e| e.endpoint);
-                    rt.update(vip, *ep, node_id.as_deref());
-                    if !self.state.is_owner {
-                        relay_stamp_vips.push(vip.clone());
-                    }
-                    sync_effects.push((vip.clone(), *ep, prev, was_present));
-                }
-            }
-            for vip in relay_stamp_vips {
-                self.sync_dest_relay_path_stamp(&vip);
-            }
-            let mut newly_added: Vec<SocketAddr> = Vec::with_capacity(sync_effects.len());
-            for (vip, ep, prev, was_present) in sync_effects {
-                if !was_present {
-                    newly_added.push(ep);
-                }
-                self.apply_route_endpoint_change_side_effects(&vip, ep, prev);
-            }
-            for ep in newly_added {
-                self.send_ctrl_signed_to(ep, PKT_HPCH, self.state.my_vip.as_bytes())
-                    .await;
-            }
-            if !self.state.is_owner {
-                for (vip, ep, node_id) in &updates {
-                    if vip == &self.state.my_vip {
-                        continue;
-                    }
-                    self.notify_roster_upsert(vip, *ep, node_id.as_deref());
-                }
-            }
-        }
-        if from_rev == 0 {
-            let mut allowed: HashSet<String> = HashSet::new();
-            allowed.insert(self.state.my_vip.clone());
-            for r in routes.iter() {
-                if let Some(vip) = r.get("vip").and_then(|x| x.as_str()) {
-                    if is_valid_sync_vip(&self.state.my_vip, vip, self.state.subnet_prefix) {
-                        allowed.insert(vip.to_string());
-                    }
-                }
-            }
-            let phantoms: Vec<(String, SocketAddr, Option<String>)> = {
-                let rt = self.routing.read();
-                rt.table
-                    .iter()
-                    .filter(|(vip, _)| {
-                        vip.as_str() != self.state.my_vip.as_str()
-                            && is_valid_sync_vip(
-                                &self.state.my_vip,
-                                vip.as_str(),
-                                self.state.subnet_prefix,
-                            )
-                            && !allowed.contains(vip.as_str())
-                    })
-                    .map(|(vip, e)| {
-                        let node_id = (!e.node_id.is_empty()).then(|| e.node_id.to_string());
-                        (vip.clone(), e.endpoint, node_id)
-                    })
-                    .collect()
-            };
-            for (vip, ep, node_id) in phantoms {
-                {
-                    let mut rt = self.routing.write();
-                    rt.remove(&vip);
-                }
-                self.on_peer_route_removed(&vip, node_id.as_deref());
-                if !self.state.is_owner {
-                    self.notify_roster_remove(&vip);
-                    self.stop_peer_reconnect_for_vip(&vip);
-                }
-                self.invalidate_fec_qd_cache(ep);
-                self.state.crypto_keys.unbind_peer(ep);
-                self.reliable.flush_dest(ep);
-                self.teardown_fec_peer(ep);
-            }
-        }
-        self.msyn_applied_to_rev = self.msyn_applied_to_rev.max(to_rev);
-    }
-
-    async fn broadcast_msyn(&mut self) -> Result<()> {
-        if !self.state.is_owner {
-            return Ok(());
-        }
-        let retain_pending: HashSet<String> = self
-            .peer_pending_removals
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        {
-            let mut rt = self.routing.write();
-            rt.prune_tombstones(&retain_pending);
-        }
-        let (current_rev, snapshot, relevant_tombs) = {
-            let rt = self.routing.read();
-            let rev = rt.revision;
-            let snap = rt.sync_snapshot();
-            let tombs: Vec<(String, u64)> = rt
-                .tombstones
-                .iter()
-                .map(|(vip, (rev, _))| (vip.clone(), *rev))
-                .collect();
-            (rev, snap, tombs)
+        let Some(claims_arr) = v.get("claims").and_then(|x| x.as_array()) else {
+            return;
         };
-
-        let routes_full = routes_from_snapshot_non_stale(&snapshot);
-        let budget =
-            effective_msyn_json_budget(self.advanced_tuning.engine_limits.msyn_shard_budget_bytes);
-
-        for row in &snapshot {
-            if matches!(row.state, RouteState::Stale) {
+        let claims_arr_len = claims_arr.len();
+        let gossip_from_node = v.get("from").and_then(|x| x.as_str()).unwrap_or("");
+        let mut should_gossip = false;
+        let mut pending_routes: Vec<(
+            String,
+            String,
+            u64,
+            crate::net::claim_gossip::MergeOutcome,
+            Vec<String>,
+        )> = Vec::new();
+        for item in claims_arr {
+            let node_id = item.get("node_id").and_then(|x| x.as_str()).unwrap_or("");
+            let vip = item.get("vip").and_then(|x| x.as_str()).unwrap_or("");
+            let vip_epoch = item.get("vip_epoch").and_then(|x| x.as_u64()).unwrap_or(0);
+            let ep_hints: Vec<String> = item
+                .get("ep_hints")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if node_id.is_empty() || !self.accept_wire_claim_vip(vip) {
                 continue;
             }
-            let peer_vip = row.vip.as_ref();
-            let ep = row.endpoint;
-            let last = self.peer_sync_state.get(peer_vip).copied().unwrap_or(0);
-            if last == current_rev {
+            if node_id == self.state.my_node_id {
                 continue;
             }
-
-            let pending = self.peer_pending_removals.get(peer_vip);
-            let sync_id = self.next_msyn_sync_id;
-            self.next_msyn_sync_id = self.next_msyn_sync_id.saturating_add(1).max(1);
-
-            let (parts_result, delivered_removed) = if last == 0 {
-                let removed = collect_removed_vips(0, &relevant_tombs, pending);
-                (
-                    build_msyn_full_shards(current_rev, sync_id, &routes_full, &removed, budget)
-                        .map(Some),
-                    removed,
-                )
-            } else {
-                let delivered = collect_removed_vips(last, &relevant_tombs, pending);
-                (
-                    build_msyn_delta_shards(
-                        last,
-                        current_rev,
-                        sync_id,
-                        &snapshot,
-                        &relevant_tombs,
-                        pending,
-                        budget,
-                    ),
-                    delivered,
-                )
+            let incoming = ClaimRecord {
+                node_id: node_id.to_string(),
+                vip: vip.to_string(),
+                vip_epoch,
+                ep_hints: ep_hints.clone(),
             };
-
-            let parts = match parts_result {
-                Ok(None) => {
-                    if peer_owes_removals(last, &relevant_tombs, pending) {
-                        self.ui_err(format!(
-                            "[MSYN] advance blocked: peer {} still owes removals (last={} rev={})",
-                            peer_vip, last, current_rev
-                        ));
-                    } else {
-                        self.peer_sync_state
-                            .insert(peer_vip.to_string(), current_rev);
-                    }
+            let outcome = merge_claim(
+                &mut self.claim_map,
+                incoming,
+                &self.leave_tombs,
+                &mut self.fight_suppress,
+                now,
+            );
+            match outcome {
+                crate::net::claim_gossip::MergeOutcome::Rejected
+                | crate::net::claim_gossip::MergeOutcome::BlockedByTombstone
+                | crate::net::claim_gossip::MergeOutcome::BlockedByFight => {
                     continue;
                 }
-                Ok(Some(parts)) => parts,
-                Err(ShardError::EntryTooLarge { kind, bytes }) => {
-                    self.ui_err(format!(
-                        "[MSYN] {kind} entry {bytes} bytes exceeds shard budget {budget}; skip peer {}",
-                        peer_vip
+                crate::net::claim_gossip::MergeOutcome::IgnoredStale
+                | crate::net::claim_gossip::MergeOutcome::Accepted => {
+                    pending_routes.push((
+                        node_id.to_string(),
+                        vip.to_string(),
+                        vip_epoch,
+                        outcome,
+                        ep_hints,
                     ));
-                    continue;
                 }
-                Err(ShardError::TooManyParts { parts }) => {
-                    self.ui_err(format!(
-                        "[MSYN] epoch needs {parts} parts (max {}); skip peer {}",
-                        crate::net::msyn_sync::MSYN_ASSEMBLE_MAX_PARTS_TOTAL,
-                        peer_vip
-                    ));
-                    continue;
-                }
-                Err(ShardError::EpochTooLarge { routes, removed }) => {
-                    self.ui_err(format!(
-                        "[MSYN] epoch too large (routes={routes} removed={removed}, caps {}/{}); skip peer {}",
-                        MSYN_APPLY_MAX_ROUTES,
-                        MSYN_APPLY_MAX_REMOVED,
-                        peer_vip
-                    ));
-                    continue;
-                }
-            };
-
-            let mut sync_ok = true;
-            let vip_owned = self.state.my_vip.clone();
-            for part in &parts {
-                let body_bytes = part.as_bytes();
-                if body_bytes.len() > self.advanced_tuning.engine_limits.msyn_body_max {
-                    self.ui_err(format!(
-                        "[MSYN] part {} bytes exceeds msyn_body_max; skip peer {}",
-                        body_bytes.len(),
-                        peer_vip
-                    ));
-                    sync_ok = false;
-                    break;
-                }
-                let now = Instant::now();
-                let keepalive = Duration::from_secs(self.advanced_tuning.timers.keepalive_secs);
-                let uncovered = self.outbound_udp.needs_refresh(ep, now, keepalive);
-                let (flags, vip) = if uncovered {
-                    (MCTL_FLAG_MSYN | MCTL_FLAG_HB, Some(vip_owned.as_bytes()))
-                } else {
-                    (MCTL_FLAG_MSYN, None)
-                };
-                if !self.send_mctl(ep, flags, vip, Some(body_bytes)).await {
-                    sync_ok = false;
-                    break;
-                }
-            }
-
-            if sync_ok {
-                if let Some(pending_set) = self.peer_pending_removals.get_mut(peer_vip) {
-                    clear_pending_delivered(pending_set, &delivered_removed);
-                }
-            }
-            let pending_after = self.peer_pending_removals.get(peer_vip);
-            if should_advance_peer_sync_after_send(sync_ok, pending_after) {
-                self.peer_sync_state
-                    .insert(peer_vip.to_string(), current_rev);
-            } else if sync_ok && pending_after.is_some_and(|p| !p.is_empty()) {
-                self.ui_err(format!(
-                    "[MSYN] advance blocked after send: peer {} peer_pending_removals still non-empty",
-                    peer_vip
-                ));
             }
         }
-        Ok(())
+        if self.apply_claim_settle_and_local_fight(None) {
+            should_gossip = true;
+        }
+        for (node_id, vip, vip_epoch, outcome, ep_hints) in pending_routes {
+            let may_route = claim_still_live(&self.claim_map, &node_id, &vip, vip_epoch)
+                && matches!(
+                    outcome,
+                    crate::net::claim_gossip::MergeOutcome::Accepted
+                        | crate::net::claim_gossip::MergeOutcome::IgnoredStale
+                );
+            if !may_route || vip == self.state.my_vip {
+                if matches!(outcome, crate::net::claim_gossip::MergeOutcome::Accepted) {
+                    should_gossip = true;
+                }
+                continue;
+            }
+            let ep = if !gossip_from_node.is_empty() && node_id == gossip_from_node {
+                Some(from)
+            } else {
+                ep_hints.iter().find_map(|h| h.parse::<SocketAddr>().ok())
+            }
+            .or_else(|| {
+                if gossip_from_node.is_empty() && claims_arr_len == 1 {
+                    Some(from)
+                } else {
+                    None
+                }
+            });
+            if let Some(ep) = ep {
+                self.update_route(&vip, ep, Some(&node_id));
+                self.notify_roster_upsert(&vip, ep, Some(&node_id));
+                if matches!(outcome, crate::net::claim_gossip::MergeOutcome::Accepted) {
+                    should_gossip = true;
+                }
+            } else if matches!(outcome, crate::net::claim_gossip::MergeOutcome::Accepted) {
+                should_gossip = true;
+            }
+        }
+        if should_gossip || self.pending_claim_gossip {
+            self.pending_claim_gossip = false;
+            self.broadcast_claim_gossip().await;
+        }
     }
 
     async fn start_ice_checks(&mut self, mut candidates: Vec<IceCandidate>, src_node: String) {
         if candidates.is_empty() {
             return;
         }
-
         candidates.sort_by_key(|c| match c.kind.as_str() {
             "srflx" => 0,
             "upnp" => 1,
@@ -5998,7 +5543,6 @@ impl P2PEngine {
         }
         let socket = self.socket.clone();
         let state_view = self.state_view.clone();
-        let outbound = self.outbound_udp.clone();
         if let Some(stop) = self.ice_check_stops.remove(&src_node) {
             stop.store(true, Ordering::Release);
         }
@@ -6031,10 +5575,7 @@ impl P2PEngine {
                             return;
                         }
                         let idx = (next_idx + k) % targets.len();
-                        let dest = targets[idx];
-                        if socket.send_to(&pkt, dest).await.is_ok() {
-                            outbound.note(dest);
-                        }
+                        let _ = socket.send_to(&pkt, targets[idx]).await;
                     }
                     next_idx = (next_idx + take) % targets.len().max(1);
                     tokio::task::yield_now().await;
@@ -6042,19 +5583,6 @@ impl P2PEngine {
                 }
             }
         });
-    }
-
-    async fn broadcast_msyn_after_join(&mut self) -> Result<()> {
-        let now = Instant::now();
-        if let Some(prev) = self.last_msyn_after_join {
-            if now.duration_since(prev) < Duration::from_millis(200) {
-                self.pending_msyn_after_join = true;
-                return Ok(());
-            }
-        }
-        self.pending_msyn_after_join = false;
-        self.last_msyn_after_join = Some(now);
-        self.broadcast_msyn().await
     }
 
     fn try_apply_adapter_mtu(&mut self, mtu: u16) {
@@ -6137,25 +5665,281 @@ impl P2PEngine {
         }
     }
 
-    fn allocate_owner_vip_fallback(&self, node_id: &str) -> Option<String> {
-        let rt = self.routing.read();
-        if let Some(ep) = rt.lookup_ep_by_node(node_id) {
-            if let Some(vip) = rt.ep_to_vip.get(&ep).cloned() {
-                return Some(vip);
-            }
+    fn unit_network_key(&self) -> Option<Key> {
+        self.state
+            .crypto_keys
+            .shared_signing_key()
+            .map(|k| k.as_key())
+    }
+
+    fn accept_wire_claim_vip(&self, vip: &str) -> bool {
+        crate::net::claim::accept_wire_claim_vip(self.unit_network_key().as_ref(), vip)
+    }
+
+    fn apply_remote_claim(
+        &mut self,
+        remote_node_id: &str,
+        remote_vip: &str,
+        remote_epoch: u64,
+        from: SocketAddr,
+    ) {
+        if remote_node_id.is_empty() || !self.accept_wire_claim_vip(remote_vip) {
+            return;
         }
-        match first_free_vip_u32_in_subnet(self.state.my_vip_u32, self.state.subnet_prefix, |u| {
-            rt.vip_u32_to_vip.contains_key(&u)
-        }) {
-            Some(u) => Some(Ipv4Addr::from(u).to_string()),
-            None => {
-                if self.state.my_vip_u32 != 0 {
-                    self.ui_err(
-                        "  [WARN] owner VIP fallback exhausted subnet host range".to_string(),
+        let incoming = ClaimRecord {
+            node_id: remote_node_id.to_string(),
+            vip: remote_vip.to_string(),
+            vip_epoch: remote_epoch,
+            ep_hints: vec![from.to_string()],
+        };
+        let now = Instant::now();
+        let outcome = merge_claim(
+            &mut self.claim_map,
+            incoming,
+            &self.leave_tombs,
+            &mut self.fight_suppress,
+            now,
+        );
+        match outcome {
+            crate::net::claim_gossip::MergeOutcome::Rejected
+            | crate::net::claim_gossip::MergeOutcome::BlockedByTombstone
+            | crate::net::claim_gossip::MergeOutcome::BlockedByFight => {
+                return;
+            }
+            crate::net::claim_gossip::MergeOutcome::IgnoredStale
+            | crate::net::claim_gossip::MergeOutcome::Accepted => {}
+        }
+        let _ = self.apply_claim_settle_and_local_fight(Some(remote_node_id));
+        let may_route = claim_still_live(&self.claim_map, remote_node_id, remote_vip, remote_epoch)
+            && matches!(
+                outcome,
+                crate::net::claim_gossip::MergeOutcome::Accepted
+                    | crate::net::claim_gossip::MergeOutcome::IgnoredStale
+            );
+        if may_route && remote_vip != self.state.my_vip {
+            self.update_route(remote_vip, from, Some(remote_node_id));
+            self.notify_roster_upsert(remote_vip, from, Some(remote_node_id));
+        }
+    }
+
+    /// Settle duplicate VIPs and optionally reroll local identity on a fight.
+    /// Returns true when local VIP changed (caller should gossip).
+    fn apply_claim_settle_and_local_fight(&mut self, fight_peer: Option<&str>) -> bool {
+        let pre_claims: HashMap<String, ClaimRecord> = self.claim_map.clone();
+        let losers = settle_duplicate_vips(&mut self.claim_map);
+        let mut changed = false;
+        let now = Instant::now();
+        for loser in losers {
+            if loser == self.state.my_node_id {
+                if self
+                    .try_local_vip_reroll(fight_peer.unwrap_or("peer"), &self.state.my_vip.clone())
+                {
+                    changed = true;
+                } else {
+                    // Reroll deferred/exhausted — keep a self claim so the map stays consistent.
+                    self.claim_map.insert(
+                        self.state.my_node_id.clone(),
+                        ClaimRecord {
+                            node_id: self.state.my_node_id.clone(),
+                            vip: self.state.my_vip.clone(),
+                            vip_epoch: self.state.vip_epoch,
+                            ep_hints: vec![],
+                        },
                     );
                 }
-                None
+            } else if let Some(pre) = pre_claims.get(&loser) {
+                remove_claim(&mut self.claim_map, &loser);
+                let removed = {
+                    let mut rt = self.routing.write();
+                    match rt.table.get(&pre.vip) {
+                        None => None,
+                        Some(entry) => {
+                            let node_ok = entry.node_id.is_empty()
+                                || entry.node_id.as_ref() == loser.as_str();
+                            if !node_ok {
+                                None
+                            } else {
+                                let ep = entry.endpoint;
+                                rt.remove(&pre.vip);
+                                Some(ep)
+                            }
+                        }
+                    }
+                };
+                if removed.is_some() {
+                    self.on_peer_route_removed(&pre.vip, Some(&loser));
+                    self.stop_peer_reconnect_for_vip(&pre.vip);
+                }
+                let _ = install_fight_suppress(
+                    &mut self.fight_suppress,
+                    &loser,
+                    &pre.vip,
+                    pre.vip_epoch,
+                    now,
+                    FIGHT_SUPPRESS_TTL,
+                );
+                // Claim map changed — push digest so peers see the settled view sooner.
+                changed = true;
             }
+        }
+        // Cross-node fight may remain even when settle did not remove local yet.
+        let contested = self.state.my_vip.clone();
+        let fighters: Vec<(String, String)> = self
+            .claim_map
+            .values()
+            .filter(|c| c.node_id != self.state.my_node_id)
+            .filter(|c| {
+                should_reroll_for_vip_fight(
+                    &self.state.my_node_id,
+                    &self.state.my_vip,
+                    &c.node_id,
+                    &c.vip,
+                )
+            })
+            .map(|c| (c.node_id.clone(), c.vip.clone()))
+            .collect();
+        for (peer_nid, peer_vip) in fighters {
+            let _ = peer_vip;
+            if self.try_local_vip_reroll(&peer_nid, &contested) {
+                changed = true;
+                break;
+            }
+        }
+        if changed {
+            self.pending_claim_gossip = true;
+        }
+        changed
+    }
+
+    fn occupied_vips_for_reroll(&self, contested: &str) -> HashSet<String> {
+        let mut set: HashSet<String> = self.claim_map.values().map(|c| c.vip.clone()).collect();
+        {
+            let rt = self.routing.read();
+            set.extend(rt.table.keys().cloned());
+        }
+        set.insert(self.state.my_vip.clone());
+        if !contested.is_empty() {
+            set.insert(contested.to_string());
+        }
+        set
+    }
+
+    /// Attempt local VIP reroll after losing a fight. On exhaustion, schedule retry.
+    fn try_local_vip_reroll(&mut self, peer_node_id: &str, contested_vip: &str) -> bool {
+        let occupied = self.occupied_vips_for_reroll(contested_vip);
+        let base = self
+            .unit_network_key()
+            .map(|k| floatunit_subnet_base_vip(&k))
+            .unwrap_or_else(|| self.state.my_vip.clone());
+        match crate::net::claim::pick_free_vip(&base, |c| occupied.contains(c)) {
+            Some(new_vip) => {
+                let old = self.state.my_vip.clone();
+                if self.apply_local_vip_change(new_vip.clone()) {
+                    self.vip_reroll_retry_after = None;
+                    self.ui_out(term_style::fmt_join_line(format_args!(
+                        " claim node={} vip={} epoch={}",
+                        self.state.my_node_id, new_vip, self.state.vip_epoch
+                    )));
+                    self.ui_out(term_style::fmt_join_line(format_args!(
+                        " lost VIP fight with {}; was {}",
+                        peer_node_id, old
+                    )));
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                self.ui_err(term_style::fmt_join_line_stderr(format_args!(
+                    " VIP pool exhausted; cannot reroll after fight with {peer_node_id}"
+                )));
+                self.vip_reroll_retry_after = Some(Instant::now() + VIP_REROLL_RETRY_INTERVAL);
+                false
+            }
+        }
+    }
+
+    fn apply_local_vip_change(&mut self, new_vip: String) -> bool {
+        if new_vip.is_empty() || new_vip == self.state.my_vip {
+            return false;
+        }
+        if !self.accept_wire_claim_vip(&new_vip) {
+            return false;
+        }
+        let old = self.state.my_vip.clone();
+        self.state.vip_epoch = self.state.vip_epoch.saturating_add(1);
+        self.state.my_vip = new_vip.clone();
+        self.state.my_vip_u32 = new_vip.parse::<Ipv4Addr>().map(u32::from).unwrap_or(0);
+        self.state_view.write().my_vip = new_vip.clone();
+        self.claim_map.insert(
+            self.state.my_node_id.clone(),
+            ClaimRecord {
+                node_id: self.state.my_node_id.clone(),
+                vip: new_vip.clone(),
+                vip_epoch: self.state.vip_epoch,
+                ep_hints: vec![],
+            },
+        );
+        let old_ep = {
+            let mut rt = self.routing.write();
+            let ep = rt.table.get(&old).map(|e| e.endpoint);
+            rt.remove(&old);
+            ep
+        };
+        if let Some(ep) = old_ep {
+            self.invalidate_fec_qd_cache(ep);
+            self.teardown_fec_peer(ep);
+        }
+        self.stop_peer_reconnect_for_vip(&old);
+        self.pending_claim_gossip = true;
+        if let Some(handler) = &self.identity_changed_handler {
+            handler(old, new_vip, self.state.vip_epoch);
+        }
+        true
+    }
+
+    fn retry_vip_fight_if_due(&mut self) {
+        let Some(after) = self.vip_reroll_retry_after else {
+            return;
+        };
+        if Instant::now() < after {
+            return;
+        }
+        self.vip_reroll_retry_after = None;
+        let _ = self.apply_claim_settle_and_local_fight(None);
+    }
+
+    async fn send_claim_presence_tick(&mut self) {
+        if self.state.my_vip.is_empty() || self.state.my_node_id.is_empty() {
+            return;
+        }
+        self.retry_vip_fight_if_due();
+        self.flush_pending_claim_gossip().await;
+        // Skip while actively joining — fanout already sends MPJN claims.
+        if self.state.join_tx.is_some() || self.decentralized.is_joiner() {
+            return;
+        }
+        let body = json!({
+            "proto_ver": WIRE_PROTOCOL_VERSION,
+            "node_id": self.state.my_node_id,
+            "vip": self.state.my_vip,
+            "vip_epoch": self.state.vip_epoch,
+            "ts_ms": now_epoch_ms(),
+            "candidates": self.state.candidates,
+        })
+        .to_string();
+        let body_bytes = body.into_bytes();
+        let targets: Vec<SocketAddr> = {
+            let rt = self.routing.read();
+            rt.table
+                .values()
+                .filter(|e| e.state == RouteState::Active)
+                .map(|e| e.endpoint)
+                .take(8)
+                .collect()
+        };
+        for ep in targets {
+            self.send_ctrl_signed_to(ep, PKT_JOIN, &body_bytes).await;
         }
     }
 
@@ -6372,10 +6156,9 @@ impl P2PEngine {
         if fail_eps.is_empty() {
             return heal_vips;
         }
-        let owner_ep_hint = self.owner_send_endpoint();
         let predictive = self.state.feature_flags.predictive_heal;
         for dest in fail_eps {
-            let fail = self.routing.write().note_fail(dest, owner_ep_hint);
+            let fail = self.routing.write().note_fail(dest, None);
             self.refresh_fec_qd_cache(dest);
             if predictive {
                 if let (Some(vip), true) = (fail.vip, fail.needs_heal) {
@@ -6387,9 +6170,6 @@ impl P2PEngine {
     }
 
     fn try_stop_ice_checks_for_join_peer(&mut self, from: SocketAddr, body: &[u8]) {
-        if !self.state.is_owner {
-            return;
-        }
         let Ok(vip) = std::str::from_utf8(body).map(str::trim) else {
             return;
         };
@@ -6418,7 +6198,7 @@ impl P2PEngine {
         &mut self,
         body: &[u8],
         from: SocketAddr,
-        is_ack: bool,
+        _is_ack: bool,
         authenticated: bool,
     ) {
         self.touch_routing_endpoint(from);
@@ -6428,15 +6208,14 @@ impl P2PEngine {
         let Ok(vip_ip) = vip.parse::<Ipv4Addr>() else {
             return;
         };
+        if !self.accept_wire_claim_vip(vip) {
+            return;
+        }
         if let Ok(my_vip) = self.state.my_vip.parse::<Ipv4Addr>() {
             let prefix = self.state.subnet_prefix;
             if (8..=30).contains(&prefix) && !same_subnet(my_vip, vip_ip, prefix) {
                 return;
             }
-        }
-
-        if !is_ack && vip == self.state.owner_vip_cached.as_str() {
-            return;
         }
 
         let allow_hijack = {
@@ -6479,7 +6258,6 @@ impl P2PEngine {
             if prev != ep {
                 self.invalidate_fec_qd_cache(prev);
                 self.invalidate_fec_qd_cache(ep);
-                self.peer_sync_state.remove(vip);
                 self.state.crypto_keys.unbind_peer(prev);
                 self.fec_send_by_dest.remove(&prev);
                 let _ = self.fec_tx.remove_peer_barrier(prev);
@@ -6493,7 +6271,7 @@ impl P2PEngine {
     }
 
     fn update_route(&mut self, vip: &str, ep: SocketAddr, node_id: Option<&str>) {
-        if self.state.my_vip.is_empty() {
+        if self.state.my_vip.is_empty() || vip == self.state.my_vip {
             return;
         }
         let old_ep = {
@@ -6502,24 +6280,14 @@ impl P2PEngine {
             rt.update(vip, ep, node_id);
             prev
         };
-        if !self.state.is_owner && vip != self.state.my_vip {
-            self.sync_dest_relay_path_stamp(vip);
-        }
+        self.sync_dest_relay_path_stamp(vip);
         self.apply_route_endpoint_change_side_effects(vip, ep, old_ep);
         self.refresh_fec_qd_cache(ep);
     }
 
     fn prune_orphan_per_peer_keys(&mut self) {
-        let owner_ep = self.state.owner_ep;
         let rt = self.routing.read();
-        self.state
-            .crypto_keys
-            .prune_per_peer_orphans(&*rt, owner_ep);
-    }
-
-    fn owner_route_healthy(&self, owner_ep: SocketAddr) -> bool {
-        let rt = self.routing.read();
-        rt.hop_usable(owner_ep, None, &self.state.my_vip, None)
+        self.state.crypto_keys.prune_per_peer_orphans(&*rt);
     }
 
     #[cfg(test)]
@@ -6536,40 +6304,16 @@ impl P2PEngine {
     }
 }
 
-fn reconnect_fastpath_owner_candidate(
-    current_owner: SocketAddr,
-    owner_hint: Option<SocketAddr>,
-    peers: &[SocketAddr],
-) -> Option<SocketAddr> {
-    peers.iter().copied().find(|ep| {
-        if *ep == current_owner {
-            return false;
-        }
-        if ep.ip() == current_owner.ip() {
-            return true;
-        }
-        if owner_hint.map(|h| h.ip()) == Some(ep.ip()) {
-            return true;
-        }
-        false
-    })
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UniqueIpMatch {
     Bound(String),
     Unbound,
 }
 
-fn unique_ip_peer_vip(
-    rt: &RoutingTable,
-    my_vip: &str,
-    owner_vip: &str,
-    announce_ip: IpAddr,
-) -> UniqueIpMatch {
+fn unique_ip_peer_vip(rt: &RoutingTable, my_vip: &str, announce_ip: IpAddr) -> UniqueIpMatch {
     let mut matches = Vec::new();
     for (vip, entry) in rt.table.iter() {
-        if vip.as_str() == my_vip || vip.as_str() == owner_vip {
+        if vip.as_str() == my_vip {
             continue;
         }
         if entry.endpoint.ip() == announce_ip {
@@ -6643,9 +6387,7 @@ pub(crate) fn build_signed_or_plain_static_for_punch(
 fn allow_unauth_control_tag_with_crypto(tag: [u8; 4]) -> bool {
     matches!(
         tag,
-        t if t == *PKT_JOIN
-            || t == *PKT_JACK
-            || t == *PKT_MERR
+        t if t == *PKT_MERR
             || t == *PKT_PMTU
             || t == *PKT_PMAR
             || t == *PKT_BREK
@@ -6665,9 +6407,7 @@ fn allow_unauth_control_tag_with_crypto(tag: [u8; 4]) -> bool {
 fn is_signaling_tag(tag: [u8; 4]) -> bool {
     matches!(
         tag,
-        t if t == *PKT_JOIN
-            || t == *PKT_JACK
-            || t == *PKT_MERR
+        t if t == *PKT_MERR
             || t == *PKT_PARA_HELLO
             || t == *PKT_PARA_REPLY
             || t == *PKT_PARA_OK
@@ -6787,28 +6527,6 @@ fn is_safe_interface_alias(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.' | '(' | ')'))
 }
 
-fn is_valid_sync_vip(left: &str, right: &str, prefix: u8) -> bool {
-    let Ok(a) = left.parse::<Ipv4Addr>() else {
-        return false;
-    };
-    let Ok(b) = right.parse::<Ipv4Addr>() else {
-        return false;
-    };
-    if !same_subnet(a, b, prefix) {
-        return false;
-    }
-    let p = prefix.clamp(1, 32);
-    let host_mask = if p >= 32 {
-        0u32
-    } else {
-        (1u32 << (32 - p)) - 1
-    };
-    let host_part = |ip: Ipv4Addr| u32::from(ip) & host_mask;
-    let ha = host_part(a);
-    let hb = host_part(b);
-    ha != 0 && ha != host_mask && hb != 0 && hb != host_mask
-}
-
 fn is_valid_sync_endpoint(ep: SocketAddr) -> bool {
     if ep.ip().is_unspecified() || ep.ip().is_multicast() || ep.ip().is_loopback() {
         return false;
@@ -6822,29 +6540,19 @@ fn is_valid_sync_endpoint(ep: SocketAddr) -> bool {
     true
 }
 
-fn jack_mpja_body_valid(v: &serde_json::Value, from: SocketAddr) -> bool {
+fn jack_mpja_body_valid(v: &serde_json::Value, from: SocketAddr, unit_key: Option<&Key>) -> bool {
     let vip = v.get("vip").and_then(|x| x.as_str()).unwrap_or("");
-    let owner_node_id = v
-        .get("owner_node_id")
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
+    let node_id = v.get("node_id").and_then(|x| x.as_str()).unwrap_or("");
     let prefix = v
         .get("prefix")
         .and_then(|x| x.as_u64())
         .map(|n| n as u8)
         .unwrap_or(24)
         .clamp(8, 30);
-    let owner_vip_str = v
-        .get("owner_vip")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| owner_vip_with_prefix(vip, prefix));
-    vip.parse::<Ipv4Addr>().is_ok()
-        && !owner_node_id.is_empty()
-        && owner_node_id.len() <= 64
-        && owner_vip_str.parse::<Ipv4Addr>().is_ok()
-        && owner_vip_str != vip
-        && is_valid_sync_vip(vip, &owner_vip_str, prefix)
+    crate::net::claim::accept_wire_claim_vip(unit_key, vip)
+        && !node_id.is_empty()
+        && node_id.len() <= 64
+        && (8..=30).contains(&prefix)
         && is_valid_sync_endpoint(from)
 }
 
@@ -6866,6 +6574,7 @@ fn is_broadcast_or_multicast(pkt: &[u8]) -> bool {
     dst == [255, 255, 255, 255] || (224..=239).contains(&dst[0])
 }
 
+#[cfg(test)]
 fn first_free_vip_u32_in_subnet(
     my_vip_u32: u32,
     subnet_prefix: u8,
@@ -6898,20 +6607,6 @@ fn is_udp_message_too_long(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(10040) | Some(90))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PmtudProbeSendPath {
-    Main,
-    Probe,
-}
-
-fn pmtud_probe_send_path(peer: SocketAddr) -> PmtudProbeSendPath {
-    if is_rfc1918_private_ip(peer.ip()) {
-        PmtudProbeSendPath::Main
-    } else {
-        PmtudProbeSendPath::Probe
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6925,22 +6620,15 @@ mod tests {
         drop(rx);
         let mut join_tx = Some(tx);
         let ack = JoinAck {
-            vip: "10.0.0.2".into(),
+            peer_vip: "10.0.0.1".into(),
+            peer_node_id: "peer-a".into(),
             subnet_prefix: 24,
-            owner_endpoint: "127.0.0.1:1".parse().unwrap(),
+            peer_endpoint: "127.0.0.1:1".parse().unwrap(),
+            local_vip: "10.0.0.2".into(),
+            vip_epoch: 0,
         };
         assert!(!try_deliver_join_ack(&mut join_tx, ack));
         assert!(join_tx.is_none());
-    }
-
-    #[test]
-    fn pmtud_probe_send_path_private_main_public_probe() {
-        let lan: SocketAddr = "192.168.0.100:7878".parse().unwrap();
-        let pub_ep: SocketAddr = "198.51.100.1:7878".parse().unwrap();
-        let loopback: SocketAddr = "127.0.0.1:7878".parse().unwrap();
-        assert_eq!(pmtud_probe_send_path(lan), PmtudProbeSendPath::Main);
-        assert_eq!(pmtud_probe_send_path(pub_ep), PmtudProbeSendPath::Probe);
-        assert_eq!(pmtud_probe_send_path(loopback), PmtudProbeSendPath::Probe);
     }
 
     #[test]
@@ -6948,9 +6636,12 @@ mod tests {
         let (tx, rx) = oneshot::channel::<Option<JoinAck>>();
         let mut join_tx = Some(tx);
         let ack = JoinAck {
-            vip: "10.0.0.2".into(),
+            peer_vip: "10.0.0.1".into(),
+            peer_node_id: "peer-a".into(),
             subnet_prefix: 24,
-            owner_endpoint: "127.0.0.1:1".parse().unwrap(),
+            peer_endpoint: "127.0.0.1:1".parse().unwrap(),
+            local_vip: "10.0.0.2".into(),
+            vip_epoch: 0,
         };
         assert!(try_deliver_join_ack(&mut join_tx, ack));
         assert!(rx.blocking_recv().unwrap().is_some());
@@ -7049,34 +6740,36 @@ mod tests {
         assert!(allow_unauth_control_tag_with_crypto(*PKT_HPCH));
         assert!(allow_unauth_control_tag_with_crypto(*PKT_HACK));
         assert!(allow_unauth_control_tag_with_crypto(*PKT_MCTL));
+        assert!(!allow_unauth_control_tag_with_crypto(*PKT_JOIN));
+        assert!(!allow_unauth_control_tag_with_crypto(*PKT_JACK));
     }
 
     #[test]
     fn encode_mctl_hb_hol_one_datagram_body() {
-        let body = encode_mctl(MCTL_FLAG_HB | MCTL_FLAG_HOL, Some(b"10.0.0.2"), None).unwrap();
-        let p = parse_mctl(&body, 4096).unwrap();
+        let body = encode_mctl(MCTL_FLAG_HB | MCTL_FLAG_HOL, Some(b"10.0.0.2")).unwrap();
+        let p = parse_mctl(&body).unwrap();
         assert_eq!(p.flags, MCTL_FLAG_HB | MCTL_FLAG_HOL);
-        assert!(p.msyn.is_none());
+        assert!(p.signaling_ok);
     }
 
     #[tokio::test]
     async fn hpch_unauth_creates_route_when_crypto_enabled() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rt = Arc::new(RwLock::new(RoutingTable::new()));
         let (_tun_tx, tun_rx) = mpsc::channel(8);
         let (inject_tx, _inject_rx) = broadcast::channel(8);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let metrics = Arc::new(EngineMetrics::new());
+        let key = MintCrypto::generate_key();
+        let my_vip = crate::net::claim::member_host_ipv4(&key, 2);
+        let peer_vip = crate::net::claim::member_host_vip(&key, 3);
         let mut eng = P2PEngine::new(
             Arc::new(socket),
-            Arc::new(pmtud_socket),
             rt.clone(),
             tun_rx,
             inject_tx,
             cmd_rx,
-            false,
-            Ipv4Addr::new(10, 1, 1, 2),
+            my_vip,
             "n".to_string(),
             24,
             metrics,
@@ -7086,20 +6779,16 @@ mod tests {
             8,
             crate::ui_events::UiEventBus::new(),
         );
-        let _ = eng
-            .state
-            .crypto_keys
-            .set_primary(MintCrypto::generate_key());
+        let _ = eng.state.crypto_keys.set_primary(key);
         eng.state_view.write().crypto_key = eng.state.crypto_keys.primary();
         let from: SocketAddr = "127.0.0.1:40000".parse().unwrap();
-        eng.learn_route_from_hole_punch_body(b"10.1.1.3", from, false, false);
-        assert_eq!(rt.read().lookup("10.1.1.3"), Some(from));
+        eng.learn_route_from_hole_punch_body(peer_vip.as_bytes(), from, false, false);
+        assert_eq!(rt.read().lookup(&peer_vip), Some(from));
     }
 
     #[tokio::test]
     async fn hpch_unauth_does_not_hijack_active_peer() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rt = Arc::new(RwLock::new(RoutingTable::new()));
         let (_tun_tx, tun_rx) = mpsc::channel(8);
         let (inject_tx, _inject_rx) = broadcast::channel(8);
@@ -7107,12 +6796,10 @@ mod tests {
         let metrics = Arc::new(EngineMetrics::new());
         let mut eng = P2PEngine::new(
             Arc::new(socket),
-            Arc::new(pmtud_socket),
             rt.clone(),
             tun_rx,
             inject_tx,
             cmd_rx,
-            false,
             Ipv4Addr::new(10, 1, 1, 2),
             "n".to_string(),
             24,
@@ -7251,38 +6938,25 @@ mod tests {
         let k = pool.add_key(MintCrypto::generate_key());
         pool.bind_peer_key(addr, k);
         let rt = RoutingTable::new();
-        pool.prune_per_peer_orphans(&rt, None);
+        pool.prune_per_peer_orphans(&rt);
         assert!(pool.key_for_peer(addr).is_none());
 
         let mut rt = RoutingTable::new();
         rt.update("10.0.0.2", addr, None);
         let k2 = pool.add_key(MintCrypto::generate_key());
         pool.bind_peer_key(addr, k2);
-        pool.prune_per_peer_orphans(&rt, None);
+        pool.prune_per_peer_orphans(&rt);
         assert!(pool.key_for_peer(addr).is_some());
     }
 
     #[test]
-    fn crypto_pool_prune_retains_owner_ep_hint() {
-        let mut pool = CryptoPool::new();
-        let _ = pool.set_primary(MintCrypto::generate_key());
-        let owner_ep: SocketAddr = "198.51.100.11:6001".parse().unwrap();
-        let k = pool.add_key(MintCrypto::generate_key());
-        pool.bind_peer_key(owner_ep, k);
-        let rt = RoutingTable::new();
-        pool.prune_per_peer_orphans(&rt, Some(owner_ep));
-        assert!(pool.key_for_peer(owner_ep).is_some());
-    }
-
-    #[test]
-    fn msyn_full_shards_use_from_rev_zero() {
-        let parts = crate::net::msyn_sync::build_msyn_full_shards(9, 1, &[], &[], 1200).unwrap();
-        assert_eq!(parts.len(), 1);
-        let v: serde_json::Value = serde_json::from_str(&parts[0]).unwrap();
-        assert_eq!(v.get("proto_ver").and_then(|x| x.as_u64()), Some(4));
-        assert_eq!(v.get("from_rev").and_then(|x| x.as_u64()), Some(0));
-        assert_eq!(v.get("to_rev").and_then(|x| x.as_u64()), Some(9));
-        assert_eq!(v.get("parts_total").and_then(|x| x.as_u64()), Some(1));
+    fn encode_mctl_hb_hol_roundtrip() {
+        let vip = b"10.0.0.2";
+        let body = encode_mctl(MCTL_FLAG_HB | MCTL_FLAG_HOL, Some(vip)).unwrap();
+        let p = parse_mctl(&body).unwrap();
+        assert!(p.signaling_ok);
+        assert_eq!(p.flags, MCTL_FLAG_HB | MCTL_FLAG_HOL);
+        assert_eq!(p.vip.as_deref(), Some(vip.as_slice()));
     }
 
     #[test]
@@ -7295,13 +6969,13 @@ mod tests {
         rt.update("10.1.1.5", a, Some("p5"));
         rt.update("10.1.1.6", b, Some("p6"));
         assert_eq!(
-            super::unique_ip_peer_vip(&rt, "10.1.1.2", "10.1.1.1", a.ip()),
+            super::unique_ip_peer_vip(&rt, "10.1.1.2", a.ip()),
             super::UniqueIpMatch::Bound("10.1.1.5".to_string())
         );
         rt.update("10.1.1.7", shared_a, Some("p7"));
         rt.update("10.1.1.8", shared_b, Some("p8"));
         assert_eq!(
-            super::unique_ip_peer_vip(&rt, "10.1.1.2", "10.1.1.1", shared_a.ip()),
+            super::unique_ip_peer_vip(&rt, "10.1.1.2", shared_a.ip()),
             super::UniqueIpMatch::Unbound
         );
     }
@@ -7322,7 +6996,6 @@ mod tests {
     #[tokio::test]
     async fn hpch_auth_rebinds_active_peer() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rt = Arc::new(RwLock::new(RoutingTable::new()));
         let (_tun_tx, tun_rx) = mpsc::channel(8);
         let (inject_tx, _inject_rx) = broadcast::channel(8);
@@ -7330,12 +7003,10 @@ mod tests {
         let metrics = Arc::new(EngineMetrics::new());
         let mut eng = P2PEngine::new(
             Arc::new(socket),
-            Arc::new(pmtud_socket),
             rt.clone(),
             tun_rx,
             inject_tx,
             cmd_rx,
-            false,
             Ipv4Addr::new(10, 1, 1, 2),
             "n".to_string(),
             24,
@@ -7360,59 +7031,62 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_fastpath_owner_candidate_same_ip_new_port() {
-        let current: SocketAddr = "10.0.0.1:4000".parse().unwrap();
-        let new_ep: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-        let got = super::reconnect_fastpath_owner_candidate(current, None, &[new_ep]);
-        assert_eq!(got, Some(new_ep));
+    fn claim_conflict_loser_rerolls_in_engine_state() {
+        // Pure helper path used by apply_remote_claim.
+        assert!(crate::net::claim::local_loses_vip_conflict("bbb", "aaa"));
+        let occupied = |c: &str| c == "10.1.1.7";
+        let new = crate::net::claim::pick_free_vip("10.1.1.7", occupied).unwrap();
+        assert_ne!(new, "10.1.1.7");
+        assert!(crate::net::claim::claim_vip_valid(&new));
     }
 
     #[test]
-    fn reconnect_fastpath_owner_candidate_skips_unchanged() {
-        let current: SocketAddr = "10.0.0.1:4000".parse().unwrap();
-        assert_eq!(
-            super::reconnect_fastpath_owner_candidate(current, None, &[current]),
-            None
-        );
-    }
-
-    #[test]
-    fn reconnect_fastpath_owner_candidate_hint_ip() {
-        let current: SocketAddr = "10.0.0.1:4000".parse().unwrap();
-        let hint: SocketAddr = "203.0.113.5:1".parse().unwrap();
-        let new_ep: SocketAddr = "203.0.113.5:9000".parse().unwrap();
-        let got = super::reconnect_fastpath_owner_candidate(current, Some(hint), &[new_ep]);
-        assert_eq!(got, Some(new_ep));
-    }
-
-    #[test]
-    fn jack_mpja_rejects_owner_vip_equals_peer_vip() {
+    fn jack_mpja_rejects_missing_node_id() {
         let from: SocketAddr = "198.51.100.10:5000".parse().unwrap();
         let v = json!({
             "vip": "10.0.0.5",
-            "owner_node_id": "owner1",
-            "owner_vip": "10.0.0.5",
+            "vip_epoch": 0,
             "prefix": 24
         });
-        assert!(!super::jack_mpja_body_valid(&v, from));
+        assert!(!super::jack_mpja_body_valid(&v, from, None));
     }
 
     #[test]
-    fn jack_mpja_accepts_valid_owner_and_peer_vip() {
+    fn jack_mpja_accepts_valid_peer_claim() {
         let from: SocketAddr = "198.51.100.10:5000".parse().unwrap();
         let v = json!({
             "vip": "10.0.0.5",
-            "owner_node_id": "owner1",
-            "owner_vip": "10.0.0.1",
+            "node_id": "member-a",
+            "vip_epoch": 0,
             "prefix": 24
         });
-        assert!(super::jack_mpja_body_valid(&v, from));
+        assert!(super::jack_mpja_body_valid(&v, from, None));
+    }
+
+    #[test]
+    fn jack_mpja_rejects_out_of_unit_when_keyed() {
+        let from: SocketAddr = "198.51.100.10:5000".parse().unwrap();
+        let key = Key([0x55; 32]);
+        let v = json!({
+            "vip": "10.1.1.5",
+            "node_id": "member-a",
+            "vip_epoch": 0,
+            "prefix": 24
+        });
+        assert!(!super::jack_mpja_body_valid(&v, from, Some(&key)));
+        let in_unit = crate::net::claim::member_host_vip(&key, 5);
+        let v2 = json!({
+            "vip": in_unit,
+            "node_id": "member-a",
+            "vip_epoch": 0,
+            "prefix": 24
+        });
+        assert!(super::jack_mpja_body_valid(&v2, from, Some(&key)));
     }
 
     #[tokio::test]
     async fn coverage_keepalive_suppresses_after_note_and_clears_on_reset() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rt = Arc::new(RwLock::new(RoutingTable::new()));
         let (_tun_tx, tun_rx) = mpsc::channel(8);
         let (inject_tx, _inject_rx) = broadcast::channel(8);
@@ -7421,12 +7095,10 @@ mod tests {
         metrics.set_enabled(true);
         let mut eng = P2PEngine::new(
             Arc::new(socket),
-            Arc::new(pmtud_socket),
             rt.clone(),
             tun_rx,
             inject_tx,
             cmd_rx,
-            false,
             Ipv4Addr::new(10, 1, 1, 2),
             "n".to_string(),
             24,
@@ -7463,9 +7135,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pacing_thread_restarts_after_kick() {
+    async fn pacing_thread_restarts_after_session_reset() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rt = Arc::new(RwLock::new(RoutingTable::new()));
         let (_tun_tx, tun_rx) = mpsc::channel(8);
         let (inject_tx, _inject_rx) = broadcast::channel(8);
@@ -7473,12 +7144,10 @@ mod tests {
         let metrics = Arc::new(EngineMetrics::new());
         let mut eng = P2PEngine::new(
             Arc::new(socket),
-            Arc::new(pmtud_socket),
             rt.clone(),
             tun_rx,
             inject_tx,
             cmd_rx,
-            false,
             Ipv4Addr::new(10, 1, 1, 2),
             "n".to_string(),
             24,
@@ -7500,7 +7169,6 @@ mod tests {
     #[tokio::test]
     async fn allocate_ping_id_unique_with_many_pending_user_pings() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rt = Arc::new(RwLock::new(RoutingTable::new()));
         let (_tun_tx, tun_rx) = mpsc::channel(8);
         let (inject_tx, _inject_rx) = broadcast::channel(8);
@@ -7508,12 +7176,10 @@ mod tests {
         let metrics = Arc::new(EngineMetrics::new());
         let mut eng = P2PEngine::new(
             Arc::new(socket),
-            Arc::new(pmtud_socket),
             rt,
             tun_rx,
             inject_tx,
             cmd_rx,
-            false,
             Ipv4Addr::new(10, 1, 1, 2),
             "n".to_string(),
             24,
@@ -7545,7 +7211,6 @@ mod tests {
 
     async fn test_engine() -> P2PEngine {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let pmtud_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rt = Arc::new(RwLock::new(RoutingTable::new()));
         let (_tun_tx, tun_rx) = mpsc::channel(8);
         let (inject_tx, _inject_rx) = broadcast::channel(8);
@@ -7553,12 +7218,10 @@ mod tests {
         let metrics = Arc::new(EngineMetrics::new());
         P2PEngine::new(
             Arc::new(socket),
-            Arc::new(pmtud_socket),
             rt,
             tun_rx,
             inject_tx,
             cmd_rx,
-            false,
             Ipv4Addr::new(10, 1, 1, 2),
             "n".to_string(),
             24,

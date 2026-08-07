@@ -12,7 +12,6 @@ pub struct EngineMetrics {
     pub relay_fallback_events: AtomicU64,
     pub relay_drop_no_hop: AtomicU64,
     pub relay_fallback_direct_no_hop: AtomicU64,
-    pub relay_send_owner_events: AtomicU64,
     pub relay_send_hop_events: AtomicU64,
     pub auth_failures: AtomicU64,
     pub tun_inject_drops: AtomicU64,
@@ -25,6 +24,7 @@ pub struct EngineMetrics {
     pub pmtud_revalidate_hints: AtomicU64,
     pub pmtud_probes_sent: AtomicU64,
     pub pmtud_probe_acks: AtomicU64,
+    pub pmtud_pmar_ignored: AtomicU64,
     pub pmtud_probe_timeouts: AtomicU64,
     pub pmtud_revalidate_fail_events: AtomicU64,
     pub pmtud_recheck_recovered_events: AtomicU64,
@@ -64,8 +64,7 @@ pub struct EngineMetrics {
     pub route_hijack_reject_count: AtomicU64,
     pub stale_to_candidate_promotions: AtomicU64,
     pub reliable_unknown_inner_tag: AtomicU64,
-    pub owner_forward_unknown_dst: AtomicU64,
-    pub peer_forward_unknown_dst: AtomicU64,
+    pub hub_forward_unknown_dst: AtomicU64,
     // ── APD metrics ──────────────────────────────────────────────────────────
     pub apd_drain_episodes: AtomicU64,
     pub apd_drain_ms_total: AtomicU64,
@@ -118,7 +117,6 @@ impl Default for EngineMetrics {
             relay_fallback_events: AtomicU64::new(0),
             relay_drop_no_hop: AtomicU64::new(0),
             relay_fallback_direct_no_hop: AtomicU64::new(0),
-            relay_send_owner_events: AtomicU64::new(0),
             relay_send_hop_events: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
             tun_inject_drops: AtomicU64::new(0),
@@ -131,6 +129,7 @@ impl Default for EngineMetrics {
             pmtud_revalidate_hints: AtomicU64::new(0),
             pmtud_probes_sent: AtomicU64::new(0),
             pmtud_probe_acks: AtomicU64::new(0),
+            pmtud_pmar_ignored: AtomicU64::new(0),
             pmtud_probe_timeouts: AtomicU64::new(0),
             pmtud_revalidate_fail_events: AtomicU64::new(0),
             pmtud_recheck_recovered_events: AtomicU64::new(0),
@@ -170,8 +169,7 @@ impl Default for EngineMetrics {
             route_hijack_reject_count: AtomicU64::new(0),
             stale_to_candidate_promotions: AtomicU64::new(0),
             reliable_unknown_inner_tag: AtomicU64::new(0),
-            owner_forward_unknown_dst: AtomicU64::new(0),
-            peer_forward_unknown_dst: AtomicU64::new(0),
+            hub_forward_unknown_dst: AtomicU64::new(0),
             apd_drain_episodes: AtomicU64::new(0),
             apd_drain_ms_total: AtomicU64::new(0),
             apd_packets_drained: AtomicU64::new(0),
@@ -241,7 +239,6 @@ impl EngineMetrics {
         self.relay_drop_no_hop.store(0, Ordering::Relaxed);
         self.relay_fallback_direct_no_hop
             .store(0, Ordering::Relaxed);
-        self.relay_send_owner_events.store(0, Ordering::Relaxed);
         self.relay_send_hop_events.store(0, Ordering::Relaxed);
         self.auth_failures.store(0, Ordering::Relaxed);
         self.tun_inject_drops.store(0, Ordering::Relaxed);
@@ -254,6 +251,7 @@ impl EngineMetrics {
         self.pmtud_revalidate_hints.store(0, Ordering::Relaxed);
         self.pmtud_probes_sent.store(0, Ordering::Relaxed);
         self.pmtud_probe_acks.store(0, Ordering::Relaxed);
+        self.pmtud_pmar_ignored.store(0, Ordering::Relaxed);
         self.pmtud_probe_timeouts.store(0, Ordering::Relaxed);
         self.pmtud_revalidate_fail_events
             .store(0, Ordering::Relaxed);
@@ -299,8 +297,7 @@ impl EngineMetrics {
         self.stale_to_candidate_promotions
             .store(0, Ordering::Relaxed);
         self.reliable_unknown_inner_tag.store(0, Ordering::Relaxed);
-        self.owner_forward_unknown_dst.store(0, Ordering::Relaxed);
-        self.peer_forward_unknown_dst.store(0, Ordering::Relaxed);
+        self.hub_forward_unknown_dst.store(0, Ordering::Relaxed);
         self.apd_drain_episodes.store(0, Ordering::Relaxed);
         self.apd_drain_ms_total.store(0, Ordering::Relaxed);
         self.apd_packets_drained.store(0, Ordering::Relaxed);
@@ -363,13 +360,6 @@ impl EngineMetrics {
         }
         self.relay_fallback_direct_no_hop
             .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_relay_send_owner(&self) {
-        if !self.is_enabled() {
-            return;
-        }
-        self.relay_send_owner_events.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_relay_send_hop(&self) {
@@ -456,6 +446,13 @@ impl EngineMetrics {
             return;
         }
         self.pmtud_probe_acks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_pmtud_pmar_ignored(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.pmtud_pmar_ignored.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn add_pmtud_events(&self, e: crate::pmtud::PmtudEventCounts) {
@@ -697,20 +694,11 @@ impl EngineMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_owner_forward_unknown_dst(&self) {
+    pub fn inc_hub_forward_unknown_dst(&self) {
         if !self.is_enabled() {
             return;
         }
-        self.owner_forward_unknown_dst
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_peer_forward_unknown_dst(&self) {
-        if !self.is_enabled() {
-            return;
-        }
-        self.peer_forward_unknown_dst
-            .fetch_add(1, Ordering::Relaxed);
+        self.hub_forward_unknown_dst.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_fec_ratio_flush(&self) {

@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 
 /// Join handshake / wire framing version (independent of MSYN `proto_ver` schema).
-pub const WIRE_PROTOCOL_VERSION: u64 = 7;
+pub const WIRE_PROTOCOL_VERSION: u64 = 8;
 
 pub const COMPACT_HEADER_LEN: usize = 1;
 pub const CONTROL_TAG_LEN: usize = 4;
@@ -13,13 +13,20 @@ pub const PKT_KPAL: &[u8; 4] = b"MKPL";
 pub const PKT_JOIN: &[u8; 4] = b"MPJN";
 pub const PKT_JACK: &[u8; 4] = b"MPJA";
 pub const PKT_PRXY: &[u8; 4] = b"MPRX";
+
+/// One-hop PRXY: clamp inbound ttl to 1; forwarded body carries `0`.
+/// Returns `Some(0)` when this hop may forward, else `None`.
+pub fn prxy_forwarded_ttl(inbound_ttl: u64) -> Option<u64> {
+    (inbound_ttl.min(1) > 0).then_some(0)
+}
 pub const PKT_HPCH: &[u8; 4] = b"MHOL";
 pub const PKT_HACK: &[u8; 4] = b"MHAC";
-pub const PKT_KICK: &[u8; 4] = b"MKCK";
-pub const PKT_SYNC: &[u8; 4] = b"MSYN";
 pub const PKT_PMTU: &[u8; 4] = b"MPMT";
 pub const PKT_PMAR: &[u8; 4] = b"MPAR";
-pub const PKT_MSMD: &[u8; 4] = b"MSMD";
+/// Signed claim-gossip digest (FloatUnit membership).
+pub const PKT_CLG: &[u8; 4] = b"MCLG";
+/// Signed graceful leave + tombstone.
+pub const PKT_LEAVE: &[u8; 4] = b"MLEA";
 pub const PKT_MSTR: &[u8; 4] = b"MSTR";
 pub const PKT_MERR: &[u8; 4] = b"MERR";
 pub const PKT_BREK: &[u8; 4] = b"MBRK";
@@ -136,69 +143,57 @@ pub fn parse_tag(buf: &[u8]) -> Option<([u8; 4], &[u8])> {
 
 pub const MCTL_FLAG_HB: u16 = 1;
 pub const MCTL_FLAG_HOL: u16 = 2;
-pub const MCTL_FLAG_MSYN: u16 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MctlParsed {
     pub flags: u16,
     pub vip: Option<Vec<u8>>,
-    /// Present only when MSYN flag set and section parsed cleanly.
-    pub msyn: Option<Vec<u8>>,
     /// HB/HOL vip section parsed (or not required).
     pub signaling_ok: bool,
-    /// MSYN section parsed when flag set; false means ignore MSYN but may still apply HB/HOL.
-    pub msyn_ok: bool,
 }
 
-/// Encode compound control body. Returns `None` if flags require vip but vip empty,
-/// or if MSYN flag set without bytes.
-pub fn encode_mctl(flags: u16, vip: Option<&[u8]>, msyn: Option<&[u8]>) -> Option<Vec<u8>> {
+/// Encode compound control body (HB/HOL only). Returns `None` if flags require vip but vip empty.
+pub fn encode_mctl(flags: u16, vip: Option<&[u8]>) -> Option<Vec<u8>> {
+    if flags == 0 {
+        return None;
+    }
+    // Ignore unknown flag bits; only HB/HOL are emitted.
+    let flags = flags & (MCTL_FLAG_HB | MCTL_FLAG_HOL);
     if flags == 0 {
         return None;
     }
     let need_vip = (flags & (MCTL_FLAG_HB | MCTL_FLAG_HOL)) != 0;
-    let need_msyn = (flags & MCTL_FLAG_MSYN) != 0;
     if need_vip {
         let v = vip?;
         if v.is_empty() || v.len() > 255 {
             return None;
         }
     }
-    if need_msyn {
-        let m = msyn?;
-        if m.len() > u32::MAX as usize {
-            return None;
-        }
-    }
-    let mut out = Vec::with_capacity(
-        2 + 1 + vip.map(|v| v.len()).unwrap_or(0) + 4 + msyn.map(|m| m.len()).unwrap_or(0),
-    );
+    let mut out = Vec::with_capacity(2 + 1 + vip.map(|v| v.len()).unwrap_or(0));
     out.extend_from_slice(&flags.to_le_bytes());
     if need_vip {
         let v = vip.unwrap();
         out.push(v.len() as u8);
         out.extend_from_slice(v);
     }
-    if need_msyn {
-        let m = msyn.unwrap();
-        out.extend_from_slice(&(m.len() as u32).to_le_bytes());
-        out.extend_from_slice(m);
-    }
     Some(out)
 }
 
-/// Parse MCTL body. Always attempts HB/HOL first; MSYN failure does not undo signaling parse.
-pub fn parse_mctl(body: &[u8], msyn_body_max: usize) -> Option<MctlParsed> {
+/// Parse MCTL body (HB/HOL). Unknown flag bits are ignored.
+pub fn parse_mctl(body: &[u8]) -> Option<MctlParsed> {
     if body.len() < 2 {
         return None;
     }
-    let flags = u16::from_le_bytes([body[0], body[1]]);
+    let raw_flags = u16::from_le_bytes([body[0], body[1]]);
+    if raw_flags == 0 {
+        return None;
+    }
+    let flags = raw_flags & (MCTL_FLAG_HB | MCTL_FLAG_HOL);
     if flags == 0 {
         return None;
     }
     let mut off = 2usize;
     let need_vip = (flags & (MCTL_FLAG_HB | MCTL_FLAG_HOL)) != 0;
-    let need_msyn = (flags & MCTL_FLAG_MSYN) != 0;
 
     let mut vip = None;
     let mut signaling_ok = !need_vip;
@@ -207,9 +202,7 @@ pub fn parse_mctl(body: &[u8], msyn_body_max: usize) -> Option<MctlParsed> {
             return Some(MctlParsed {
                 flags,
                 vip: None,
-                msyn: None,
                 signaling_ok: false,
-                msyn_ok: false,
             });
         }
         let vip_len = body[off] as usize;
@@ -218,40 +211,17 @@ pub fn parse_mctl(body: &[u8], msyn_body_max: usize) -> Option<MctlParsed> {
             return Some(MctlParsed {
                 flags,
                 vip: None,
-                msyn: None,
                 signaling_ok: false,
-                msyn_ok: false,
             });
         }
         vip = Some(body[off..off + vip_len].to_vec());
-        off += vip_len;
         signaling_ok = true;
-    }
-
-    let mut msyn = None;
-    let mut msyn_ok = !need_msyn;
-    if need_msyn {
-        if off + 4 > body.len() {
-            msyn_ok = false;
-        } else {
-            let mlen = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]])
-                as usize;
-            off += 4;
-            if mlen == 0 || mlen > msyn_body_max || off + mlen > body.len() {
-                msyn_ok = false;
-            } else {
-                msyn = Some(body[off..off + mlen].to_vec());
-                msyn_ok = true;
-            }
-        }
     }
 
     Some(MctlParsed {
         flags,
         vip,
-        msyn,
         signaling_ok,
-        msyn_ok,
     })
 }
 
@@ -344,34 +314,22 @@ mod tests {
     #[test]
     fn mctl_hb_hol_roundtrip() {
         let vip = b"10.0.0.2";
-        let body = encode_mctl(MCTL_FLAG_HB | MCTL_FLAG_HOL, Some(vip), None).unwrap();
-        let p = parse_mctl(&body, 524_288).unwrap();
+        let body = encode_mctl(MCTL_FLAG_HB | MCTL_FLAG_HOL, Some(vip)).unwrap();
+        let p = parse_mctl(&body).unwrap();
         assert!(p.signaling_ok);
-        assert!(p.msyn_ok);
         assert_eq!(p.flags, MCTL_FLAG_HB | MCTL_FLAG_HOL);
         assert_eq!(p.vip.as_deref(), Some(vip.as_slice()));
-        assert!(p.msyn.is_none());
     }
 
     #[test]
-    fn mctl_msyn_plus_hb_roundtrip() {
+    fn mctl_ignores_unknown_flag_bits_on_parse() {
+        // Wire may carry unknown flag bit 4; HB section still parses.
         let vip = b"10.0.0.1";
-        let msyn = br#"{"proto_ver":4}"#;
-        let body = encode_mctl(MCTL_FLAG_HB | MCTL_FLAG_MSYN, Some(vip), Some(msyn)).unwrap();
-        let p = parse_mctl(&body, 524_288).unwrap();
-        assert!(p.signaling_ok && p.msyn_ok);
-        assert_eq!(p.msyn.as_deref(), Some(msyn.as_slice()));
-    }
-
-    #[test]
-    fn mctl_bad_msyn_keeps_hb() {
-        let vip = b"10.0.0.1";
-        let mut body = encode_mctl(MCTL_FLAG_HB | MCTL_FLAG_MSYN, Some(vip), Some(b"abc")).unwrap();
-        // Truncate msyn payload
-        body.truncate(body.len() - 1);
-        let p = parse_mctl(&body, 524_288).unwrap();
+        let mut body = encode_mctl(MCTL_FLAG_HB, Some(vip)).unwrap();
+        body[0] |= 4; // unknown bit
+        let p = parse_mctl(&body).unwrap();
         assert!(p.signaling_ok);
-        assert!(!p.msyn_ok);
+        assert_eq!(p.flags, MCTL_FLAG_HB);
         assert_eq!(p.vip.as_deref(), Some(vip.as_slice()));
     }
 }
