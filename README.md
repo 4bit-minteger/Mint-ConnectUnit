@@ -20,7 +20,7 @@ NOTE: Please note that this is a very first project created as a hobby by someon
 2. [Features](#features)
 3. [Build and run](#build-and-run)
 4. [Architecture](#architecture)
-5. [Roles: owner vs peer](#roles-owner-vs-peer)
+5. [FloatUnit members](#floatunit-members)
 6. [CLI commands](#cli-commands)
 7. [Configuration](#configuration)
 
@@ -31,33 +31,31 @@ NOTE: Please note that this is a very first project created as a hobby by someon
 1. Run `ConnectUnit.exe`(or your binary build name) as **Administrator**, make sure you have `wintun.dll` in the same folder with the binary.
 2. Window defender may block it (need administrator privileges to install Wintun driver). -> `More info` -> `Run anyway` if you trust me.
 3. Command Line Interface, first run:
-- type `1` to create server, `2` to join a server
+- type `1` to create FloatUnit, `2` to join
 <img src="./windows/option.png" width="400" alt="apple">
 
 - If you are not a power-user -> Just press Enter, it will automatically setup a new room.
-  - To invite someone to join -> Copy the Invite ID and send it to them.
+  - To invite someone to join -> Copy the Invite ID (key-only) and send it to them.
   - In CLI, type `?`  for help or read docs.
 
-- If you join a server:
+- If you join a FloatUnit:
 <img src="./windows/option2.png" width="400" alt="pen">
 
 - Type `1` (recommended) or just press enter for "Decentralized" (using BitTorrent tracker to find others) -> paste the Invite ID -> Usually it will take about 1 min to join.
-  - Type `2` for "Parasitic" mode:
-    - **Public**: use another VPN’s VIP path as a signaling pipe (STUN/UPnP/punch).
-    - **LAN**: UDP broadcast discovers a Mint owner on the same Wi‑Fi/LAN (no IP prompt when exactly one owner replies; optional `ip:port` fallback). Owner listen port defaults to **7878**.
-  - Type `3` for "Manual" invite join (Public or LAN punch path).
+  - Type `2` for "Manual" invite join (paste invite, then type peer `ip:port`; Public or LAN punch path).
+- After you already hold a FloatUnit key, type `lan` to discover same-unit members on the local LAN and punch toward them.
 4. Should know that the VPN will run in the background until you open CLI and type `stop` (it still run if you just close the CLI window).
 5. File `NetInfo/config.toml` automatically generate for our power-user.
 
 ## Features
 
-- **Serverless P2P**: no central data-plane server; the owner node coordinates membership while STUN/UPnP/ICE handle NAT traversal and BitTorrent-style trackers handle discovery
+- **Serverless P2P**: no central data-plane server; equal FloatUnit members share a network key while STUN/UPnP/ICE handle NAT traversal and BitTorrent-style trackers handle discovery
 - **Encrypted data plane**: AEGIS-128L data + control plane
 - **Adaptive pacing & congestion control**: token bucket + deficit round-robin (DRR) + adaptive pressure drain (APD) to bound latency under load
-- **Adaptive FEC**: Reed-Solomon shards recover lost packets without waiting on retransmission + loss classifier
-- **Automatic failover**: quality-scored routing switches between direct and owner-relayed paths.
-- **NAT traversal**: STUN, UPnP, ICE-style candidates, canonical hole punching, plus a LAN "parasitic" mode that needs no invite ID
-- **PPacketization Layer Path MTU Discovery**: adaptive shard/frame sizing to the live path MTU
+- **Adaptive FEC**: Reed-Solomon shards recover lost packets without waiting on retransmission; ratio follows peer RX wire-loss feedback in pong + loss classifier
+- **Automatic failover**: quality-scored routing switches between direct and one-hop hub-relayed paths
+- **NAT traversal**: STUN, UPnP, ICE-style candidates, canonical hole punching, plus same-key LAN discover assist
+- **Packetization Layer Path MTU Discovery**: adaptive shard/frame sizing to the live path MTU
 
 ---
 
@@ -79,7 +77,7 @@ Binary name: **`ConnectUnit.exe`**. Place **`wintun.dll`** next to it (Windows b
 cargo run
 ```
 
-On first launch, the interactive CLI offers **[1] Create** (owner), **[2] Join** (peer), or **[3] Exit**. After setup, **`NetInfo/config.toml`** next to the executable restores the session (working directory does not matter).
+On first launch, the interactive CLI offers **[1] Mint FloatUnit** (member), **[2] Join**, or **[3] Exit**. The invite is key-only (no endpoint in the invite). After setup, **`NetInfo/config.toml`** next to the executable restores the session (working directory does not matter).
 
 ---
 
@@ -95,10 +93,15 @@ flowchart TB
     ENG["P2PEngine::run — tokio::select!"]
     CLK["pace_clock OS thread"]
     PACW["mint-pacing OS thread — PacingEngine tick + UDP send"]
+    FECTX["mint-fec-tx OS thread — RS encode + batch enqueue"]
     CLI --> CMD --> ENG
     CLK -->|"tick ch(1)"| PACW
-    ENG -->|"enqueue cmds FF / FEC batch ack"| PACW
+    ENG -->|"Push try_send / control barriers"| FECTX
+    FECTX -->|"Encoded batch ack"| PACW
+    FECTX -->|"EnqueueNormal events"| ENG
+    ENG -->|"enqueue cmds FF"| PACW
     PACW -->|"TickDone + ArcSwap PacingObs"| ENG
+    ENG -->|"flush AtomicU8"| FECTX
   end
   subgraph io["I/O"]
     UDP["UDP socket listen ≥7878"]
@@ -121,22 +124,23 @@ flowchart TB
   ENG --> STUN_UPnP
 ```
 
-One **`P2PEngine`** task owns RX/decrypt/routing/encrypt; a **`mint-pacing`** OS thread owns paced UDP send. The owner allocates VIPs and relays when direct paths degrade. Details: **[`SPEC.md`](SPEC.md)**.
+One **`P2PEngine`** task owns RX/decrypt/routing/encrypt; **`mint-fec-tx`** owns Reed–Solomon TX encode; **`mint-pacing`** owns paced UDP send. Equal members self-claim VIPs and use quality-based one-hop hub relay when direct paths degrade. Details: **[`SPEC.md`](SPEC.md)**.
 
 ---
 
-## Roles: owner vs peer
+## FloatUnit members
 
-| | **Owner** | **Peer** |
-|---|-----------|----------|
-| VIP pool | Allocates new peer VIPs on join | Receives assigned VIP |
-| `config.toml` peers | Authoritative peer list | Stores owner endpoint + crypto |
-| Relay | Relays packets for peers on degraded paths | Uses owner as relay when needed |
-| Membership sync | Publishes membership / route sync | Applies deltas from owner |
-| Parasitic listener | Can accept LAN parasitic joins (`discover_only` + admit) | Join menu: Parasitic Public (VIP) or Parasitic LAN (broadcast) |
-| Kick | Can disconnect a peer | Clears local session on kick |
+Every peer with the FloatUnit key is an equal **member**.
 
-Full detail on membership sync, kick/removal, and the parasitic join handshake: **[`SPEC.md` § Membership sync](SPEC.md#membership-sync-msyn)** and **[§ NAT, hole punch, and parasitic join](SPEC.md#nat-hole-punch-and-parasitic-join)**.
+| | **Member** |
+|---|------------|
+| VIP | Self-claims a host in the subnet; conflicts: lower hex `node_id` wins, loser bumps `vip_epoch` and rerolls |
+| Roster | `config.peers` FIFO 64 from claim gossip (`MCLG` / `MLEA`) |
+| Relay | Sticky/best-quality peer hub when `should_relay` |
+| LAN assist | Same-key LAN presence (`MPHI`/`MPHR` by `network_id`) then punch + `MPJN` |
+| Exclusion | Rotate to a new FloatUnit key (no kick) |
+
+Full detail: **[`SPEC.md`](SPEC.md)** membership gossip, NAT/LAN assist, and wire contract sections.
 
 ---
 
@@ -146,14 +150,14 @@ Interactive loop after session restore (`?` = help):
 
 | Command | Description |
 |---------|-------------|
-| First-run `[1]` Create | New network (owner): name, port, VIP, subnet, UPnP, STUN, invites (idle only) |
-| First-run `[2]` Join | Join via wizard: decentralized (default), parasitic, or manual — not while a profile is active (`remove` first) |
+| First-run `[1]` Mint FloatUnit | New unit (member): name, port, VIP, subnet, UPnP, STUN, key-only invite |
+| First-run `[2]` Join | Join via wizard: decentralized (default) or manual — not while a profile is active (`remove` first) |
 | First-run `[3]` / `stop` / `exit` | Shut down VPN daemon and quit client |
 | `list` | Peers and routes |
 | `runtime` | Live dashboard: counters, VPN byte rates, pacing/UDP/TUN buffers (1s; Enter to stop) |
 | `ping` | Latency to peers |
-| `kick` | Disconnect peer (owner) |
-| `remove` | Remove peer from config |
+| `lan` | Discover same-FloatUnit members on LAN and assist (punch + claim hello) |
+| `remove` | Clear session and config (destructive) |
 | `stun` | Query public endpoint |
 | `punch` | Manual hole punch to host:port |
 | `config show` / `config reload` / `config reset` | Performance via `NetInfo/config.toml` (show, merge from disk + apply live, factory reset) |
@@ -168,14 +172,15 @@ Two files live in **`NetInfo/`**, next to `ConnectUnit.exe`:
 
 | File | Contents |
 |------|----------|
-| `config.toml` | Identity, role, crypto, peers, invites, parasitic state, and all pacing/APD/DRR/FEC/failover tuning knobs (sectioned by feature: `[session]`, `[drr]`, `[fec]`, `[congestion]`, …) |
+| `config.toml` | Identity, crypto, peers, invites, and all pacing/APD/DRR/FEC/failover tuning knobs (sectioned by feature: `[session]`, `[drr]`, `[fec]`, `[congestion]`, …) |
 | `peer_cache.json` | Learned peer endpoints, maintained by the engine |
 
-Edit `config.toml`, then run `config reload` to apply performance fields live. Identity/session fields (network id, role, VIP, keys) require a daemon restart.
+Edit `config.toml`, then run `config reload` to apply performance fields live. Identity/session fields (network id, VIP, keys) require a daemon restart.
 
 Full field list, factory defaults, and what each knob trades off: **[`SPEC.md` § Persistence](SPEC.md#persistence)** and **[§ Operational defaults](SPEC.md#operational-defaults-user-tunable)**.
 
 ---
+
 
 ## License
 
