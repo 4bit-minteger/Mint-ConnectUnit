@@ -3162,6 +3162,9 @@ mod tests {
         let mut p = PacingEngine::new();
         p.config.drr_enabled = true;
         p.config.drr_rtt_aware = true;
+        // Hold the peer backlogged: refresh samples only non-empty queues, and
+        // default byte pacing would otherwise drain the single packet mid-cadence.
+        p.config.target_bps = 0;
         let d = addr(90);
         assert!(p.enqueue_peer_with_hints(Bytes::from_static(b"x"), d, Some(40.0), None));
         p.refresh_drr_rtt_ref_for_test();
